@@ -123,10 +123,18 @@ def ref_for(uri: str, name: str) -> str:
     return os.path.join(uri, name)
 
 
-def download(ref: str, verify: bool = True) -> str:
+def download(ref: str, verify: bool = True, dest_dir: str = "") -> str:
     """Return a local path for ``ref``. For S3, download to a temp file (and let
     S3/boto3 validate the SHA-256 when ``verify``). For local, ``ref`` already is
     a path, so return it unchanged.
+
+    boto3's ``download_file`` is the *managed* transfer: parallel ranged GETs
+    written straight to disk, so a 17 GB dataset bin never sits in RAM.
+
+    ``dest_dir`` places the temp file on the same filesystem as wherever the
+    caller will move it. Default (``$TMPDIR``) is fine for checkpoints, but for a
+    17 GB bin a cross-filesystem move turns into a full second copy — minutes of
+    boot time and 2x the free space.
 
     The caller OWNS the returned temp file and must remove (or move) it — a
     30-second checkpoint loop that forgets will fill the disk. Prefer
@@ -134,7 +142,7 @@ def download(ref: str, verify: bool = True) -> str:
     if not is_s3(ref):
         return ref
     bucket, key = _split(ref)
-    fd, local = tempfile.mkstemp(suffix="-" + key.rsplit("/", 1)[-1])
+    fd, local = tempfile.mkstemp(suffix="-" + key.rsplit("/", 1)[-1], dir=dest_dir or None)
     os.close(fd)
     extra = {"ChecksumMode": "ENABLED"} if verify else {}
     _client().download_file(bucket, key, local, ExtraArgs=extra)

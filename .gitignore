@@ -20,6 +20,8 @@ checkpoints/
 # Dataset bins are huge + regenerable — ignore them, but KEEP our prep scripts
 # (data/<dataset>/prepare.py) tracked so `stage-data` can build the corpus.
 data/**/*.bin
+# ...and the in-progress artifacts of a long prep job (.bin.partial/.bin.progress)
+data/**/*.bin.*
 data/**/*.pkl
 datasets/
 out/

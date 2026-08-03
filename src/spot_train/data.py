@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import pickle
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -30,6 +31,12 @@ from . import s3_store
 _REQUIRED = ("train.bin", "val.bin")
 _OPTIONAL = ("meta.pkl",)
 _FILES = (*_REQUIRED, *_OPTIONAL)
+
+# How long a non-downloading local rank waits for rank 0's files. Sized for the
+# corpus, not the fixture: full OpenWebText's 17 GB train.bin takes ~2-5 min to
+# land on a g5 (disk-throughput bound), and a slow/throttled pull several times
+# that — the old 600 s ceiling would fail the box mid-download.
+_WAIT_TIMEOUT_SECONDS = float(os.environ.get("DATA_WAIT_TIMEOUT_SECONDS", "1800"))
 
 
 @dataclass
@@ -95,13 +102,25 @@ class PositionedLoader:
             # (BPE datasets), rather than 404-ing on HeadObject.
             if name in _OPTIONAL and not s3_store.exists(ref):
                 continue
-            local = s3_store.download(ref)
+            started = time.monotonic()
+            # Land the temp INSIDE the destination directory: full OpenWebText's
+            # train.bin is ~17 GB, and a temp in $TMPDIR on another filesystem
+            # would make the move below a second full copy of it.
+            local = s3_store.download(ref, dest_dir=self.data_local_dir)
             dest = os.path.join(self.data_local_dir, name)
             tmp = f"{dest}.tmp-{os.getpid()}"
-            shutil.move(local, tmp)  # may be a cross-fs copy — but into dest's dir
+            shutil.move(local, tmp)  # same-dir now => a rename, not a copy
             os.replace(tmp, dest)  # atomic: waiters can trust existence
+            # Multi-GB bins make boot look wedged; this line is also how we
+            # measure the per-box download cost of a corpus.
+            size_mb = os.path.getsize(dest) / (1 << 20)
+            print(
+                f"[data] fetched {name} ({size_mb:,.1f} MB) in "
+                f"{time.monotonic() - started:.1f}s",
+                file=sys.stderr,
+            )
 
-    def _wait_for_files(self, names: list[str], timeout: float = 600.0) -> None:
+    def _wait_for_files(self, names: list[str], timeout: float = _WAIT_TIMEOUT_SECONDS) -> None:
         """Non-downloading local ranks block here until rank 0's files land."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

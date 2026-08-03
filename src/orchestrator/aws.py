@@ -15,6 +15,7 @@ functions; they never import boto3 themselves.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from typing import Any
@@ -91,6 +92,19 @@ def object_exists(bucket: str, key: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def object_size(bucket: str, key: str) -> int | None:
+    """Size in bytes of an S3 object, or None if it is absent. Used by
+    ``stage-data`` to tell "already uploaded" from "uploaded something else" —
+    a 17 GB re-upload is an hour, so we want more than existence before skipping."""
+    if _DRY_RUN:
+        _log(f"head s3://{bucket}/{key} (size)")
+        return None
+    try:
+        return int(_client("s3").head_object(Bucket=bucket, Key=key)["ContentLength"])
+    except Exception:  # noqa: BLE001 — NoSuchKey / 403 => treat as absent
+        return None
 
 
 def any_object_under(bucket: str, prefix: str) -> bool:
@@ -291,11 +305,60 @@ def object_exists_bucket(s3, bucket: str) -> bool:
         return False
 
 
+class _UploadProgress:
+    """Callback that logs an upload's progress every ~10%.
+
+    Only attached to big objects: a 17 GB ``train.bin`` is an hour of complete
+    silence otherwise, which is indistinguishable from a hang."""
+
+    STEP = 0.10
+
+    def __init__(self, label: str, total: int):
+        self._label = label
+        self._total = max(1, total)
+        self._sent = 0
+        self._next = self.STEP
+        self._started = time.time()
+
+    def __call__(self, chunk: int) -> None:
+        self._sent += chunk
+        frac = self._sent / self._total
+        if frac < self._next and self._sent < self._total:
+            return
+        self._next = frac + self.STEP
+        elapsed = max(time.time() - self._started, 1e-6)
+        rate = self._sent / elapsed / (1 << 20)
+        _log(
+            f"upload {self._label}: {frac * 100:.0f}% "
+            f"({self._sent / (1 << 30):.1f} GB, {rate:.0f} MB/s, {elapsed:.0f}s)"
+        )
+
+
+# Log progress for anything above this; below it, uploads finish before a first
+# progress line would be useful (shakespeare's bins are ~1 MB).
+_PROGRESS_THRESHOLD_BYTES = 256 << 20
+
+
 def upload_file(local_path: str, bucket: str, key: str) -> None:
-    _log(f"upload {local_path} -> s3://{bucket}/{key}")
+    """Upload one file. boto3's ``upload_file`` is the *managed* transfer — it
+    switches to a threaded multipart upload above 8 MB — so this is the correct
+    entrypoint for a 17 GB dataset bin (a raw ``put_object`` would fail: a single
+    S3 PUT caps at 5 GB). The SHA-256 is computed per part as the bytes stream,
+    so memory stays flat regardless of file size."""
+    size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+    _log(f"upload {local_path} ({size / (1 << 20):.1f} MB) -> s3://{bucket}/{key}")
     if _DRY_RUN:
         return
-    _client("s3").upload_file(local_path, bucket, key, ExtraArgs={"ChecksumAlgorithm": "SHA256"})
+    callback = None
+    if size >= _PROGRESS_THRESHOLD_BYTES:
+        callback = _UploadProgress(key.rsplit("/", 1)[-1], size)
+    _client("s3").upload_file(
+        local_path,
+        bucket,
+        key,
+        ExtraArgs={"ChecksumAlgorithm": "SHA256"},
+        Callback=callback,
+    )
 
 
 def put_text(bucket: str, key: str, body: str) -> None:
