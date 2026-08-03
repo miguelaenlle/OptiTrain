@@ -301,3 +301,47 @@ def test_startup_timeout_is_operator_overridable(monkeypatch):
     monkeypatch.setenv("NCCL_INIT_TIMEOUT", "900")
     ud = _ud(ddp=True, nodes=8, node_index=0)
     assert 'export NCCL_INIT_TIMEOUT="900"' in ud
+
+
+def test_worker_policy_can_abort_its_own_multipart_uploads():
+    """Without AbortMultipartUpload, a failed managed-transfer upload leaves
+    billable parts that `s3 ls` does not show and nothing can ever clean up —
+    4.86 GB accrued this way. Abort is NOT implied by PutObject, so it must be
+    granted explicitly, and the shipped policy doc must agree with the code that
+    actually writes the inline policy (setup overwrites it on every run)."""
+    import json as _json
+
+    from orchestrator import aws as _aws
+
+    calls = {}
+
+    class _FakeIam:
+        def create_role(self, **kw):
+            return {}
+
+        def put_role_policy(self, **kw):
+            calls[kw["PolicyName"]] = _json.loads(kw["PolicyDocument"])
+
+        def attach_role_policy(self, **kw):
+            return {}
+
+        def create_instance_profile(self, **kw):
+            return {}
+
+        def get_instance_profile(self, **kw):
+            return {"InstanceProfile": {"Roles": [{"RoleName": "spot-train-role"}]}}
+
+        def add_role_to_instance_profile(self, **kw):
+            return {}
+
+    import unittest.mock as _mock
+
+    with _mock.patch.object(_aws, "_client", lambda svc: _FakeIam()):
+        _aws.ensure_instance_profile("spot-train-role", "spot-train-profile", "b")
+    actions = calls["spot-train-s3"]["Statement"][0]["Action"]
+    assert "s3:AbortMultipartUpload" in actions
+    # The doc under docs/iam/ is the reviewable contract; keep it in step.
+    with open("docs/iam/worker-policy.json") as fh:
+        doc = _json.load(fh)
+    doc_actions = next(s["Action"] for s in doc["Statement"] if "s3:PutObject" in s["Action"])
+    assert set(actions) == set(doc_actions), "policy doc drifted from the code"

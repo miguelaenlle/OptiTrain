@@ -388,6 +388,64 @@ def ensure_bucket(bucket: str, region: str) -> None:
     s3.create_bucket(**kwargs)
 
 
+ABORT_INCOMPLETE_UPLOAD_DAYS = 7
+
+
+def ensure_bucket_lifecycle(bucket: str, days: int = ABORT_INCOMPLETE_UPLOAD_DAYS) -> None:
+    """Expire incomplete multipart uploads server-side.
+
+    The worker/orchestrator roles can now abort their own failed uploads, but
+    that only helps a process that is still ALIVE to do it. Preemption kills the
+    box mid-write by definition — that is the whole experiment — so the parts of
+    a half-written 17 GB checkpoint have nobody left to clean them up. They then
+    bill indefinitely and do not show up in `s3 ls`, which is how 4.86 GB
+    accumulated here unnoticed over a month. S3 expiring them is the only
+    cleanup that cannot be skipped by the failure it is cleaning up after.
+
+    Idempotent: the rule is written by id, so re-running replaces it in place.
+    """
+    _log(f"put S3 lifecycle on {bucket}: abort incomplete multipart uploads after {days}d")
+    if _DRY_RUN:
+        return
+    _client("s3").put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [
+                {
+                    "ID": "abort-incomplete-multipart-uploads",
+                    "Status": "Enabled",
+                    "Filter": {"Prefix": ""},  # whole bucket
+                    "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": days},
+                }
+            ]
+        },
+    )
+
+
+def abort_incomplete_uploads(bucket: str) -> tuple[int, int]:
+    """Abort every in-progress multipart upload now. Returns (count, bytes).
+
+    For clearing the backlog that accrued before the lifecycle rule existed;
+    the rule handles everything after. Safe to run when no upload is in flight,
+    but NOT while a real upload is running — it would abort that too.
+    """
+    s3 = _client("s3")
+    ups = s3.list_multipart_uploads(Bucket=bucket).get("Uploads", [])
+    total = 0
+    for u in ups:
+        try:
+            parts = s3.list_parts(Bucket=bucket, Key=u["Key"], UploadId=u["UploadId"])
+            total += sum(p["Size"] for p in parts.get("Parts", []))
+        except Exception:  # noqa: BLE001 — size is for reporting only
+            pass
+    _log(f"abort {len(ups)} incomplete multipart upload(s) in {bucket} ({total / 1e9:.2f} GB)")
+    if _DRY_RUN:
+        return len(ups), total
+    for u in ups:
+        s3.abort_multipart_upload(Bucket=bucket, Key=u["Key"], UploadId=u["UploadId"])
+    return len(ups), total
+
+
 def object_exists_bucket(s3, bucket: str) -> bool:
     try:
         s3.head_bucket(Bucket=bucket)
@@ -505,7 +563,25 @@ def ensure_instance_profile(role_name: str, profile_name: str, bucket: str) -> N
                 # DeleteObject is required: the atomic checkpoint writes a .tmp
                 # key, copies it to the final key, then DELETES the .tmp
                 # (s3_store._s3_save). Without it, checkpointing fails AccessDenied.
-                "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+                #
+                # AbortMultipartUpload is required for a DIFFERENT reason, and its
+                # absence leaks money silently. Checkpoints and the 17 GB dataset
+                # go through boto3's managed transfer, i.e. multipart. When an
+                # upload fails, boto3 tries to abort it — and abort is NOT covered
+                # by PutObject. Denied, the parts stay, billing forever and
+                # invisible to `s3 ls`. Preemption testing kills boxes mid-write by
+                # design, so this is the normal path, not an edge case: 35 orphans
+                # / 4.86 GB accumulated before this was noticed. The List* actions
+                # let a box see its own stragglers.
+                "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                    "s3:ListBucket",
+                    "s3:AbortMultipartUpload",
+                    "s3:ListMultipartUploadParts",
+                    "s3:ListBucketMultipartUploads",
+                ],
                 "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
             }
         ],
@@ -594,7 +670,18 @@ def ensure_orchestrator_profile(
             {
                 "Effect": "Allow",
                 # DeleteObject: the supervisor clears stale control documents.
-                "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+                # Multipart actions for the same reason as the worker role: the
+                # orchestrator streams logs and profiles through boto3's managed
+                # transfer, and an upload it cannot abort leaks billable parts.
+                "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                    "s3:ListBucket",
+                    "s3:AbortMultipartUpload",
+                    "s3:ListMultipartUploadParts",
+                    "s3:ListBucketMultipartUploads",
+                ],
                 "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
             },
             {

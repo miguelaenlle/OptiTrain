@@ -18,6 +18,9 @@ def ensure_infra(cfg: OrchestratorConfig) -> None:
     aws.set_region(cfg.region)
 
     aws.ensure_bucket(cfg.bucket, cfg.region)
+    # Server-side cleanup for multipart uploads no one is left alive to abort —
+    # the normal outcome of preempting a box mid-checkpoint. See the function.
+    aws.ensure_bucket_lifecycle(cfg.bucket)
     aws.ensure_instance_profile(cfg.role_name, cfg.instance_profile, cfg.bucket)
     # The control plane's own role (`orch up`): EC2 lifecycle + S3 + PassRole for
     # the worker role. Created here because it needs the same one-time IAM rights
