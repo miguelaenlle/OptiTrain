@@ -49,11 +49,32 @@ src/orchestrator/ local control plane (boto3): setup / experiments / fleet
 src/inference/    serving fleet (ROADMAP Part 1): worker + router
 loadgen/          Go load generator / stress-test harness (ROADMAP Part 1)
 third_party/      Karpathy's nanoGPT as a pinned submodule — we import the model, not rewrite it
-docs/iam/         least-privilege IAM policies (controller / worker / setup)
+docs/iam/         least-privilege IAM policies (setup / controller / orchestrator / worker)
 tests/            checkpoint/resume + fleet tests
 ```
 
 After cloning: `git submodule update --init` then `pip install -e .`.
+
+## Long runs: put the orchestrator in the cloud
+
+A multi-day run shouldn't need your laptop awake. `orch up` launches the control
+plane on an always-on (never spot) `t3.micro`, runs the experiment there under
+systemd, and then attaches this terminal to the normal live dashboard:
+
+```bash
+spot-orchestrate orch up --experiment multinode --env NODES=8 --env TRAIN_BUDGET_SECONDS=129600
+# boot progress → the full-screen dashboard. Ctrl-C DETACHES; it cannot stop the run.
+
+spot-orchestrate orch status          # heartbeat age, epoch, world size, step/loss, cost
+spot-orchestrate orch logs            # reattach (finds the active run for you)
+spot-orchestrate orch down --all      # terminate the control plane + its training fleet
+```
+
+The box authenticates with an instance-profile role (no keys are copied, so
+nothing expires mid-run), streams its log to
+`s3://<bucket>/orchestrators/<orch_id>/orchestrator.log`, restarts the run on
+crash **resuming the same `run_id`**, and bills itself into the run's cost
+ledger. `--dry-run` prints every AWS call it would make and launches nothing.
 
 ## Watch a run live
 

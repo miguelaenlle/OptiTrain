@@ -1,8 +1,11 @@
 """CLI: ``spot-orchestrate {setup,stage-data,bake-ami,baseline,spot,preempt,ddp,
 ddp-preempt,multinode,multinode-shrink,multinode-preempt,scaling-experiment,
 scaling-clean,scaling-preempt} [--dry-run]``,
-``spot-orchestrate resume <run_id> [--budget N] [--market ...]``, and
-``spot-orchestrate compare <run_id> [<run_id> ...]``.
+``spot-orchestrate resume <run_id> [--budget N] [--market ...]``,
+``spot-orchestrate compare <run_id> [<run_id> ...]``, and
+``spot-orchestrate orch {up,status,logs,down}`` — the durable remote
+orchestrator, which runs an experiment on an always-on t3.micro so a multi-day
+run does not need this laptop awake.
 
 You run this; it needs your AWS creds in the environment. A git-ignored ``.env``
 in the current directory is loaded into the environment on startup (values are
@@ -101,6 +104,62 @@ def main() -> None:
         help="append-tail one node (--node) with join/death notices — for tmux panes/pipes",
     )
 
+    # --- remote orchestrator: run the control plane on a t3.micro, not here --- #
+    orch_parser = sub.add_parser(
+        "orch",
+        parents=[common],
+        help="durable remote orchestrator: run an experiment on an always-on t3.micro",
+    )
+    orch_sub = orch_parser.add_subparsers(dest="orch_command", required=True)
+    orch_up = orch_sub.add_parser(
+        "up",
+        parents=[common],
+        help="launch the control plane and attach to the live dashboard (Ctrl-C detaches)",
+    )
+    orch_up.add_argument(
+        "--experiment",
+        required=True,
+        help="experiment the remote orchestrator runs (e.g. multinode)",
+    )
+    orch_up.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="env override for the run, repeatable (e.g. --env NODES=8)",
+    )
+    orch_up.add_argument("--no-attach", action="store_true", help="launch and exit (scripted use)")
+    orch_up.add_argument("--node", type=int, default=None, help="dashboard: node tab to open")
+    orch_up.add_argument("--interval", type=float, default=None, help="dashboard: poll seconds")
+    orch_up.add_argument("--grid", action="store_true", help="dashboard: open the tiled grid")
+    orch_status = orch_sub.add_parser(
+        "status",
+        parents=[common],
+        help="one screen: heartbeat age, epoch/world, step/loss, elapsed vs budget, cost",
+    )
+    orch_status.add_argument("--id", dest="orch_id", default="", help="orchestrator id")
+    orch_logs = orch_sub.add_parser(
+        "logs", parents=[common], help="reattach to the active orchestrator's dashboard"
+    )
+    orch_logs.add_argument("--id", dest="orch_id", default="", help="orchestrator id")
+    orch_logs.add_argument("--run", dest="run_id", default="", help="run id (skips discovery)")
+    orch_logs.add_argument("--node", type=int, default=None)
+    orch_logs.add_argument("--interval", type=float, default=None)
+    orch_logs.add_argument("--grid", action="store_true")
+    orch_logs.add_argument("--plain", action="store_true")
+    orch_down = orch_sub.add_parser("down", parents=[common], help="terminate the control plane")
+    orch_down.add_argument("--id", dest="orch_id", default="", help="orchestrator id")
+    orch_down.add_argument(
+        "--all", action="store_true", help="also terminate the training fleet it was driving"
+    )
+    orch_down.add_argument("--yes", "-y", action="store_true", help="skip the confirmation")
+    # What the systemd unit on the box runs — you never type this yourself.
+    orch_agent = orch_sub.add_parser(
+        "_agent", parents=[common], help="(internal) run the experiment ON the control-plane box"
+    )
+    orch_agent.add_argument("--orch-id", dest="orch_id", required=True)
+    orch_agent.add_argument("--experiment", required=True)
+
     fleet_parser = sub.add_parser(
         "fleet", parents=[common], help="inference fleet (ROADMAP Part 1)"
     )
@@ -179,25 +238,65 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command == "spotwatch":
-        from . import aws, spotwatch
+    if args.command in ("spotwatch", "orch"):
+        from . import aws
         from .config import OrchestratorConfig
 
         aws.set_dry_run(args.dry_run)
         cfg = OrchestratorConfig()
         aws.set_region(cfg.region)
-        if args.spotwatch_command == "deploy":
-            spotwatch.deploy(cfg)
-        elif args.spotwatch_command == "down":
-            spotwatch.down(cfg)
-        elif args.spotwatch_command == "report":
-            spotwatch.report(
-                cfg,
-                since_hours=args.since,
-                threshold=args.threshold,
-                home_region=args.region,
-                home_type=args.instance_type,
-            )
+        if args.command == "spotwatch":
+            from . import spotwatch
+
+            if args.spotwatch_command == "deploy":
+                spotwatch.deploy(cfg)
+            elif args.spotwatch_command == "down":
+                spotwatch.down(cfg)
+            elif args.spotwatch_command == "report":
+                spotwatch.report(
+                    cfg,
+                    since_hours=args.since,
+                    threshold=args.threshold,
+                    home_region=args.region,
+                    home_type=args.instance_type,
+                )
+        else:
+            from . import orch
+
+            if args.orch_command == "up":
+                pairs = {}
+                for item in args.env:
+                    if "=" not in item:
+                        parser.error(f"--env expects K=V, got {item!r}")
+                    k, _, v = item.partition("=")
+                    pairs[k.strip()] = v
+                orch.up(
+                    cfg,
+                    experiment=args.experiment,
+                    env_overrides=pairs,
+                    no_attach=args.no_attach,
+                    node=args.node,
+                    interval=args.interval,
+                    grid=args.grid,
+                )
+            elif args.orch_command == "status":
+                orch.status(cfg, args.orch_id)
+            elif args.orch_command == "logs":
+                orch.logs(
+                    cfg,
+                    orch_id=args.orch_id,
+                    run_id=args.run_id,
+                    node=args.node,
+                    interval=args.interval,
+                    grid=args.grid,
+                    plain=args.plain,
+                )
+            elif args.orch_command == "down":
+                orch.down(cfg, orch_id=args.orch_id, all_=args.all, yes=args.yes)
+            elif args.orch_command == "_agent":
+                # Runs ON the control-plane box under systemd; its exit code is the
+                # restart signal (0 = done, nonzero = systemd retries and resumes).
+                sys.exit(orch.run_agent(cfg, orch_id=args.orch_id, experiment=args.experiment))
         if args.dry_run:
             print("\n[dry-run] no AWS calls were made.", file=sys.stderr)
         return

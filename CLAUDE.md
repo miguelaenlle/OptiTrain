@@ -193,6 +193,10 @@ src/orchestrator/      # local control plane (boto3) — you run this
   sidecar.py           # per-box: obey epoch.json, run static torchrun per epoch
   spotwatch.py         # spot-availability collector: deploy/down/report (~$0)
   lambda_spotwatch.py  # ^ its Lambda handler — runs IN AWS, boto3+stdlib only
+  orch.py              # DURABLE remote orchestrator: `orch up|status|logs|down`
+                       #   — runs the supervisor on an always-on t3.micro so a
+                       #   36h run doesn't need the laptop; `up` attaches to the
+                       #   existing logview dashboard, Ctrl-C only detaches
   config.py            # OrchestratorConfig (env-overridable)
   __main__.py          # CLI: setup | stage-data | baseline | spot [--dry-run]
 third_party/nanoGPT/   # Karpathy's nanoGPT — git submodule, read-only.

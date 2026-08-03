@@ -59,6 +59,69 @@ _TRAINER_PASSTHROUGH = (
     "SAMPLES_PER_PROMPT",
 )
 
+# Orchestrator knobs the REMOTE control plane inherits from your shell/.env when
+# you run `orch up`. An ALLOWLIST, never a blanket copy of os.environ: the env
+# lands in EC2 user-data (readable via IMDS by anything on the box), so
+# credentials and API keys must never ride along — boto3 on the box resolves its
+# creds from the attached instance-profile role instead.
+_ORCH_RELAY_ENV = (
+    "SPOT_TRAIN_BUCKET",
+    "AWS_REGION",
+    "REPO_URL",
+    "REPO_BRANCH",
+    "INSTANCE_TYPE",
+    "AMI_ID",
+    "AMI_NAME_FILTER",
+    "SSH_KEY_NAME",
+    "IAM_ROLE",
+    "IAM_PROFILE",
+    "SECURITY_GROUP",
+    "MAX_INSTANCE_LIFETIME_SECONDS",
+    "DATASET",
+    "HOURLY_USD",
+    "BASELINE_SECONDS",
+    "SPOT_SEG1_SECONDS",
+    "SPOT_SEG2_SECONDS",
+    "CHECKPOINT_INTERVAL_SECONDS",
+    "EVAL_ITERS",
+    "BATCH_SIZE",
+    "MARKET",
+    "TRAIN_TOTAL_SECONDS",
+    "PREEMPT_COUNT",
+    "PREEMPT_GRACE",
+    "PREEMPT_AFTER",
+    "PREEMPT_CHECKPOINT_SECONDS",
+    "PREEMPT_VICTIMS",
+    "SMOKE_TEST_EVERY",
+    "SAMPLE_PROMPTS",
+    "DDP_NPROC_PER_NODE",
+    "DDP_DATA_MODE",
+    "NODES",
+    "RDZV_PORT",
+    "NCCL_TIMEOUT",
+    "NCCL_SOCKET_IFNAME",
+    "NCCL_IB_DISABLE",
+    "NCCL_DEBUG",
+    "NCCL_NET",
+    "NCCL_NET_PLUGIN",
+    "NCCL_SOCKET_NTHREADS",
+    "NCCL_NSOCKS_PERTHREAD",
+    "RECOVERY_TIMEOUT",
+    "VCPU_QUOTA",
+    "INSTANCE_VCPUS",
+    "METRICS_TIMEOUT",
+    "LOG_STREAM_SECONDS",
+    "WANDB_PROJECT",
+    "WANDB_ENTITY",
+    "WANDB_GROUP",
+    "WANDB_DISABLED",
+)
+
+# Belt-and-braces: any name that smells like a credential is dropped from the
+# relayed env even if it was explicitly passed with `--env`. user-data is not a
+# secret store.
+_SECRETISH = ("SECRET", "PASSWORD", "TOKEN", "API_KEY", "ACCESS_KEY", "CREDENTIAL")
+
 # vCPUs per instance type, for the quota-headroom gate. Only the types this
 # project plausibly launches; anything else needs INSTANCE_VCPUS set explicitly.
 _INSTANCE_VCPUS = {
@@ -83,6 +146,11 @@ ON_DEMAND_HOURLY_USD = {
     "g4dn.12xlarge": 3.912,
     "g5.xlarge": 1.006,
     "g6.xlarge": 0.805,
+    # Control-plane boxes (`orch up`): tiny, on-demand, and long-lived, so their
+    # cost must show up in the ledger for a multi-day run to be honest.
+    "t3.micro": 0.0104,
+    "t3.small": 0.0208,
+    "t3.medium": 0.0416,
 }
 
 
@@ -236,6 +304,52 @@ class OrchestratorConfig:
     # never false-fires mid-recovery, yet well under METRICS_TIMEOUT so a genuine
     # hang is broken within a run instead of stalling to the deadline.
     recovery_timeout_seconds: int = field(default_factory=lambda: _env_int("RECOVERY_TIMEOUT", 150))
+
+    # --- remote orchestrator (spot-orchestrate orch up) ----------------------
+    # The durable control plane: one ALWAYS-ON-DEMAND box that runs the epoch
+    # supervisor so a 36h run doesn't need your laptop awake. Never spot — if the
+    # control plane is reclaimed mid-run there is nobody left to replace it.
+    orch_instance_type: str = field(default_factory=lambda: _env("ORCH_INSTANCE_TYPE", "t3.micro"))
+    # A plain Amazon Linux 2023 image, NOT the DLAMI: the control plane never
+    # trains, so it needs no CUDA/torch and a small root volume is a feature (a
+    # 100GB DLAMI volume would bill for the whole run). Kept separate from
+    # AMI_ID/AMI_NAME_FILTER so a DLAMI pin in your .env can't leak in here.
+    orch_ami_id: str = field(default_factory=lambda: _env("ORCH_AMI_ID", ""))
+    orch_ami_name_filter: str = field(
+        default_factory=lambda: _env("ORCH_AMI_NAME_FILTER", "al2023-ami-2023.*-x86_64")
+    )
+    # The control plane's OWN instance profile: it launches/terminates training
+    # boxes, so it needs more than the worker role (see docs/iam/). Separate role
+    # = the training boxes never inherit EC2 lifecycle rights.
+    orch_role_name: str = field(
+        default_factory=lambda: _env("ORCH_IAM_ROLE", "spot-train-orch-role")
+    )
+    orch_instance_profile: str = field(
+        default_factory=lambda: _env("ORCH_IAM_PROFILE", "spot-train-orch-profile")
+    )
+    # How often the on-box agent republishes heartbeat.json (liveness + live
+    # step/loss/cost for `orch status`).
+    orch_heartbeat_seconds: int = field(default_factory=lambda: _env_int("ORCH_HEARTBEAT", 10))
+    # Heartbeat older than this => the control plane is presumed wedged/gone.
+    orch_stale_seconds: int = field(default_factory=lambda: _env_int("ORCH_STALE_SECONDS", 60))
+    # Log relay cadence, and the cap that keeps 36h of stdout from filling an 8GB
+    # root volume — the local file is trimmed to its newest half past this size.
+    orch_log_upload_seconds: int = field(default_factory=lambda: _env_int("ORCH_LOG_UPLOAD", 15))
+    orch_log_max_bytes: int = field(
+        default_factory=lambda: _env_int("ORCH_LOG_MAX_BYTES", 32 * 1024 * 1024)
+    )
+    # Dead-man's switch for the CONTROL PLANE, deliberately its own knob and
+    # deliberately 0 (off) by default: MAX_INSTANCE_LIFETIME_SECONDS exists to
+    # reap orphaned *training* boxes when the orchestrator dies, and applying it
+    # here would kill the very process that does the reaping mid-run. Set it only
+    # if you want a hard ceiling comfortably above the run budget.
+    orch_max_lifetime_seconds: int = field(
+        default_factory=lambda: _env_int("ORCH_MAX_LIFETIME_SECONDS", 0)
+    )
+    # `orch up` gives up waiting for the box to boot + provision after this.
+    orch_boot_timeout_seconds: int = field(
+        default_factory=lambda: _env_int("ORCH_BOOT_TIMEOUT", 1800)
+    )
 
     # --- inference fleet (ROADMAP Part 1) ------------------------------------
     # CPU instances by default: the 10M-param model serves fine on CPU, and
@@ -409,6 +523,52 @@ class OrchestratorConfig:
 
     def fleet_state_key(self, fleet_id: str) -> str:
         return f"fleet/{fleet_id}/fleet.json"
+
+    # Remote-orchestrator control keys. Everything the laptop needs to find,
+    # watch, and cost a detached control plane lives under this one prefix:
+    #   orch.json      — what it was asked to run (experiment/env) + its run_id,
+    #                    written by the on-box agent; survives a systemd restart,
+    #                    which is how a restarted agent RESUMES the same run.
+    #   progress.json  — boot phase markers written by user-data, so `orch up`
+    #                    can show real provisioning progress instead of a spinner.
+    #   heartbeat.json — the agent's liveness + live step/loss/cost.
+    #   orchestrator.log / boot.log — the streamed process and user-data logs.
+    def orch_prefix(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/"
+
+    def orch_state_key(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/orch.json"
+
+    def orch_progress_key(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/progress.json"
+
+    def orch_heartbeat_key(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/heartbeat.json"
+
+    def orch_log_key(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/orchestrator.log"
+
+    def orch_boot_log_key(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/boot.log"
+
+    def orch_hourly_usd(self) -> float | None:
+        """$/hr for the control-plane box's cost-ledger row (None = unknown)."""
+        return ON_DEMAND_HOURLY_USD.get(self.orch_instance_type)
+
+    def orch_relay_env(self, overrides: dict[str, str] | None = None) -> dict[str, str]:
+        """The env the remote control plane boots with: this shell's values for
+        the allowlisted knobs (so your .env recipe carries over verbatim), then
+        the explicit ``--env K=V`` overrides on top. Credential-shaped names are
+        dropped from BOTH sources — user-data is world-readable on the box."""
+        env = {k: os.environ[k] for k in _ORCH_RELAY_ENV if os.environ.get(k)}
+        env.update(self.trainer_passthrough())  # the recipe knobs (MAX_STEPS, LR, …)
+        env.update(overrides or {})  # explicit --env wins over the inherited shell
+        return {k: v for k, v in env.items() if not any(s in k.upper() for s in _SECRETISH)}
+
+    def orch_secretish(self, env: dict[str, str]) -> list[str]:
+        """Names in ``env`` that look like credentials (dropped by orch_relay_env
+        — reported so the operator sees WHY their value didn't make it across)."""
+        return sorted(k for k in env if any(s in k.upper() for s in _SECRETISH))
 
     # AMI-bake control keys: the bake box writes status.json (ok/rc/commit) when
     # provisioning finishes and streams its boot log next to it.

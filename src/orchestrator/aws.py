@@ -143,6 +143,21 @@ def get_texts(bucket: str, keys: list[str]) -> dict[str, str]:
         return {k: v for k, v in pool.map(_one, keys) if v}
 
 
+def get_json(bucket: str, key: str) -> dict | None:
+    """Small control document as a dict, or None if it's absent/unreadable. One
+    API call instead of head+get, and never raises — the remote-orchestrator
+    views poll documents that legitimately don't exist yet."""
+    if _DRY_RUN:
+        _log(f"get s3://{bucket}/{key} (json)")
+        return None
+    import json
+
+    try:
+        return json.loads(_client("s3").get_object(Bucket=bucket, Key=key)["Body"].read().decode())
+    except Exception:  # noqa: BLE001 — absent/partial/malformed => "no document yet"
+        return None
+
+
 def max_checkpoint_step(bucket: str, prefix: str) -> int:
     """Highest checkpoint step under ``prefix`` (ckpt-<step>.pt), or -1 if none.
     Used to detect training-start (step advances past the resume point) and to
@@ -381,9 +396,12 @@ def upload_file(local_path: str, bucket: str, key: str) -> None:
     )
 
 
-def put_text(bucket: str, key: str, body: str) -> None:
-    """Write a small control document the boxes poll."""
-    _log(f"put s3://{bucket}/{key}: {body}")
+def put_text(bucket: str, key: str, body: str, *, quiet: bool = False) -> None:
+    """Write a small control document the boxes poll. ``quiet`` logs the key but
+    not the body — for documents rewritten on a timer (the remote orchestrator's
+    heartbeat), where echoing the payload every few seconds for 36 hours would
+    swamp the orchestrator's own log."""
+    _log(f"put s3://{bucket}/{key}" + (f" ({len(body)} bytes)" if quiet else f": {body}"))
     if _DRY_RUN:
         return
     _client("s3").put_object(Bucket=bucket, Key=key, Body=body.encode())
@@ -449,6 +467,102 @@ def ensure_instance_profile(role_name: str, profile_name: str, bucket: str) -> N
     # An instance profile holds at most one role; on a re-run the role is already
     # attached and AddRoleToInstanceProfile raises LimitExceeded. Add only if the
     # role isn't already in the profile (idempotent).
+    attached = [
+        r["RoleName"]
+        for r in iam.get_instance_profile(InstanceProfileName=profile_name)["InstanceProfile"][
+            "Roles"
+        ]
+    ]
+    if role_name not in attached:
+        iam.add_role_to_instance_profile(InstanceProfileName=profile_name, RoleName=role_name)
+
+
+def ensure_orchestrator_profile(
+    role_name: str, profile_name: str, bucket: str, worker_role_name: str
+) -> None:
+    """Create the CONTROL PLANE's role + instance profile (``orch up``).
+
+    Strictly more than the worker role and strictly less than your laptop: the
+    orchestrator box launches/terminates training instances and reads/writes the
+    run bucket, so it gets EC2 lifecycle + S3 + a ``PassRole`` scoped to the
+    single worker role and to EC2 only. No IAM writes, no bucket creation.
+
+    A role (not copied keys) is the whole point: the box's credentials are
+    refreshed by IMDS for as long as it lives, so a 36-hour run never dies of an
+    expired session token. Mirrors docs/iam/orchestrator-policy.json. Idempotent.
+    """
+    import json
+
+    _log(
+        f"create IAM role {role_name} + instance profile {profile_name} "
+        f"(EC2 lifecycle + s3://{bucket} + PassRole {worker_role_name})"
+    )
+    if _DRY_RUN:
+        return
+    iam = _client("iam")
+    assume = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "ec2.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+    _ignore_exists(
+        lambda: iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=json.dumps(assume))
+    )
+    account = _client("sts").get_caller_identity()["Account"]
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "ec2:RunInstances",
+                    "ec2:TerminateInstances",
+                    "ec2:CreateTags",
+                    "ec2:DescribeInstances",
+                    "ec2:DescribeInstanceStatus",
+                    "ec2:DescribeImages",
+                    "ec2:DescribeSecurityGroups",
+                    "ec2:DescribeSubnets",
+                    "ec2:DescribeVpcs",
+                    "ec2:DescribeSpotPriceHistory",
+                    "ec2:AuthorizeSecurityGroupIngress",
+                    "ec2:CreateSecurityGroup",
+                ],
+                "Resource": "*",
+            },
+            {
+                "Effect": "Allow",
+                # DeleteObject: the supervisor clears stale control documents.
+                "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+                "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+            },
+            {
+                "Effect": "Allow",
+                "Action": "iam:PassRole",
+                "Resource": f"arn:aws:iam::{account}:role/{worker_role_name}",
+                "Condition": {"StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}},
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["ssm:SendCommand", "ssm:DescribeInstanceInformation"],
+                "Resource": "*",
+            },
+        ],
+    }
+    iam.put_role_policy(
+        RoleName=role_name, PolicyName="spot-train-orch", PolicyDocument=json.dumps(policy)
+    )
+    # SSM Session Manager on the control plane too: `journalctl -u spot-orch -f`
+    # over a 36h run without opening SSH.
+    iam.attach_role_policy(
+        RoleName=role_name, PolicyArn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    )
+    _ignore_exists(lambda: iam.create_instance_profile(InstanceProfileName=profile_name))
     attached = [
         r["RoleName"]
         for r in iam.get_instance_profile(InstanceProfileName=profile_name)["InstanceProfile"][
