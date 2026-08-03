@@ -2,15 +2,20 @@
 
 Pins the invariants that make a 72-hour unattended collector safe:
 
-  - the SPS request matrix is FIXED (identical every tick, regardless of input
-    ordering) — a matrix that drifts burns the 24h per-configuration throttle;
+  - the SPS request matrix is FIXED and PER-REGION (identical every tick,
+    regardless of input ordering) — responses hard-cap at 10 rows, so only a
+    single-region ask gives every AZ a continuous series;
+  - the truncated all-regions leaderboard never leaks into the math;
+  - a failed request becomes a recorded GAP, never a silent low score;
   - the expensive daily work runs on exactly one tick a day;
-  - the truth probe is rate-limited AND never runs while a training box is up;
+  - the truth probe is rate-limited, never runs while a training box is up, and
+    is skipped (not failed) when the region has no default VPC;
   - every record carries when/which-tick/what-type;
   - a whole tick runs end to end against a fake AWS, and always gives back the
     instance it borrowed;
-  - the report's aggregation math and scenario ranking are right on synthetic
-    records (this is the analysis the whole experiment exists to produce).
+  - the report leads with the capacity-8 answer in absolute terms and its
+    aggregation math is right on synthetic records (this is the analysis the
+    whole experiment exists to produce).
 """
 
 from __future__ import annotations
@@ -40,38 +45,90 @@ def test_sps_matrix_is_identical_across_ticks():
 
 def test_sps_matrix_size_and_shape():
     reqs = lam.sps_requests(REGIONS)
-    # 6 types x 2 capacities x 2 AZ modes, plus the 6-type basket x 2 x 2.
-    assert len(reqs) == (len(lam.INSTANCE_TYPES) + 1) * 2 * 2 == 28
+    # Per region: 6 types x 2 capacities x 2 AZ modes + a per-AZ basket per
+    # capacity = 26. Plus one all-regions leaderboard per (type|basket, capacity).
+    per_region = (len(lam.INSTANCE_TYPES) * 2 + 1) * 2
+    globals_ = (len(lam.INSTANCE_TYPES) + 1) * 2
+    assert per_region == 26 and globals_ == 14
+    assert len(reqs) == len(REGIONS) * per_region + globals_ == 92
     configs = {
         (
-            tuple(r["InstanceTypes"]),
-            r["TargetCapacity"],
-            r["TargetCapacityUnitType"],
-            r["SingleAvailabilityZone"],
-            tuple(r["RegionNames"]),
+            tuple(r.kwargs["InstanceTypes"]),
+            r.kwargs["TargetCapacity"],
+            r.kwargs["TargetCapacityUnitType"],
+            r.kwargs["SingleAvailabilityZone"],
+            tuple(r.kwargs["RegionNames"]),
         )
         for r in reqs
     }
     assert len(configs) == len(reqs)  # every request is a DISTINCT configuration
-    assert {r["TargetCapacity"] for r in reqs} == {1, 8}
-    assert {r["SingleAvailabilityZone"] for r in reqs} == {True, False}
-    assert all(r["RegionNames"] == sorted(REGIONS) for r in reqs)
+    assert {r.kwargs["TargetCapacity"] for r in reqs} == {1, 8}
+    assert {r.kwargs["SingleAvailabilityZone"] for r in reqs} == {True, False}
 
 
-def test_basket_request_is_labelled_any():
+def test_per_region_requests_name_exactly_one_region():
+    """The reason the matrix is per-region: a response is capped at 10 rows, so
+    only a single-region ask is guaranteed to cover every AZ in that region."""
     reqs = lam.sps_requests(REGIONS)
-    labels = [lam.request_label(r) for r in reqs]
-    assert labels.count(lam.BASKET_LABEL) == 4  # one per (capacity, AZ mode)
+    scoped = [r for r in reqs if r.scope == "region"]
+    assert len(scoped) == len(REGIONS) * 26
+    assert all(len(r.kwargs["RegionNames"]) == 1 for r in scoped)
+    assert {r.kwargs["RegionNames"][0] for r in scoped} == set(REGIONS)
+
+    # ... and each region gets the identical sub-matrix.
+    def _shape(r):
+        k = r.kwargs
+        return (tuple(k["InstanceTypes"]), k["TargetCapacity"], k["SingleAvailabilityZone"])
+
+    per_region = {
+        region: [_shape(r) for r in scoped if r.kwargs["RegionNames"][0] == region]
+        for region in REGIONS
+    }
+    assert len({tuple(v) for v in per_region.values()}) == 1
+
+
+def test_global_leaderboard_requests_are_labelled_and_few():
+    board = [r for r in lam.sps_requests(REGIONS) if r.scope == "global_top10"]
+    assert len(board) == 14
+    # All regions in one ask — the only requests allowed to do that, because
+    # their 10 rows are a leaderboard rather than coverage.
+    assert all(r.kwargs["RegionNames"] == sorted(REGIONS) for r in board)
+    assert all(r.kwargs["SingleAvailabilityZone"] for r in board)
+
+
+def test_basket_requests_are_labelled_any():
+    reqs = lam.sps_requests(REGIONS)
+    labels = [r.label for r in reqs]
+    # One per (region, capacity) plus one per capacity globally.
+    assert labels.count(lam.BASKET_LABEL) == len(REGIONS) * 2 + 2
     assert set(labels) == {*lam.INSTANCE_TYPES, "any"}
 
 
 def test_matrix_does_not_depend_on_module_level_mutation():
     # Callers must not be able to mutate the constants through a returned request.
     reqs = lam.sps_requests(REGIONS)
-    basket = next(r for r in reqs if lam.request_label(r) == "any")
-    basket["InstanceTypes"].append("p5.48xlarge")
+    basket = next(r for r in reqs if r.label == "any")
+    basket.kwargs["InstanceTypes"].append("p5.48xlarge")
     assert "p5.48xlarge" not in lam.INSTANCE_TYPES
     assert lam.sps_requests(REGIONS) == lam.sps_requests(REGIONS)
+
+
+def test_pagination_is_not_used_because_responses_hard_cap_at_ten():
+    # Following NextToken re-serves the same 10 rows, so a paging loop would
+    # either duplicate data or spin forever. Structural guard: the collector may
+    # mention NextToken in a comment but must never read or send it.
+    source = open(lam.__file__).read()  # noqa: SIM115
+    assert '"NextToken"' not in source
+    assert "NextToken=" not in source
+    assert lam.SPS_MAX_ROWS == 10
+
+
+def test_throttle_codes_and_pacing_stay_under_the_measured_bucket():
+    # Measured: bucket capacity 100, refill 20/s. Half the refill rate can never
+    # drain it however big the matrix gets.
+    assert lam.SPS_RATE_PER_S <= 10.0
+    assert lam.is_throttle("RequestLimitExceeded")
+    assert not lam.is_throttle("InsufficientInstanceCapacity")
 
 
 # --------------------------------------------------------------------------- #
@@ -229,11 +286,23 @@ def test_lambda_env_matches_what_the_handler_reads():
 class FakeAws:
     """One object standing in for every boto3 client the handler uses."""
 
-    def __init__(self, *, objects=None, training=(), stray=(), run_error=None, state="running"):
+    def __init__(
+        self,
+        *,
+        objects=None,
+        training=(),
+        stray=(),
+        run_error=None,
+        state="running",
+        sps_error=None,
+        default_vpc="vpc-123",
+    ):
         self.objects = dict(objects or {})
         self.training = list(training)
         self.stray = list(stray)
         self.run_error = run_error
+        self.sps_error = sps_error
+        self.default_vpc = default_vpc
         self.state = state
         self.sps_calls: list[dict] = []
         self.launched: list[dict] = []
@@ -255,11 +324,16 @@ class FakeAws:
     # --- ec2 --------------------------------------------------------------- #
     def get_spot_placement_scores(self, **kwargs):
         self.sps_calls.append(kwargs)
+        if self.sps_error:
+            raise self.sps_error
         return {
             "SpotPlacementScores": [
                 {"Region": "us-east-1", "AvailabilityZoneId": "use1-az4", "Score": 7}
             ]
         }
+
+    def describe_vpcs(self, Filters=None):  # noqa: N803
+        return {"Vpcs": [{"VpcId": self.default_vpc}] if self.default_vpc else []}
 
     def get_paginator(self, name):
         pages = {
@@ -362,10 +436,30 @@ def test_tick_writes_one_shard_with_every_record_type(tick_env, monkeypatch):
     assert result["records"] == len(records)
     assert result["key"].startswith("spotwatch/2026-08-01/")
     # Exactly the fixed matrix went out — no more, no fewer, no ad-hoc extras.
-    assert len(fake.sps_calls) == 28
+    assert len(fake.sps_calls) == 26 + 14  # one pinned region + the leaderboard
     assert all(r["tick_id"] == records[0]["tick_id"] for r in records)
+    # Every scored row is tagged with the scope it came from, so the report can
+    # keep the truncated leaderboard out of its coverage math.
+    scopes = {r["scope"] for r in records if r["type"] == "sps"}
+    assert scopes == {"region", "global_top10"}
+    assert not any(r["truncated"] for r in records if r["type"] == "sps")
     # Non-daily tick: no pool enumeration, no advisor fetch.
     assert "offering" not in kinds and "interruption" not in kinds and "az_map" not in kinds
+
+
+def test_failed_requests_become_gaps_not_silence(tick_env, monkeypatch):
+    err = RuntimeError("slow down")
+    err.response = {"Error": {"Code": "RequestLimitExceeded"}}
+    fake = FakeAws(objects={"spotwatch/meta/regions.json": PINNED}, sps_error=err)
+    _, records, _ = _run_tick(monkeypatch, fake)
+    gaps = [r for r in records if r["type"] == "sps_gap"]
+    assert len(gaps) == 40  # one per request in the matrix
+    assert all(g["throttled"] and g["error_code"] == "RequestLimitExceeded" for g in gaps)
+    assert not any(r["type"] == "sps" for r in records)  # nothing masquerades as a score
+    tick = next(r for r in records if r["type"] == "tick")
+    assert tick["sps_gaps"] == 40 and tick["sps_throttled"] == 40
+    # Throttles are retried with backoff before being written off as a gap.
+    assert len(fake.sps_calls) == 40 * 4
 
 
 def test_daily_tick_adds_the_expensive_context(tick_env, monkeypatch):
@@ -417,6 +511,17 @@ def test_tick_never_probes_while_training_is_running(tick_env, monkeypatch):
     skipped = next(r for r in records if r["type"] == "probe_skipped")
     assert "i-train" in skipped["reason"]
     assert any(r["type"] == "sps" for r in records)  # observation continues
+
+
+def test_probe_skipped_when_the_region_has_no_default_VPC(tick_env, monkeypatch):  # noqa: N802
+    # VPCIdNotSpecified is an infrastructure gap, not a capacity signal — it must
+    # never land in the calibration table as a failed launch.
+    fake = FakeAws(objects={"spotwatch/meta/regions.json": PINNED}, default_vpc="")
+    _, records, _ = _run_tick(monkeypatch, fake)
+    assert not fake.launched
+    assert not any(r["type"] == "probe" for r in records)
+    skipped = next(r for r in records if r["type"] == "probe_skipped")
+    assert "default VPC" in skipped["reason"]
 
 
 def test_tick_sweeps_leftover_probes(tick_env, monkeypatch):
@@ -472,7 +577,19 @@ def test_parse_shard_skips_a_truncated_final_line():
 BASE = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc).timestamp()
 
 
-def _sps(tick, hour, region, az_id, itype, score, *, capacity=1, single_az=True, day=0):
+def _sps(
+    tick,
+    hour,
+    region,
+    az_id,
+    itype,
+    score,
+    *,
+    capacity=1,
+    single_az=True,
+    day=0,
+    scope="region",
+):
     t = BASE + day * 86400 + hour * 3600
     return lam.make_record(
         "sps",
@@ -484,6 +601,7 @@ def _sps(tick, hour, region, az_id, itype, score, *, capacity=1, single_az=True,
         capacity=capacity,
         single_az=single_az,
         score=score,
+        scope=scope,
     )
 
 
@@ -491,7 +609,9 @@ def _synthetic() -> list[dict]:
     """Two ticks an hour apart in a world where:
     - us-east-1 / g5.xlarge is hopeless at az1 (score 2) but fine at az4 (8);
     - g4dn.xlarge is good region-wide at hour 3 only;
-    - us-west-2 is uniformly excellent.
+    - us-west-2 is uniformly excellent;
+    - and at the capacity we actually need (8 in one AZ) us-east-1 never gets
+      above 3, which is the drought the report has to state plainly.
     """
     recs: list[dict] = []
     for tick, hour in (("t0", 1), ("t1", 3)):
@@ -505,10 +625,34 @@ def _synthetic() -> list[dict]:
                 tick, hour, "us-east-1", "", "g4dn.xlarge", 9 if hour == 3 else 4, single_az=False
             ),
             _sps(tick, hour, "us-east-1", "use1-az4", "any", 9 if hour == 3 else 5),
+            # capacity 8, single AZ — the decision query
+            _sps(tick, hour, "us-east-1", "use1-az1", "g5.xlarge", 2, capacity=8),
+            _sps(tick, hour, "us-east-1", "use1-az4", "g5.xlarge", 3, capacity=8),
+            _sps(tick, hour, "us-east-1", "use1-az4", "g4dn.xlarge", 3, capacity=8),
+            _sps(tick, hour, "us-west-2", "usw2-az1", "g5.xlarge", 8, capacity=8),
+            # the truncated worldwide leaderboard — must never enter the math
+            _sps(
+                tick,
+                hour,
+                "ap-south-1",
+                "aps1-az1",
+                "g5.xlarge",
+                10,
+                capacity=8,
+                scope="global_top10",
+            ),
         ]
         recs.append(
             lam.make_record(
-                "tick", tick, BASE + hour * 3600, daily=False, error_count=0, record_count=7
+                "tick",
+                tick,
+                BASE + hour * 3600,
+                daily=False,
+                error_count=0,
+                record_count=12,
+                sps_requests=12,
+                sps_gaps=0,
+                sps_throttled=0,
             )
         )
     recs += [
@@ -546,8 +690,8 @@ def test_scenario_ranking_widens_monotonically():
         _synthetic(), threshold=7, home_region="us-east-1", home_type="g5.xlarge", capacity=1
     )
     by_name = {r["scenario"]: r for r in rows}
-    never = by_name["never switch (same region, same GPU)"]
-    gpu = by_name["switch GPU only (same region, any of our GPUs)"]
+    never = by_name["never switch (same region, same GPU) *"]
+    gpu = by_name["switch GPU only (same region, any of our GPUs) *"]
     az = by_name["switch AZ only (same region+GPU, best AZ)"]
     both = by_name["switch both (same region, any GPU, best AZ)"]
     anywhere = by_name["switch region too (anywhere, any GPU, best AZ)"]
@@ -708,6 +852,96 @@ def test_price_and_interruption_summaries():
     assert interrupts[0]["interruption_range"] == "10-15%"
 
 
+def test_truncated_leaderboard_rows_never_enter_the_math():
+    """The all-regions query returns AWS's 10 best rows worldwide. Letting those
+    into a rate would credit availability to AZs we never actually measured."""
+    recs = _synthetic()
+    scored = spotwatch.sps_rows(recs, capacity=8, single_az=True)
+    assert all(r["region"] != "ap-south-1" for r in scored)
+    pools = spotwatch.availability(recs, capacity=8, threshold=7)
+    assert all(p["region"] != "ap-south-1" for p in pools)
+    board = spotwatch.leaderboard(recs, capacity=8)
+    assert [p["region"] for p in board][:1] == ["ap-south-1"]  # visible only here
+    # Records written before `scope` existed are per-region by construction.
+    legacy = [dict(r) for r in scored]
+    for r in legacy:
+        r.pop("scope")
+    assert len(spotwatch.sps_rows(legacy, capacity=8, single_az=True)) == len(scored)
+
+
+def test_availability_reports_absolutes_and_the_longest_good_window():
+    rows = [
+        _sps("t0", 0, "us-east-1", "use1-az4", "g5.xlarge", 3, capacity=8),
+        _sps("t1", 1, "us-east-1", "use1-az4", "g5.xlarge", 8, capacity=8),
+        _sps("t2", 2, "us-east-1", "use1-az4", "g5.xlarge", 8, capacity=8),
+        _sps("t3", 3, "us-east-1", "use1-az4", "g5.xlarge", 2, capacity=8),
+        _sps("t4", 4, "us-east-1", "use1-az4", "g5.xlarge", 9, capacity=8),
+    ]
+    p = spotwatch.availability(rows, capacity=8, threshold=7)[0]
+    assert p["best"] == 9 and p["samples"] == 5 and p["good_samples"] == 3
+    # Two consecutive good samples an hour apart = a 1-hour window; the lone 9
+    # afterwards is a moment, not a window, and must not extend it.
+    assert p["longest_good_s"] == 3600.0
+    assert p["longest_good_samples"] == 2
+
+
+def test_availability_of_a_drought_is_unmistakable():
+    rows = [_sps(f"t{i}", i, "us-east-1", "use1-az4", "g5.xlarge", 3, capacity=8) for i in range(6)]
+    p = spotwatch.availability(rows, capacity=8, threshold=7)[0]
+    assert p["best"] == 3 and p["good_samples"] == 0 and p["longest_good_s"] == 0.0
+
+
+def test_headline_states_the_capacity_8_answer():
+    h = spotwatch.headline(_synthetic(), threshold=7, home_region="us-east-1")
+    assert h["home_best"] == 3  # 8-in-one-AZ never got near the bar at home
+    assert h["home_good_pools"] == 0
+    assert h["home_cap1_best"] == 9  # ... while capacity 1 looks fine: the trap
+    assert h["world_best"] == 8 and h["world_good_pools"] == 1
+    text = spotwatch.render_headline(_synthetic(), threshold=7, home_region="us-east-1")
+    assert text.startswith("--- HEADLINE")
+    assert "NO." in text and "3/10" in text
+    assert "optimistic" in text  # capacity-1 caveat is spelled out
+
+
+def test_headline_says_yes_with_the_window_length_when_capacity_exists():
+    rows = [
+        _sps("t0", 0, "us-east-1", "use1-az4", "g5.xlarge", 8, capacity=8),
+        _sps("t1", 1, "us-east-1", "use1-az4", "g5.xlarge", 9, capacity=8),
+    ]
+    text = spotwatch.render_headline(rows, threshold=7, home_region="us-east-1")
+    assert "YES" in text and "1.0 h" in text
+
+
+def test_coverage_counts_gaps_against_what_was_requested():
+    recs = _synthetic()
+    recs.append(
+        lam.make_record(
+            "sps_gap",
+            "t0",
+            BASE,
+            region="us-east-1",
+            instance_type="g5.xlarge",
+            capacity=8,
+            single_az=True,
+            scope="region",
+            error_code="RequestLimitExceeded",
+            throttled=True,
+        )
+    )
+    cov = spotwatch.coverage(recs)
+    assert cov["ticks"] == 2 and cov["requested"] == 24
+    assert cov["gaps"] == 1 and cov["throttled"] == 1
+    assert cov["gap_pct"] == pytest.approx(1 / 24)
+
+
+def test_relocation_is_a_separate_question_with_data_gravity_spelled_out():
+    text = spotwatch.render_relocation(_synthetic(), threshold=7, home_region="us-east-1", names={})
+    assert "RELOCATING" in text
+    assert "17 GB" in text and "egress" in text and "one AZ" in text
+    assert "us-west-2" in text  # the only non-home pool that clears the bar
+    assert "1 of" in text
+
+
 def test_render_report_is_plain_text_and_answers_the_question():
     text = spotwatch.render_report(
         _synthetic(), threshold=7, home_region="us-east-1", home_type="g5.xlarge", since_hours=72
@@ -721,18 +955,50 @@ def test_render_report_is_plain_text_and_answers_the_question():
     assert max(len(line) for line in text.splitlines()) <= spotwatch.WIDTH
 
 
+def test_report_leads_with_the_8_node_answer_not_with_a_ranking():
+    text = spotwatch.render_report(
+        _synthetic(), threshold=7, home_region="us-east-1", home_type="g5.xlarge", since_hours=72
+    )
+    body = text[: text.index("VERDICT")]
+    # The drought verdict comes before anything a reader could mistake for
+    # success, and the capacity-8 tables precede the capacity-1 ones.
+    assert body.index("HEADLINE") < body.index("ABSOLUTE AVAILABILITY")
+    assert body.index("8 instance(s), single AZ") < body.index("1 instance(s), single AZ")
+    assert body.index("THE DECISION QUERY") < body.index("context only")
+    assert "NO." in body
+    # The leaderboard is present but explicitly disclaimed.
+    assert "TRUNCATED" in body.upper() and "NOT coverage" in body
+    # Coverage (gaps) is stated before any rate.
+    assert body.index("no gaps") < body.index("HEADLINE")
+
+
 def test_verdict_calls_out_a_hopeless_window():
     dead = [
         _sps(f"t{i}", i, "us-east-1", "use1-az1", "g5.xlarge", 2, single_az=False) for i in range(4)
     ]
     text = spotwatch.verdict(dead, threshold=7, home_region="us-east-1", home_type="g5.xlarge")
     assert "NEVER ENOUGH" in text
+    assert "on-demand baseline" in text  # says what to do instead
+
+
+def test_verdict_judges_at_capacity_8_when_it_has_the_data():
+    # Capacity 1 is wide open, capacity 8 is a desert. The verdict must follow
+    # the query we actually need, not the flattering one.
+    recs = []
+    for i in range(6):
+        recs.append(_sps(f"t{i}", i, "us-east-1", "", "g5.xlarge", 10, single_az=False))
+        recs.append(_sps(f"t{i}", i, "us-east-1", "", "g5.xlarge", 2, single_az=False, capacity=8))
+        recs.append(_sps(f"t{i}", i, "us-east-1", "use1-az4", "g5.xlarge", 2, capacity=8))
+    text = spotwatch.verdict(recs, threshold=7, home_region="us-east-1", home_type="g5.xlarge")
+    assert "NEVER ENOUGH" in text
 
 
 def test_verdict_names_the_cheapest_working_strategy():
     always = []
     for i in range(10):
-        always.append(_sps(f"t{i}", i % 24, "us-east-1", "", "g5.xlarge", 9, single_az=False))
+        always.append(
+            _sps(f"t{i}", i % 24, "us-east-1", "", "g5.xlarge", 9, single_az=False, capacity=8)
+        )
     text = spotwatch.verdict(always, threshold=7, home_region="us-east-1", home_type="g5.xlarge")
     assert "never switch (same region, same GPU)" in text and "100.0%" in text
 

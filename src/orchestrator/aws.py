@@ -176,6 +176,22 @@ def list_keys(bucket: str, prefix: str) -> list[str]:
     return sorted(keys)
 
 
+def default_vpc_id(region: str) -> str:
+    """The region's default VPC id, or "" if it has none. The spotwatch probe
+    launches with no SubnetId, which only works inside a default VPC — checking
+    at deploy time keeps a missing VPC from later masquerading as "no capacity"."""
+    if _DRY_RUN:
+        _log(f"describe-vpcs isDefault=true in {region}")
+        return "vpc-DRYRUN"
+    import boto3  # noqa: PLC0415 — per-region client, outside the cached default
+
+    r = boto3.client("ec2", region_name=region).describe_vpcs(
+        Filters=[{"Name": "isDefault", "Values": ["true"]}]
+    )
+    vpcs = r.get("Vpcs", [])
+    return vpcs[0]["VpcId"] if vpcs else ""
+
+
 def ssm_online(instance_id: str) -> bool:
     """True if the SSM agent on the instance is registered and online (so we can
     send it a command). Boxes get AmazonSSMManagedInstanceCore via the instance

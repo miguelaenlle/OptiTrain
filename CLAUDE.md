@@ -191,7 +191,7 @@ src/orchestrator/      # local control plane (boto3) — you run this
   experiments.py       # run_baseline / run_spot / _run_supervised (multinode)
   supervisor.py        # epoch supervisor: pure decide() reducer + Effects loop
   sidecar.py           # per-box: obey epoch.json, run static torchrun per epoch
-  spotwatch.py         # spot-availability collector: deploy/down/report (~$0)
+  spotwatch.py         # spot-availability collector: deploy/down/report (~$1-3/mo)
   lambda_spotwatch.py  # ^ its Lambda handler — runs IN AWS, boto3+stdlib only
   config.py            # OrchestratorConfig (env-overridable)
   __main__.py          # CLI: setup | stage-data | baseline | spot [--dry-run]
