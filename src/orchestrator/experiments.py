@@ -285,17 +285,27 @@ def _run_single_box(
     ddp: bool = False,
     nproc_per_node: int = 0,
     return_profile: bool = False,
+    run_id: str | None = None,
+    on_profile=None,
 ):
     """One box, run to its wall-clock budget, stream the log, collect the run
     profile, then terminate. Shared by `baseline` (1 process) and `ddp` (torchrun,
-    N processes) — the only difference is the ddp/torchrun launch."""
+    N processes) — the only difference is the ddp/torchrun launch.
+
+    ``run_id`` reuses an existing run prefix instead of minting a new one (the
+    remote orchestrator passes the run it is resuming after a control-plane
+    restart; the trainer's one resume path then continues from that prefix's
+    latest checkpoint). ``on_profile(profile)`` is called once the ledger exists,
+    so a caller can register boxes IT owns — the control-plane instance."""
     ami, sg_id = _prepare(cfg)
-    run_id = _run_id(kind)
+    run_id = run_id or _run_id(kind)
     extra = f" nproc_per_node={nproc_per_node or 'auto(gpu)'}" if ddp else ""
     print(f"[{kind}] run_id={run_id} budget={budget}s{extra}", file=sys.stderr)
     _logs_hint(run_id)
     # Collect a run profile (timeline + loss) and mirror to W&B if configured.
     profile = RunProfile(run_id, kind=kind, market=market)
+    if on_profile is not None:
+        on_profile(profile)
     if not aws.is_dry_run():  # dry-run must not create a real W&B run
         profile.wandb_start(cfg)
     iid = _launch(
@@ -328,8 +338,10 @@ def _run_single_box(
         aws.terminate(iid)
 
 
-def run_baseline(cfg: OrchestratorConfig) -> dict | None:
-    return _run_single_box(cfg, kind="baseline", market="on-demand", budget=cfg.baseline_seconds)
+def run_baseline(cfg: OrchestratorConfig, **kw) -> dict | None:
+    return _run_single_box(
+        cfg, kind="baseline", market="on-demand", budget=cfg.baseline_seconds, **kw
+    )
 
 
 def run_resume(
@@ -399,7 +411,7 @@ def run_resume(
         aws.terminate(iid)
 
 
-def run_ddp(cfg: OrchestratorConfig) -> dict | None:
+def run_ddp(cfg: OrchestratorConfig, **kw) -> dict | None:
     """Single-node, multi-process DDP via torchrun (Phase 1b). Same machinery as
     baseline; the box runs the trainer under torchrun with ddp_nproc_per_node ranks."""
     return _run_single_box(
@@ -409,6 +421,7 @@ def run_ddp(cfg: OrchestratorConfig) -> dict | None:
         budget=cfg.baseline_seconds,
         ddp=True,
         nproc_per_node=cfg.ddp_nproc_per_node,
+        **kw,
     )
 
 
@@ -485,6 +498,8 @@ def _run_supervised(
     kill_schedule: list[tuple[float, int]],
     verdict: bool = False,
     return_profile: bool = False,
+    run_id: str | None = None,
+    on_profile=None,
 ):
     """Shared driver for every multi-node experiment: launch N boxes, hand
     membership to the epoch :class:`~orchestrator.supervisor.Supervisor`, and let
@@ -492,13 +507,20 @@ def _run_supervised(
     one kill with ``replace_on_loss=False`` (+ a PASS/FAIL verdict);
     ``multinode-preempt`` a schedule with ``replace_on_loss=True``. All three
     share one code path, so the W&B world-size staircase / degraded phase / cost
-    ledger behave identically across them."""
+    ledger behave identically across them.
+
+    ``run_id`` reuses an existing run prefix rather than minting a new one: the
+    remote orchestrator passes the run it was already driving when its control
+    plane restarted, so the replacement boxes resume from that run's checkpoints
+    (and its budget-in-checkpoint) instead of training from scratch.
+    ``on_profile(profile)`` lets the caller add ledger rows for boxes it owns —
+    the control-plane instance, so a multi-day run's cost is honest."""
     from .supervisor import Policy, Supervisor
 
     if cfg.node_count < 2:
         raise SystemExit(f"{kind} needs NODES >= 2")
     ami, sg_id = _prepare(cfg)
-    run_id = _run_id(kind)
+    run_id = run_id or _run_id(kind)
     market = cfg.spot_market
     if kill_schedule:
         # Dense checkpoints: a hard kill gives no warning, so lost work (and the
@@ -514,6 +536,8 @@ def _run_supervised(
     )
     _logs_hint(run_id)
     profile = RunProfile(run_id, kind=kind, market=market)
+    if on_profile is not None:
+        on_profile(profile)
     if not aws.is_dry_run():
         profile.wandb_start(cfg)
 
@@ -571,7 +595,7 @@ def _run_supervised(
             aws.terminate(iid)
 
 
-def run_multinode(cfg: OrchestratorConfig) -> dict | None:
+def run_multinode(cfg: OrchestratorConfig, **kw) -> dict | None:
     """N nodes x one-rank-per-GPU DDP under the epoch supervisor, run to the
     wall-clock budget with no kills. Proves a clean multi-node run end to end."""
     return _run_supervised(
@@ -580,10 +604,11 @@ def run_multinode(cfg: OrchestratorConfig) -> dict | None:
         budget=cfg.baseline_seconds,
         replace_on_loss=False,
         kill_schedule=[],
+        **kw,
     )
 
 
-def run_multinode_shrink(cfg: OrchestratorConfig) -> dict | None:
+def run_multinode_shrink(cfg: OrchestratorConfig, **kw) -> dict | None:
     """The minimal elastic validation: ONE kill, NO replacement. The supervisor
     publishes a shrink epoch; survivors must re-form at N-1 and finish the run on
     their own. Ends with an explicit PASS/FAIL verdict (survivors checkpointed
@@ -599,10 +624,11 @@ def run_multinode_shrink(cfg: OrchestratorConfig) -> dict | None:
         replace_on_loss=False,
         kill_schedule=[(kill_after, cfg.node_count - 1)],
         verdict=True,
+        **kw,
     )
 
 
-def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
+def run_multinode_preempt(cfg: OrchestratorConfig, **kw) -> dict | None:
     """Multi-node preemption under the epoch supervisor: a schedule of hard kills,
     each followed by a replacement that rejoins at the next epoch. Same profile
     marks as before (kill -> shrink_resume -> relaunch -> full_world), so the W&B
@@ -619,6 +645,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
         budget=max(1, math.ceil(total)),
         replace_on_loss=True,
         kill_schedule=schedule,
+        **kw,
     )
 
 

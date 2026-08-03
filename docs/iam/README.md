@@ -1,17 +1,20 @@
 # IAM policies
 
-Three least-privilege policies, split by principal. Replace `YOUR_BUCKET` and
+Four least-privilege policies, split by principal. Replace `YOUR_BUCKET` and
 `ACCOUNT_ID` (your 12-digit account number) before attaching.
 
 | Policy | Attach to | When |
 |--------|-----------|------|
-| [`setup-policy.json`](./setup-policy.json) | the **human** running `setup` (laptop user / SSO session) | one-time; creates the bucket + worker role/profile |
+| [`setup-policy.json`](./setup-policy.json) | the **human** running `setup` (laptop user / SSO session) | one-time; creates the bucket + worker/orchestrator roles + profiles |
 | [`controller-policy.json`](./controller-policy.json) | the **orchestrator** — laptop now, an instance-profile role when it becomes a cloud node | every `stage-data` / `baseline` / `spot` run |
+| [`orchestrator-policy.json`](./orchestrator-policy.json) | the **remote control-plane box** (`spot-train-orch-role` instance profile, `spot-orchestrate orch up`) | attached automatically by `setup` |
 | [`worker-policy.json`](./worker-policy.json) | the **training box** (`spot-train-role` instance profile) | attached automatically by `setup` |
 
 `setup` also attaches the AWS-managed `AmazonSSMManagedInstanceCore` policy to the
 worker role so you can attach a shell via SSM Session Manager (no inbound ports)
-to watch training live — see the main README's "Watch a run live".
+to watch training live — see the main README's "Watch a run live". The
+orchestrator role gets it too, so you can `journalctl -u spot-orch -f` on the
+control plane during a multi-day run.
 
 ## Design notes
 
@@ -27,10 +30,19 @@ to watch training live — see the main README's "Watch a run live".
 - **`PassRole` is scoped.** The controller may pass only `spot-train-role`, and
   only to `ec2.amazonaws.com` — a compromised controller can't hand out arbitrary
   roles.
+- **The remote control plane is a role, never keys.** `orch up` copies **no**
+  credentials into user-data (which is readable from IMDS by anything on the
+  box); the instance profile's role is refreshed by IMDS for as long as the box
+  lives. Static keys or an STS session token would expire hours into a 36-hour
+  run and strand the fleet. `orchestrator-policy.json` is the controller policy
+  minus the human-only bits (no `ssm:StartSession`, no service-quota lookups) —
+  it can launch, tag, describe and terminate training instances, read/write the
+  run bucket, and pass **only** `spot-train-role` to EC2. It cannot create roles,
+  cannot create buckets, and cannot pass any other role.
 - **`ssm:StartSession`** in the controller policy is a human-operator convenience
   (to `tail -f` the box live). It's not needed by an automated cloud controller —
   drop that statement there. The box side (`AmazonSSMManagedInstanceCore` on the
-  worker role) is attached by `setup`.
+  worker and orchestrator roles) is attached by `setup`.
 
 ## For a throwaway test user
 

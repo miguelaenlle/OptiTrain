@@ -19,11 +19,17 @@ def ensure_infra(cfg: OrchestratorConfig) -> None:
 
     aws.ensure_bucket(cfg.bucket, cfg.region)
     aws.ensure_instance_profile(cfg.role_name, cfg.instance_profile, cfg.bucket)
+    # The control plane's own role (`orch up`): EC2 lifecycle + S3 + PassRole for
+    # the worker role. Created here because it needs the same one-time IAM rights
+    # as the worker role — the ongoing controller never creates roles.
+    aws.ensure_orchestrator_profile(
+        cfg.orch_role_name, cfg.orch_instance_profile, cfg.bucket, cfg.role_name
+    )
     sg_id = aws.ensure_security_group(cfg.security_group, cfg.region)
 
     print(
         f"[setup] ready: bucket={cfg.bucket} profile={cfg.instance_profile} "
-        f"sg={sg_id} region={cfg.region}",
+        f"orch_profile={cfg.orch_instance_profile} sg={sg_id} region={cfg.region}",
         file=sys.stderr,
     )
     print(
