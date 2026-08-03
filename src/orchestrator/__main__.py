@@ -157,7 +157,50 @@ def main() -> None:
         "--keep", action="store_true", help="don't tear down a fleet this experiment booted"
     )
 
+    sw_parser = sub.add_parser(
+        "spotwatch",
+        parents=[common],
+        help="unattended GPU spot-availability collector (Lambda + 10-min tick)",
+    )
+    sw_sub = sw_parser.add_subparsers(dest="spotwatch_command", required=True)
+    sw_sub.add_parser("deploy", parents=[common], help="create/update the collector (idempotent)")
+    sw_sub.add_parser("down", parents=[common], help="remove the rule, function and role")
+    sw_report = sw_sub.add_parser("report", parents=[common], help="analyse the collected JSONL")
+    sw_report.add_argument(
+        "--since", type=float, default=72.0, help="hours to analyse (default 72)"
+    )
+    sw_report.add_argument(
+        "--threshold", type=float, default=7.0, help="placement score counted as 'good' (1-10)"
+    )
+    sw_report.add_argument("--region", default="", help="home region (default: AWS_REGION)")
+    sw_report.add_argument(
+        "--type", dest="instance_type", default="", help="home GPU type (default: INSTANCE_TYPE)"
+    )
+
     args = parser.parse_args()
+
+    if args.command == "spotwatch":
+        from . import aws, spotwatch
+        from .config import OrchestratorConfig
+
+        aws.set_dry_run(args.dry_run)
+        cfg = OrchestratorConfig()
+        aws.set_region(cfg.region)
+        if args.spotwatch_command == "deploy":
+            spotwatch.deploy(cfg)
+        elif args.spotwatch_command == "down":
+            spotwatch.down(cfg)
+        elif args.spotwatch_command == "report":
+            spotwatch.report(
+                cfg,
+                since_hours=args.since,
+                threshold=args.threshold,
+                home_region=args.region,
+                home_type=args.instance_type,
+            )
+        if args.dry_run:
+            print("\n[dry-run] no AWS calls were made.", file=sys.stderr)
+        return
 
     if args.command == "fleet":
         from . import fleet
