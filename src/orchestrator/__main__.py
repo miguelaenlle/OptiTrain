@@ -132,7 +132,11 @@ def main() -> None:
     orch_up.add_argument("--node", type=int, default=None, help="dashboard: node tab to open")
     orch_up.add_argument("--interval", type=float, default=None, help="dashboard: poll seconds")
     orch_up.add_argument("--grid", action="store_true", help="dashboard: open the tiled grid")
-    orch_status = orch_sub.add_parser("status", parents=[common])
+    orch_status = orch_sub.add_parser(
+        "status",
+        parents=[common],
+        help="one screen: heartbeat age, epoch/world, step/loss, elapsed vs budget, cost",
+    )
     orch_status.add_argument("--id", dest="orch_id", default="", help="orchestrator id")
     orch_logs = orch_sub.add_parser(
         "logs", parents=[common], help="reattach to the active orchestrator's dashboard"
@@ -149,8 +153,10 @@ def main() -> None:
         "--all", action="store_true", help="also terminate the training fleet it was driving"
     )
     orch_down.add_argument("--yes", "-y", action="store_true", help="skip the confirmation")
-    # Internal: what the systemd unit on the box runs. Hidden — you never type it.
-    orch_agent = orch_sub.add_parser("_agent", parents=[common], help=argparse.SUPPRESS)
+    # What the systemd unit on the box runs — you never type this yourself.
+    orch_agent = orch_sub.add_parser(
+        "_agent", parents=[common], help="(internal) run the experiment ON the control-plane box"
+    )
     orch_agent.add_argument("--orch-id", dest="orch_id", required=True)
     orch_agent.add_argument("--experiment", required=True)
 
