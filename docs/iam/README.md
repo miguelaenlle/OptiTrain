@@ -1,6 +1,6 @@
 # IAM policies
 
-Three least-privilege policies, split by principal. Replace `YOUR_BUCKET` and
+Four least-privilege policies, split by principal. Replace `YOUR_BUCKET` and
 `ACCOUNT_ID` (your 12-digit account number) before attaching.
 
 | Policy | Attach to | When |
@@ -8,6 +8,12 @@ Three least-privilege policies, split by principal. Replace `YOUR_BUCKET` and
 | [`setup-policy.json`](./setup-policy.json) | the **human** running `setup` (laptop user / SSO session) | one-time; creates the bucket + worker role/profile |
 | [`controller-policy.json`](./controller-policy.json) | the **orchestrator** — laptop now, an instance-profile role when it becomes a cloud node | every `stage-data` / `baseline` / `spot` run |
 | [`worker-policy.json`](./worker-policy.json) | the **training box** (`spot-train-role` instance profile) | attached automatically by `setup` |
+| [`spotwatch-policy.json`](./spotwatch-policy.json) | the **human** running `spotwatch deploy`/`down`/`report` | only if you run the spot-availability collector |
+
+The collector's own runtime permissions are *not* here: `spotwatch deploy`
+writes them as an inline policy on `spotwatch-lambda-role` (see
+`orchestrator/spotwatch.py:lambda_policy`), so tightening them is another
+`deploy` rather than a console edit.
 
 `setup` also attaches the AWS-managed `AmazonSSMManagedInstanceCore` policy to the
 worker role so you can attach a shell via SSM Session Manager (no inbound ports)

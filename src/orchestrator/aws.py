@@ -123,6 +123,26 @@ def get_text(bucket: str, key: str) -> str:
     return _client("s3").get_object(Bucket=bucket, Key=key)["Body"].read().decode()
 
 
+def get_texts(bucket: str, keys: list[str]) -> dict[str, str]:
+    """Fetch many small objects at once. The spotwatch report reads one shard per
+    10-minute tick (432 for a 72h window) — serially that is minutes of pure
+    round-trip latency, so they go out on a small thread pool. Unreadable keys
+    are skipped rather than failing a report over one bad object."""
+    if _DRY_RUN:
+        _log(f"get {len(keys)} objects from s3://{bucket}/")
+        return {}
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(key: str) -> tuple[str, str]:
+        try:
+            return key, _client("s3").get_object(Bucket=bucket, Key=key)["Body"].read().decode()
+        except Exception:  # noqa: BLE001 — one shard missing must not sink the report
+            return key, ""
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        return {k: v for k, v in pool.map(_one, keys) if v}
+
+
 def max_checkpoint_step(bucket: str, prefix: str) -> int:
     """Highest checkpoint step under ``prefix`` (ckpt-<step>.pt), or -1 if none.
     Used to detect training-start (step advances past the resume point) and to
@@ -765,6 +785,237 @@ def wait_vcpu_headroom(needed: int, quota: int, timeout: int = 900) -> None:
                 f"no vCPU headroom after {timeout}s ({used} used + {needed} needed > {quota})"
             )
         time.sleep(15)
+
+
+# --------------------------------------------------------------------------- #
+# Mutating: Lambda + EventBridge (the spotwatch collector's control plane)
+#
+# Everything here is ensure_*: safe to re-run, updating in place rather than
+# creating a second copy. `spotwatch deploy` is expected to be run repeatedly.
+# --------------------------------------------------------------------------- #
+def role_arn(role_name: str) -> str:
+    if _DRY_RUN:
+        _log(f"get IAM role arn {role_name}")
+        return f"arn:aws:iam::000000000000:role/{role_name}"
+    return _client("iam").get_role(RoleName=role_name)["Role"]["Arn"]
+
+
+def ensure_service_role(role_name: str, service: str, policy_name: str, policy: dict) -> str:
+    """Create/refresh a role an AWS *service* (not EC2) assumes, with one inline
+    policy. Returns the role ARN. Re-running rewrites the policy, so tightening
+    permissions is just another `deploy`."""
+    import json
+
+    _log(f"create IAM role {role_name} assumable by {service} + inline policy {policy_name}")
+    if _DRY_RUN:
+        return f"arn:aws:iam::000000000000:role/{role_name}"
+    iam = _client("iam")
+    assume = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": service},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+    _ignore_exists(
+        lambda: iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=json.dumps(assume))
+    )
+    iam.put_role_policy(
+        RoleName=role_name, PolicyName=policy_name, PolicyDocument=json.dumps(policy)
+    )
+    return iam.get_role(RoleName=role_name)["Role"]["Arn"]
+
+
+def delete_role(role_name: str) -> None:
+    """Delete a role and everything attached to it (IAM refuses otherwise)."""
+    _log(f"delete IAM role {role_name} (+ its inline/attached policies)")
+    if _DRY_RUN:
+        return
+    iam = _client("iam")
+    try:
+        for name in iam.list_role_policies(RoleName=role_name).get("PolicyNames", []):
+            iam.delete_role_policy(RoleName=role_name, PolicyName=name)
+        for pol in iam.list_attached_role_policies(RoleName=role_name).get("AttachedPolicies", []):
+            iam.detach_role_policy(RoleName=role_name, PolicyArn=pol["PolicyArn"])
+        iam.delete_role(RoleName=role_name)
+    except Exception as e:  # noqa: BLE001 — already gone is a successful teardown
+        if "NoSuchEntity" not in str(e):
+            raise
+
+
+def lambda_code_sha256(function_name: str) -> str | None:
+    """Base64 SHA-256 of the deployed zip, or None if the function doesn't exist
+    — lets `deploy` skip the code update when nothing changed."""
+    if _DRY_RUN:
+        _log(f"get lambda {function_name} code sha")
+        return None
+    try:
+        return _client("lambda").get_function(FunctionName=function_name)["Configuration"][
+            "CodeSha256"
+        ]
+    except Exception:  # noqa: BLE001 — ResourceNotFound == not deployed yet
+        return None
+
+
+def ensure_lambda_function(
+    *,
+    function_name: str,
+    role: str,
+    handler: str,
+    runtime: str,
+    zip_bytes: bytes,
+    env: dict[str, str],
+    timeout: int,
+    memory_mb: int,
+    description: str = "",
+) -> str:
+    """Create the function, or update code+config in place. Returns its ARN."""
+    import base64
+    import hashlib
+
+    want_sha = base64.b64encode(hashlib.sha256(zip_bytes).digest()).decode()
+    have_sha = lambda_code_sha256(function_name)
+    _log(
+        f"deploy lambda {function_name} ({len(zip_bytes)}B, {runtime}, {timeout}s, "
+        f"{memory_mb}MB) — {'create' if have_sha is None else 'update'}"
+    )
+    if _DRY_RUN:
+        return f"arn:aws:lambda:{_region}:000000000000:function:{function_name}"
+    lam = _client("lambda")
+    if have_sha is None:
+        # A freshly created role isn't immediately assumable by Lambda (IAM is
+        # eventually consistent); CreateFunction then fails with
+        # InvalidParameterValueException. Retry for ~60s rather than making the
+        # operator re-run deploy.
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                r = lam.create_function(
+                    FunctionName=function_name,
+                    Runtime=runtime,
+                    Role=role,
+                    Handler=handler,
+                    Code={"ZipFile": zip_bytes},
+                    Description=description,
+                    Timeout=timeout,
+                    MemorySize=memory_mb,
+                    Environment={"Variables": env},
+                    Publish=True,
+                )
+                return r["FunctionArn"]
+            except Exception as e:  # noqa: BLE001
+                if "cannot be assumed" not in str(e) or time.monotonic() > deadline:
+                    raise
+                _log("waiting for the new IAM role to become assumable by Lambda...")
+                time.sleep(5)
+    if have_sha != want_sha:
+        lam.update_function_code(FunctionName=function_name, ZipFile=zip_bytes, Publish=True)
+        _wait_lambda_updated(function_name)
+    lam.update_function_configuration(
+        FunctionName=function_name,
+        Role=role,
+        Handler=handler,
+        Runtime=runtime,
+        Timeout=timeout,
+        MemorySize=memory_mb,
+        Environment={"Variables": env},
+        Description=description,
+    )
+    _wait_lambda_updated(function_name)
+    return lam.get_function(FunctionName=function_name)["Configuration"]["FunctionArn"]
+
+
+def _wait_lambda_updated(function_name: str, timeout: int = 120) -> None:
+    """Code and config updates are asynchronous; a second update while the first
+    is InProgress fails with ResourceConflictException."""
+    lam = _client("lambda")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        cfg = lam.get_function_configuration(FunctionName=function_name)
+        if cfg.get("LastUpdateStatus") != "InProgress":
+            return
+        time.sleep(2)
+
+
+def delete_lambda_function(function_name: str) -> None:
+    _log(f"delete lambda {function_name}")
+    if _DRY_RUN:
+        return
+    try:
+        _client("lambda").delete_function(FunctionName=function_name)
+    except Exception as e:  # noqa: BLE001 — already gone is a successful teardown
+        if "ResourceNotFound" not in str(e):
+            raise
+
+
+def ensure_lambda_permission(
+    function_name: str, statement_id: str, principal: str, source_arn: str
+) -> None:
+    """Let ``principal`` (e.g. events.amazonaws.com) invoke the function. The
+    statement id makes it idempotent — a duplicate is a no-op, not a second
+    grant."""
+    _log(f"allow {principal} ({source_arn}) to invoke {function_name} [{statement_id}]")
+    if _DRY_RUN:
+        return
+    try:
+        _client("lambda").add_permission(
+            FunctionName=function_name,
+            StatementId=statement_id,
+            Action="lambda:InvokeFunction",
+            Principal=principal,
+            SourceArn=source_arn,
+        )
+    except Exception as e:  # noqa: BLE001
+        if "ResourceConflictException" not in str(e):
+            raise
+
+
+def remove_lambda_permission(function_name: str, statement_id: str) -> None:
+    _log(f"revoke invoke permission {statement_id} on {function_name}")
+    if _DRY_RUN:
+        return
+    try:
+        _client("lambda").remove_permission(FunctionName=function_name, StatementId=statement_id)
+    except Exception as e:  # noqa: BLE001 — already gone is a successful teardown
+        if "ResourceNotFound" not in str(e):
+            raise
+
+
+def ensure_schedule_rule(rule_name: str, schedule: str, description: str = "") -> str:
+    """EventBridge rule on a fixed cadence, e.g. ``rate(10 minutes)``. PutRule is
+    an upsert, so changing the cadence is just another deploy."""
+    _log(f"put EventBridge rule {rule_name} schedule={schedule!r}")
+    if _DRY_RUN:
+        return f"arn:aws:events:{_region}:000000000000:rule/{rule_name}"
+    return _client("events").put_rule(
+        Name=rule_name, ScheduleExpression=schedule, State="ENABLED", Description=description
+    )["RuleArn"]
+
+
+def put_rule_target(rule_name: str, target_id: str, target_arn: str) -> None:
+    """Point the rule at the function. Same target id => replaced, not added."""
+    _log(f"put target {target_id} -> {target_arn} on rule {rule_name}")
+    if _DRY_RUN:
+        return
+    _client("events").put_targets(Rule=rule_name, Targets=[{"Id": target_id, "Arn": target_arn}])
+
+
+def delete_schedule_rule(rule_name: str, target_ids: list[str]) -> None:
+    """Remove the targets then the rule (EventBridge refuses to delete a rule
+    that still has targets)."""
+    _log(f"delete EventBridge rule {rule_name} (targets {target_ids})")
+    if _DRY_RUN:
+        return
+    events = _client("events")
+    try:
+        events.remove_targets(Rule=rule_name, Ids=target_ids)
+        events.delete_rule(Name=rule_name)
+    except Exception as e:  # noqa: BLE001 — already gone is a successful teardown
+        if "ResourceNotFound" not in str(e):
+            raise
 
 
 def _ignore_exists(fn) -> None:

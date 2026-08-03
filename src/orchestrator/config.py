@@ -254,6 +254,31 @@ class OrchestratorConfig:
     # experiments); set FLEET_INGRESS_CIDR=<your-ip>/32 to tighten.
     fleet_ingress_cidr: str = field(default_factory=lambda: _env("FLEET_INGRESS_CIDR", "0.0.0.0/0"))
 
+    # --- spotwatch (unattended spot-availability collector) -------------------
+    # S3 prefix the Lambda writes JSONL shards under; also the only prefix its
+    # IAM role can touch, so a bug in the collector can't reach checkpoints.
+    spotwatch_prefix: str = field(default_factory=lambda: _env("SPOTWATCH_PREFIX", "spotwatch"))
+    # Tick cadence. 10 minutes = 144 samples/day, comfortably inside Lambda's
+    # free tier and fine-grained enough to see an hour-of-day pattern.
+    spotwatch_interval_minutes: int = field(
+        default_factory=lambda: _env_int("SPOTWATCH_INTERVAL_MINUTES", 10)
+    )
+    # UTC hour whose first tick also does the daily-only work (pool enumeration
+    # + Spot Advisor fetch). 3 = quiet hour, away from business-hours throttling.
+    spotwatch_daily_hour: int = field(default_factory=lambda: _env_int("SPOTWATCH_DAILY_HOUR", 3))
+    # Truth probe: a real 1-instance spot launch, immediately returned. This is
+    # the only part that spends money or competes for capacity — hence the hard
+    # rate limit and the non-interference skip (see lambda_spotwatch.should_probe).
+    spotwatch_probe_enabled: bool = field(
+        default_factory=lambda: _env("SPOTWATCH_PROBE_ENABLED", "1") not in ("0", "false", "False")
+    )
+    spotwatch_probe_type: str = field(
+        default_factory=lambda: _env("SPOTWATCH_PROBE_TYPE", "g5.xlarge")
+    )
+    spotwatch_probe_min_hours: float = field(
+        default_factory=lambda: _env_float("SPOTWATCH_PROBE_MIN_HOURS", 6.0)
+    )
+
     # --- vCPU quota gate ------------------------------------------------------
     # The account's "Running On-Demand G and VT instances" vCPU quota. Launches
     # wait until running+pending G/VT usage leaves headroom under this before

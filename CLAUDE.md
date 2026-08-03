@@ -191,6 +191,8 @@ src/orchestrator/      # local control plane (boto3) — you run this
   experiments.py       # run_baseline / run_spot / _run_supervised (multinode)
   supervisor.py        # epoch supervisor: pure decide() reducer + Effects loop
   sidecar.py           # per-box: obey epoch.json, run static torchrun per epoch
+  spotwatch.py         # spot-availability collector: deploy/down/report (~$0)
+  lambda_spotwatch.py  # ^ its Lambda handler — runs IN AWS, boto3+stdlib only
   config.py            # OrchestratorConfig (env-overridable)
   __main__.py          # CLI: setup | stage-data | baseline | spot [--dry-run]
 third_party/nanoGPT/   # Karpathy's nanoGPT — git submodule, read-only.
