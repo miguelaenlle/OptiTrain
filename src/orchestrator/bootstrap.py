@@ -450,6 +450,13 @@ def build_user_data(
         # Operator-overridable for a real EFA fleet (NCCL_NET=OFI).
         env["NCCL_NET"] = os.environ.get("NCCL_NET", "Socket")
         env["NCCL_NET_PLUGIN"] = os.environ.get("NCCL_NET_PLUGIN", "none")
+        # Relaunch-after-kill can find the GPU fragmented or a just-reaped worker's
+        # allocation still settling; expandable segments let the allocator grow into
+        # freed space instead of OOM-ing on a large contiguous request. Cheap and
+        # safe; operator-overridable.
+        env["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+        )
         # No EFA on g4dn/g5.xlarge, so the gradient all-reduce rides bare TCP,
         # whose NCCL defaults (1 thread x 1 socket) leave bandwidth on the table.
         # Parallelize the socket transport: ~2-4x all-reduce throughput, the
