@@ -79,6 +79,35 @@ but adds standing infra + cost and a shared-throughput ceiling. For a pure-spot
 thesis, stream-from-S3 is the cheaper, more elastic default; FSx is the pragmatic
 shortcut if loader complexity isn't worth it for a one-off run.
 
+### The monolithic corpus today: `data/openwebtext/prepare.py`
+
+Until the sharded loader exists, the full corpus ships as one `train.bin`. The
+prep job (`python data/openwebtext/prepare.py`, then `DATASET=openwebtext
+spot-orchestrate stage-data`) reproduces nanoGPT's OWT recipe exactly — GPT-2
+BPE, uint16, EOT-separated docs, the 0.05% / seed-2357 split — but streams
+chunks into a preallocated memmap instead of buffering tokens in RAM, and
+publishes each bin via a `.partial` → rename so an interrupted run resumes
+rather than leaving a short bin. One-time cost: **~110 GB free disk** (54 GB raw
+HF cache + ~35 GB tokenized arrow + 17 GB bins), ~8 GB RAM, **~1–2 h**. Output:
+**~9.04 B train tokens / 17 GB**, **~4.4 M val tokens / 8.5 MB**, no `meta.pkl`.
+
+**Per-box download cost — the number that justifies item 2 above.** Every box
+pulls the whole 17 GB before step 1, and again after every preemption
+replacement. Same-region S3 → g5.xlarge, boto3's managed download (parallel
+ranged GETs straight to disk, so RAM is flat):
+
+| Destination for `DATA_LOCAL_DIR` | Ceiling | 17 GB takes |
+|---|---|---|
+| gp3 root volume at the default 125 MB/s | **disk** write throughput | **~2.3–2.5 min** |
+| gp3 provisioned ≥ 500 MB/s | g5.xlarge EBS bandwidth (~437 MB/s) | ~40–65 s |
+| instance-store NVMe (`/opt/dlami/nvme`) | 10 Gbps network (~600 MB/s realised) | ~30–50 s |
+
+So at 4 nodes the corpus costs ~10 GPU-minutes of idle per cold start and ~2.5
+min of extra recovery per preemption — dollars are ~0 (same-region transfer is
+free; ~2.1 k GETs is under a cent). Today `bootstrap.py` points
+`DATA_LOCAL_DIR` at the EBS root volume, i.e. the slowest row; pointing it at
+the NVMe scratch disk is the cheap ~4× win before the streaming loader lands.
+
 ## Model & training config at scale
 
 - **Size = config.** Set `N_LAYER/N_HEAD/N_EMBD/BLOCK_SIZE` (add as env knobs +
