@@ -151,6 +151,10 @@ ON_DEMAND_HOURLY_USD = {
     "t3.micro": 0.0104,
     "t3.small": 0.0208,
     "t3.medium": 0.0416,
+    # Dataset-prep boxes (`stage-data --remote`): CPU-only, one hour, one job.
+    "c6i.2xlarge": 0.34,
+    "c6i.4xlarge": 0.68,
+    "c6i.8xlarge": 1.36,
 }
 
 
@@ -349,6 +353,43 @@ class OrchestratorConfig:
     # `orch up` gives up waiting for the box to boot + provision after this.
     orch_boot_timeout_seconds: int = field(
         default_factory=lambda: _env_int("ORCH_BOOT_TIMEOUT", 1800)
+    )
+
+    # --- remote dataset prep (spot-orchestrate stage-data --remote) ----------
+    # One throwaway on-demand box prepares the corpus IN AWS and uploads the bins
+    # same-region (free, minutes) instead of pushing 17 GB up a home uplink.
+    # CPU is NOT the bottleneck — tiktoken does ~29 MB/s/core, so even 4 cores
+    # tokenize OpenWebText in minutes; the HF download, the ~52 GB of cache
+    # writes and the S3 upload are. 16 vCPU keeps that pipeline saturated for
+    # ~$0.68/hr on a job that runs about an hour.
+    prep_instance_type: str = field(
+        default_factory=lambda: _env("PREP_INSTANCE_TYPE", "c6i.4xlarge")
+    )
+    # Root volume, sized EXPLICITLY: OpenWebText needs ~110 GB transient (54 GB
+    # HF cache + ~35 GB tokenized arrow + 17 GB bins), and every AMI default is
+    # far below that (AL2023 8 GB, DLAMI 30 GB). Inheriting the AMI's mapping —
+    # which is what every other launch in this repo does — would fill the disk
+    # ~40 minutes in.
+    prep_volume_gb: int = field(default_factory=lambda: _env_int("PREP_VOLUME_GB", 200))
+    # gp3 defaults to 125 MB/s and 3000 IOPS. ~52 GB of cache writes at 125 MB/s
+    # is ~7 minutes of pure disk wait on the critical path; 500 MB/s costs cents
+    # for a one-hour volume. gp3 caps throughput at 0.25 MB/s per provisioned
+    # IOPS, so 500 MB/s needs >=2000 IOPS — 6000 leaves headroom for the many
+    # small random writes the arrow cache makes.
+    prep_volume_throughput: int = field(
+        default_factory=lambda: _env_int("PREP_VOLUME_THROUGHPUT", 500)
+    )
+    prep_volume_iops: int = field(default_factory=lambda: _env_int("PREP_VOLUME_IOPS", 6000))
+    # Dead-man's switch — MANDATORY here (unlike the control plane's opt-in
+    # ceiling): this box exists to run ONE unattended job, and the worst possible
+    # outcome is a wedged prep billing overnight. 4h is ~4x the expected runtime,
+    # so it only ever fires on a genuinely stuck job.
+    prep_max_lifetime_seconds: int = field(
+        default_factory=lambda: _env_int("PREP_MAX_LIFETIME_SECONDS", 4 * 3600)
+    )
+    # Roughly how long the job takes, for the billable notice's cost estimate.
+    prep_expected_minutes: int = field(
+        default_factory=lambda: _env_int("PREP_EXPECTED_MINUTES", 70)
     )
 
     # --- inference fleet (ROADMAP Part 1) ------------------------------------
@@ -577,6 +618,22 @@ class OrchestratorConfig:
 
     def bake_log_key(self, bake_id: str) -> str:
         return f"bake/{bake_id}/bake.log"
+
+    # Remote dataset prep (`stage-data --remote`): the box streams its whole log
+    # here so the laptop can watch an hour-long job, and writes status.json last
+    # (the done signal — same shape as the bake marker).
+    def prep_log_key(self, prep_id: str) -> str:
+        return f"prep/{prep_id}/prep.log"
+
+    def prep_status_key(self, prep_id: str) -> str:
+        return f"prep/{prep_id}/status.json"
+
+    def prep_log_uri(self, prep_id: str) -> str:
+        return f"s3://{self.bucket}/{self.prep_log_key(prep_id)}"
+
+    def prep_hourly_usd(self) -> float | None:
+        """$/hr for the prep box (None = unknown type, so no cost estimate)."""
+        return ON_DEMAND_HOURLY_USD.get(self.prep_instance_type)
 
     def on_demand_hourly_usd(self) -> float | None:
         """$/hr for on-demand ledger rows: HOURLY_USD override, else the table.

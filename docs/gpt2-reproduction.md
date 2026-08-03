@@ -91,6 +91,15 @@ rather than leaving a short bin. One-time cost: **~110 GB free disk** (54 GB raw
 HF cache + ~35 GB tokenized arrow + 17 GB bins), ~8 GB RAM, **~1–2 h**. Output:
 **~9.04 B train tokens / 17 GB**, **~4.4 M val tokens / 8.5 MB**, no `meta.pkl`.
 
+**Run it in AWS, not on a laptop:** `DATASET=openwebtext spot-orchestrate
+stage-data --remote`. Same two steps (`prepare.py` → `stage-data`), but on one
+throwaway on-demand `c6i.4xlarge` with a 200 GB / 500 MB/s gp3 root, so the
+110 GB of transient cache fits and the 17 GB upload is same-region (free,
+minutes) instead of an overnight push up a home uplink. ~45–70 min, ~$0.90; the
+box streams its log to `s3://<bucket>/prep/<id>/prep.log` (Ctrl-C detaches, it
+keeps going) and terminates itself on success, on failure, and unconditionally
+after `PREP_MAX_LIFETIME_SECONDS`. It clones `REPO_BRANCH` — set it.
+
 **Per-box download cost — the number that justifies item 2 above.** Every box
 pulls the whole 17 GB before step 1, and again after every preemption
 replacement. Same-region S3 → g5.xlarge, boto3's managed download (parallel

@@ -185,7 +185,11 @@ src/spot_train/        # remote trainer — OUR fault-tolerance loop
 src/orchestrator/      # local control plane (boto3) — you run this
   aws.py               # the ONLY module that calls AWS; --dry-run + logging
   setup.py             # idempotent: bucket + IAM instance profile + SG
-  dataset.py           # prepare-once → upload to S3
+  dataset.py           # prepare-once → upload to S3 (local `stage-data`)
+  prep.py              # `stage-data --remote`: prepare the corpus IN AWS on one
+                       #   throwaway box (110 GB transient / 17 GB train.bin do
+                       #   not fit a laptop); self-terminating, log streamed to
+                       #   s3://<bucket>/prep/<id>/prep.log
   bake.py              # bake-ami: pre-provisioned AMI (repo+deps) → faster boots
   bootstrap.py         # EC2 user-data script builder (multinode → sidecar)
   experiments.py       # run_baseline / run_spot / _run_supervised (multinode)
@@ -198,7 +202,7 @@ src/orchestrator/      # local control plane (boto3) — you run this
                        #   36h run doesn't need the laptop; `up` attaches to the
                        #   existing logview dashboard, Ctrl-C only detaches
   config.py            # OrchestratorConfig (env-overridable)
-  __main__.py          # CLI: setup | stage-data | baseline | spot [--dry-run]
+  __main__.py          # CLI: setup | stage-data [--remote] | baseline | spot [--dry-run]
 third_party/nanoGPT/   # Karpathy's nanoGPT — git submodule, read-only.
                        #   we import GPT/GPTConfig from model.py; we do NOT
                        #   use their train.py — our loop owns fault tolerance.

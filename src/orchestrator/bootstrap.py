@@ -534,6 +534,193 @@ echo "[orch] user-data done — the run is systemd's now; this box outlives your
 """
 
 
+# --------------------------------------------------------------------------- #
+# Remote dataset prep (`stage-data --remote`)
+# --------------------------------------------------------------------------- #
+_PREP_APP = "/home/ec2-user/app"
+# The HuggingFace cache (54 GB for OpenWebText) MUST land on the big root volume
+# the prep launch provisions, never in whatever $HOME the shell inherits.
+_PREP_HF_HOME = "/home/ec2-user/hf-cache"
+# Prep knobs relayed verbatim, and only when set — same discipline as
+# trainer_passthrough. Deliberately no credential-shaped names (HF_TOKEN &c):
+# user-data is readable by anything on the box.
+_PREP_PASSTHROUGH = ("OWT_NUM_PROC", "OWT_TARGET_TOKENS")
+
+
+def _prep_env(cfg: OrchestratorConfig) -> dict[str, str]:
+    """Environment the prep box runs the job under. ``stage-data`` on the box is
+    the SAME CLI the laptop runs, so it reads the same three variables."""
+    env = {
+        "SPOT_TRAIN_BUCKET": cfg.bucket,
+        "AWS_REGION": cfg.region,
+        # Both spellings on purpose: the log relay and the staging upload are
+        # separate boto3 processes, and an unset region makes them fall back to
+        # IMDS lookup — a needless dependency when we already know the region.
+        "AWS_DEFAULT_REGION": cfg.region,
+        "DATASET": cfg.dataset,
+        "HF_HOME": _PREP_HF_HOME,
+        "PYTHONUNBUFFERED": "1",  # tqdm/prints reach the streamed log immediately
+    }
+    env.update({k: os.environ[k] for k in _PREP_PASSTHROUGH if os.environ.get(k)})
+    return env
+
+
+def build_prep_user_data(cfg: OrchestratorConfig, *, prep_id: str) -> str:
+    """Boot a THROWAWAY dataset-prep box (``stage-data --remote``): prepare the
+    configured dataset, upload the bins to S3 with the ordinary ``stage-data``
+    code path, and terminate — whatever happens.
+
+    Same Amazon Linux 2023 + venv + boto3 shape as the control plane
+    (``build_orchestrator_user_data``), because this is the same kind of job: no
+    GPU, no torch, just python and S3. It differs in the one way that matters —
+    **it must never outlive its job**, so termination is layered four deep:
+
+      1. ``InstanceInitiatedShutdownBehavior=terminate`` on the launch, so any OS
+         poweroff is a real termination (billing stops, volume is deleted);
+      2. an UNCONDITIONAL systemd lifetime timer armed as the very first action,
+         before anything that can fail — it fires even if this script dies on its
+         next line, or wedges forever inside the HF download;
+      3. a ``trap ... EXIT`` that powers off on EVERY exit path (``set -e``
+         abort, a python traceback, an early ``exit 1``);
+      4. an explicit ``shutdown -h now`` after the status document is written, so
+         the normal path doesn't wait on the timer.
+
+    The job itself runs in a subshell so a failure becomes an exit code we can
+    publish, rather than an early exit that would skip the status marker. No
+    credentials are passed in: S3 access comes from the instance-profile role."""
+    bucket = cfg.bucket
+    log_key = cfg.prep_log_key(prep_id)
+    status_key = cfg.prep_status_key(prep_id)
+    interval = cfg.log_stream_seconds
+    dataset = cfg.dataset
+    env_exports = "\n".join(f'export {k}="{v}"' for k, v in sorted(_prep_env(cfg).items()))
+    n = max(60, cfg.prep_max_lifetime_seconds)
+    mins = max(1, -(-n // 60))  # ceil(n/60) for the `shutdown` fallback (minutes)
+    return f"""#!/bin/bash
+set -x
+exec > /var/log/spot-prep.log 2>&1
+chmod 644 /var/log/spot-prep.log
+
+# --- 1. dead-man's switch, armed BEFORE anything that can fail -------------- #
+# Unconditional on purpose: if the very next line kills this script, the box
+# still terminates on its own. systemd owns the timer, so it survives user-data
+# exiting, a wedged download, and a dead laptop.
+echo "[prep] {prep_id}: self-terminate scheduled in {n}s (dead-man switch)"
+systemd-run --on-active={n}s --unit=spot-prep-autokill /usr/bin/systemctl poweroff \\
+  || shutdown -h +{mins} "spot-prep autokill" || true
+
+# --- 2. terminate on EVERY exit path --------------------------------------- #
+# A failure that leaves this box running is the worst outcome of the whole
+# command, so the poweroff is a trap, not a trailing line someone can skip: it
+# fires on a `set -e` abort, a python traceback, and any early `exit`.
+terminate_self() {{
+  RC=$?
+  echo "[prep] user-data exiting rc=$RC — powering off (shutdown behavior=terminate)"
+  shutdown -h now || systemctl poweroff || poweroff -f
+}}
+trap terminate_self EXIT
+
+# --- job environment -------------------------------------------------------- #
+# Exported at TOP level, not inside the job subshell, because the log relay below
+# is a separate boto3 process that needs the region too.
+{env_exports}
+
+# --- interpreter + boto3 (same AL2023 dance as the control plane) ----------- #
+(dnf install -y git || yum install -y git) 2>/dev/null || true
+dnf install -y python3.11 python3.11-pip 2>/dev/null \\
+  || dnf install -y python3-pip 2>/dev/null \\
+  || yum install -y python3-pip 2>/dev/null || true
+BASE_PY="$(command -v python3.11 || command -v python3)"
+if "$BASE_PY" -m venv /home/ec2-user/venv 2>/dev/null; then
+  PREP_PY=/home/ec2-user/venv/bin/python
+else
+  PREP_PY="$BASE_PY"
+fi
+"$PREP_PY" -m pip install --upgrade pip 2>/dev/null || true
+"$PREP_PY" -m pip install boto3 || "$PREP_PY" -m pip install --user boto3 || true
+
+# --- log relay: the same mechanism the training boxes use ------------------- #
+# boto3 upload_file on a timer. Started FIRST so the laptop sees dnf/pip/clone
+# too — an hour-long job you cannot watch is indistinguishable from a hang.
+"$PREP_PY" - <<'PY' &
+import time, boto3
+c = boto3.client("s3")
+while True:
+    try:
+        c.upload_file("/var/log/spot-prep.log", "{bucket}", "{log_key}")
+    except Exception:
+        pass
+    time.sleep({interval})
+PY
+UPLOADER_PID=$!
+
+# --- the job (subshell => a failure is an RC, never a skipped status doc) ---- #
+(
+  set -euxo pipefail
+  mkdir -p "$HF_HOME"
+  df -h /
+
+  # Branch matters: the prep script and the staging code both come from the repo,
+  # so a prep run from a feature branch must not silently run main's code.
+  git clone --depth 1 -b {cfg.repo_branch} {cfg.repo_url} {_PREP_APP}
+  cd {_PREP_APP}
+
+  # prepare.py imports datasets/tiktoken/tqdm/numpy lazily, so they are installed
+  # explicitly; the package itself goes in with --no-deps because its dependency
+  # set drags ~2 GB of CUDA torch onto a box that only tokenizes text. (The
+  # editable install is what makes `python -m orchestrator` importable below.)
+  "$PREP_PY" -m pip install datasets tiktoken tqdm numpy boto3
+  "$PREP_PY" -m pip install --no-deps -e {_PREP_APP}
+
+  # Same resolution as orchestrator.dataset._local_dir: our own prep for this
+  # dataset if we have one, else nanoGPT's. Run from its own directory, exactly
+  # as the local stage-data path does (the script writes its bins beside itself).
+  PREPARE="data/{dataset}/prepare.py"
+  if [ ! -f "$PREPARE" ]; then
+    git submodule update --init --depth 1
+    PREPARE="third_party/nanoGPT/data/{dataset}/prepare.py"
+  fi
+  ( cd "$(dirname "$PREPARE")" && "$PREP_PY" -u prepare.py )
+  df -h /
+
+  # Upload through the ORDINARY stage-data path — one staging code path, and it
+  # already skips per file, so a rerun never re-sends a bin that landed.
+  "$PREP_PY" -u -m orchestrator stage-data
+  df -h /
+)
+RC=$?
+
+# --- publish the result, flush the log, then stop the meter ----------------- #
+kill "$UPLOADER_PID" 2>/dev/null || true
+"$PREP_PY" - <<PY
+import json, time
+import boto3
+c = boto3.client("s3")
+try:
+    c.upload_file("/var/log/spot-prep.log", "{bucket}", "{log_key}")
+except Exception:
+    pass
+c.put_object(
+    Bucket="{bucket}",
+    Key="{status_key}",
+    Body=json.dumps(
+        {{
+            "version": 1,
+            "prep_id": "{prep_id}",
+            "dataset": "{dataset}",
+            "ok": $RC == 0,
+            "rc": $RC,
+            "at": time.time(),
+        }}
+    ).encode(),
+)
+PY
+echo "[prep] finished rc=$RC — terminating this box"
+shutdown -h now || systemctl poweroff || poweroff -f
+exit "$RC"
+"""
+
+
 def build_provisioning_user_data(
     cfg: OrchestratorConfig, *, run_id: str, market: str, max_seconds: int
 ) -> str:

@@ -1,4 +1,4 @@
-"""CLI: ``spot-orchestrate {setup,stage-data,bake-ami,baseline,spot,preempt,ddp,
+"""CLI: ``spot-orchestrate {setup,stage-data [--remote],bake-ami,baseline,spot,preempt,ddp,
 ddp-preempt,multinode,multinode-shrink,multinode-preempt,scaling-experiment,
 scaling-clean,scaling-preempt} [--dry-run]``,
 ``spot-orchestrate resume <run_id> [--budget N] [--market ...]``,
@@ -46,7 +46,6 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     for name in (
         "setup",
-        "stage-data",
         "bake-ami",
         "baseline",
         "spot",
@@ -62,6 +61,28 @@ def main() -> None:
         "scaling-preempt",
     ):
         sub.add_parser(name, parents=[common])
+
+    # stage-data: local by default (unchanged); --remote runs the identical
+    # prepare+upload on a throwaway EC2 box, which is the only way corpora like
+    # full OpenWebText (~110 GB transient, 17 GB uploaded) can be staged at all.
+    stage_parser = sub.add_parser(
+        "stage-data", parents=[common], help="prepare the dataset and upload the bins to S3"
+    )
+    stage_parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="prepare IN AWS on one throwaway box (same-region upload; it self-terminates)",
+    )
+    stage_parser.add_argument(
+        "--no-attach", action="store_true", help="--remote: launch and exit instead of streaming"
+    )
+    stage_parser.add_argument(
+        "--attach",
+        dest="prep_id",
+        default="",
+        help="--remote: reattach to a prep already running (its id)",
+    )
+
     res_parser = sub.add_parser("resume", parents=[common])
     res_parser.add_argument("run_id", help="existing run id to resume from its latest checkpoint")
     res_parser.add_argument(
@@ -398,7 +419,13 @@ def main() -> None:
     if args.command == "setup":
         setup.ensure_infra(cfg)
     elif args.command == "stage-data":
-        dataset.stage_data(cfg)
+        # --attach implies --remote (you can only reattach to a remote prep).
+        if args.remote or args.prep_id:
+            from . import prep
+
+            prep.run_remote_prep(cfg, attach=not args.no_attach, prep_id=args.prep_id)
+        else:
+            dataset.stage_data(cfg)
     elif args.command == "bake-ami":
         from . import bake
 

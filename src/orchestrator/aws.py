@@ -83,6 +83,46 @@ def resolve_ami(ami_id: str, name_filter: str) -> str:
     return chosen["ImageId"]
 
 
+def image_root_device(ami_id: str) -> str:
+    """The AMI's root device name ("/dev/xvda" on Amazon Linux 2023, "/dev/sda1"
+    on the Ubuntu DLAMI).
+
+    Asked, never guessed: a BlockDeviceMapping only RESIZES the root volume when
+    its DeviceName matches the AMI's exactly. A wrong name is not an error — EC2
+    silently attaches a SECOND, unmounted volume and the box boots with the tiny
+    default root anyway, which for a 110 GB dataset prep means a disk-full crash
+    40 minutes in instead of a clear failure at launch."""
+    if _DRY_RUN:
+        _log(f"describe-images {ami_id} (root device name)")
+        return "/dev/xvda"
+    try:
+        r = _client("ec2").describe_images(ImageIds=[ami_id])
+        return r["Images"][0].get("RootDeviceName") or "/dev/xvda"
+    except Exception:  # noqa: BLE001 — unreadable image => fall back to the common name
+        return "/dev/xvda"
+
+
+def root_volume_mapping(
+    device_name: str, size_gb: int, *, iops: int = 0, throughput: int = 0
+) -> list[dict[str, Any]]:
+    """The ``BlockDeviceMappings`` entry that resizes/retunes an instance's root
+    volume. PURE (no API call) so the shape is unit-testable.
+
+    gp3 because it is the only volume type where IOPS and throughput are dialed
+    independently of size; DeleteOnTermination so a self-terminating box can
+    never leave a 200 GB volume billing behind it."""
+    ebs: dict[str, Any] = {
+        "VolumeSize": int(size_gb),
+        "VolumeType": "gp3",
+        "DeleteOnTermination": True,
+    }
+    if iops > 0:
+        ebs["Iops"] = int(iops)
+    if throughput > 0:
+        ebs["Throughput"] = int(throughput)
+    return [{"DeviceName": device_name, "Ebs": ebs}]
+
+
 def object_exists(bucket: str, key: str) -> bool:
     if _DRY_RUN:
         _log(f"head s3://{bucket}/{key}")
@@ -689,15 +729,31 @@ def launch(
     run_id: str,
     key_name: str = "",
     extra_tags: dict[str, str] | None = None,
+    root_volume_gb: int = 0,
+    root_volume_iops: int = 0,
+    root_volume_throughput: int = 0,
 ) -> str:
     """Launch one instance (on-demand or spot). Returns the instance id.
 
     ``extra_tags`` are added to the standard Name/project/market tags (the fleet
-    uses them for discovery); None keeps the original tag set exactly."""
+    uses them for discovery); None keeps the original tag set exactly.
+
+    ``root_volume_gb <= 0`` (the default, and what every training/fleet/control
+    -plane launch passes) sends NO BlockDeviceMappings at all, so those launches
+    keep inheriting the AMI's own mapping byte-for-byte. A positive value opts in
+    to an explicitly sized gp3 root — needed by ``stage-data --remote``, whose
+    110 GB of transient dataset caches do not fit any AMI default."""
+    volume = (
+        f" root={root_volume_gb}GB gp3"
+        f"{f'/{root_volume_iops}iops' if root_volume_iops else ''}"
+        f"{f'/{root_volume_throughput}MBps' if root_volume_throughput else ''}"
+        if root_volume_gb > 0
+        else ""
+    )
     _log(
         f"RunInstances type={instance_type} market={market} ami={ami_id} "
         f"run_id={run_id} key={key_name or '<none>'} "
-        f"user-data={'yes' if user_data else 'none'} (public IP + SSH ingress)"
+        f"user-data={'yes' if user_data else 'none'}{volume} (public IP + SSH ingress)"
     )
     if _DRY_RUN:
         return "i-DRYRUN"
@@ -737,6 +793,15 @@ def launch(
             "MarketType": "spot",
             "SpotOptions": {"SpotInstanceType": "one-time"},
         }
+    # Additive by design: absent unless a caller explicitly asks for a sized root
+    # volume, so the proven launches are unchanged (see the docstring).
+    if root_volume_gb > 0:
+        kwargs["BlockDeviceMappings"] = root_volume_mapping(
+            image_root_device(ami_id),
+            root_volume_gb,
+            iops=root_volume_iops,
+            throughput=root_volume_throughput,
+        )
     if key_name:  # SSH-verification mode: attach a key pair so you can ssh in
         kwargs["KeyName"] = key_name
     if user_data:  # the boot script (provisioning); empty => bare boot, no user-data
