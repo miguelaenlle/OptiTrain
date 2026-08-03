@@ -111,6 +111,7 @@ _ORCH_RELAY_ENV = (
     "VCPU_QUOTA",
     "INSTANCE_VCPUS",
     "METRICS_TIMEOUT",
+    "METRICS_OVERHEAD",
     "LOG_STREAM_SECONDS",
     "WANDB_PROJECT",
     "WANDB_ENTITY",
@@ -457,7 +458,37 @@ class OrchestratorConfig:
 
     # --- polling -------------------------------------------------------------
     metrics_poll_seconds: int = 15
+    # How long the orchestrator waits for metrics.json before declaring the run
+    # dead. This is a FLOOR, not the whole story — see metrics_deadline_for(),
+    # which every supervised run must use instead of reading this directly. A
+    # fixed 1800s silently capped a 1h run at 30 minutes: the fleet was healthy
+    # (epoch 1, world 8, step 400, loss 4.86, zero crashes) and got terminated
+    # anyway, because the watchdog's patience was shorter than the work it was
+    # watching. At 36h a fixed default would kill the run before the first eval.
     metrics_timeout_seconds: int = field(default_factory=lambda: _env_int("METRICS_TIMEOUT", 1800))
+    # Slack added on top of the training budget: instance launch, clone/pip, the
+    # dataset pull (~2 min for a 17 GB train.bin), plus the final eval + sample +
+    # checkpoint tail after the budget expires. Generous on purpose — this
+    # deadline exists to catch a WEDGED run, and being late to notice one costs
+    # far less than killing a healthy fleet mid-run.
+    metrics_overhead_seconds: int = field(
+        default_factory=lambda: _env_int("METRICS_OVERHEAD", 1200)
+    )
+
+    def metrics_deadline_for(self, budget_seconds: float | None) -> int:
+        """Watchdog deadline for a run with this training budget.
+
+        The deadline has to outlast the work: budget + boot + dataset + the
+        post-budget eval/checkpoint tail. An explicit METRICS_TIMEOUT still wins
+        when it is larger, so operators can extend but never accidentally
+        shorten a run below its own budget.
+        """
+        if not budget_seconds or budget_seconds <= 0:
+            return self.metrics_timeout_seconds
+        return max(
+            self.metrics_timeout_seconds, int(budget_seconds) + self.metrics_overhead_seconds
+        )
+
     # How often the orchestrator pulls the box's boot log from S3 to print new
     # lines. Smaller than the metrics poll — this drives the live view latency.
     log_stream_seconds: int = field(default_factory=lambda: _env_int("LOG_STREAM_SECONDS", 3))

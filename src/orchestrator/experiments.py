@@ -204,6 +204,7 @@ def _stream_until_metrics(
     profile: RunProfile,
     logs_key: str | None = None,
     state: dict | None = None,
+    budget: int | None = None,
 ) -> dict | None:
     """Stream the box log until ``metrics.json`` appears (trainer writes it last =>
     done) or ``metrics_timeout_seconds`` elapses. Returns parsed metrics, or None.
@@ -213,7 +214,7 @@ def _stream_until_metrics(
     metrics_key = cfg.run_metrics_key(run_id)
     state = state if state is not None else {"printed": 0}
     start = time.monotonic()
-    deadline = start + cfg.metrics_timeout_seconds
+    deadline = start + cfg.metrics_deadline_for(budget)
     last_heartbeat = start
     marked_first = False
 
@@ -324,7 +325,7 @@ def _run_single_box(
         if aws.is_dry_run():
             print(f"[{kind}] dry-run: skipping stream/terminate", file=sys.stderr)
             return (profile, None) if return_profile else None
-        metrics = _stream_until_metrics(cfg, run_id, profile)
+        metrics = _stream_until_metrics(cfg, run_id, profile, budget=budget)
         profile.mark("metrics" if metrics is not None else "timeout")
         profile.from_metrics(metrics)
         profile.instance_stopped(iid)  # ledger stop ~= the terminate call below
@@ -401,7 +402,7 @@ def run_resume(
         if aws.is_dry_run():
             print("[resume] dry-run: skipping stream/terminate", file=sys.stderr)
             return None
-        metrics = _stream_until_metrics(cfg, run_id, profile, logs_key=logs_key)
+        metrics = _stream_until_metrics(cfg, run_id, profile, logs_key=logs_key, budget=budget)
         if metrics is not None:
             if not metrics.get("resumed"):
                 print("[resume] WARNING: trainer did not report resumed=true", file=sys.stderr)
@@ -576,7 +577,9 @@ def _run_supervised(
             pull_logs=lambda: _pull_logs(cfg, logs, profile),
             kill_schedule=kill_schedule,
         )
-        metrics = sup.run(deadline_s=cfg.metrics_timeout_seconds)
+        # Deadline must outlast the work it is watching: budget + boot +
+        # dataset pull + the post-budget eval/checkpoint tail.
+        metrics = sup.run(deadline_s=cfg.metrics_deadline_for(budget))
         profile.mark("metrics" if metrics is not None else "timeout")
         profile.from_metrics(metrics)
         if metrics is not None:
@@ -1884,7 +1887,9 @@ def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
 
             if final:
                 # Let this segment finish its remaining budget and write metrics.
-                metrics = _stream_until_metrics(cfg, run_id, profile, logs_key=logs_key)
+                metrics = _stream_until_metrics(
+                    cfg, run_id, profile, logs_key=logs_key, budget=budget
+                )
                 profile.mark("metrics" if metrics is not None else "timeout")
                 profile.from_metrics(metrics)
                 done, iid = iid, None
