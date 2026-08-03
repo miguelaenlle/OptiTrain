@@ -1,5 +1,6 @@
 """CLI: ``spot-orchestrate {setup,stage-data,bake-ami,baseline,spot,preempt,ddp,
-ddp-preempt,multinode,multinode-shrink,multinode-preempt} [--dry-run]``,
+ddp-preempt,multinode,multinode-shrink,multinode-preempt,scaling-experiment,
+scaling-clean,scaling-preempt} [--dry-run]``,
 ``spot-orchestrate resume <run_id> [--budget N] [--market ...]``, and
 ``spot-orchestrate compare <run_id> [<run_id> ...]``.
 
@@ -55,6 +56,7 @@ def main() -> None:
         "calibrate",
         "scaling-experiment",
         "scaling-clean",
+        "scaling-preempt",
     ):
         sub.add_parser(name, parents=[common])
     res_parser = sub.add_parser("resume", parents=[common])
@@ -281,6 +283,8 @@ def main() -> None:
         experiments.run_scaling_experiment(cfg)
     elif args.command == "scaling-clean":
         experiments.run_scaling_clean(cfg)
+    elif args.command == "scaling-preempt":
+        experiments.run_scaling_preempt(cfg)
     elif args.command == "resume":
         experiments.run_resume(cfg, args.run_id, budget=args.budget, market=args.market)
     elif args.command == "compare":

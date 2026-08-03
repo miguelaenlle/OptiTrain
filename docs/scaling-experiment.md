@@ -148,6 +148,45 @@ bounds the whole sweep. Caveat: a 1-node spot box that AWS reclaims mid-run just
 dies (no auto-resume on the single-box path) — rerun it, or run 1-node on-demand
 if you have the G quota.
 
+## Variant: preemption scaling test — `scaling-preempt`
+
+The preemption twin of `scaling-clean`, holding the orchestrator constant (same
+epoch supervisor + `_run_supervised` kill path as `multinode-preempt` — it's a
+**test harness, not new control-plane code**). Same model / data / seed /
+constant-global-batch recipe and the same report; the only differences are:
+
+- **Half of each world is killed 60s in.** For an N-node run the top `N//2` nodes
+  (indices `N//2 … N-1`) are terminated simultaneously at `PREEMPT_AT_SECONDS`
+  (default 60), keeping node 0 (master) + the lower half alive. The killed boxes
+  are **replaced** so the world grows back and the run can still finish — so it
+  measures *scaling under a preemption + recovery*, not just a shrink.
+- **2x the default cap** (`SCALING_CAP_SECONDS=960`, vs 480 clean) — a run that
+  loses half its world and recovers needs the headroom to still reach target.
+- **Node counts must be ≥ 2** (you can't preempt half a 1-node world and keep a
+  survivor; the supervisor is 2+-node only). Default `NODE_COUNTS=2,4`.
+
+```bash
+# time-to-target under preemption (calibrate first to size TARGET_LOSS):
+VCPU_QUOTA=32 MARKET=spot TARGET_LOSS=<from calibrate> \
+  INSTANCE_TYPE=g5.xlarge DATASET=openwebtext_300m NODE_COUNTS=2,4 \
+  spot-orchestrate scaling-preempt
+
+# throughput mode (omit TARGET_LOSS): ms/step per world size, recovery dip visible
+VCPU_QUOTA=32 MARKET=spot INSTANCE_TYPE=g5.xlarge DATASET=openwebtext_300m \
+  GLOBAL_BATCH_SIZE=256 BATCH_SIZE=16 NODE_COUNTS=2,4 \
+  spot-orchestrate scaling-preempt
+```
+
+Report `reports/scaling-preempt-<ts>/summary.txt`: the same speedup + scaling
+efficiency table as the clean sweep (time-to-target now **includes** preemption
+downtime + recompute), plus a **PREEMPTION** block per run — nodes killed, how
+deep the world dipped (`min_world`), recovery time (`kill → full_world`), and the
+degraded window (`shrink_resume → full_world`). Extra knobs: `PREEMPT_AT_SECONDS`
+(default 60), `SCALING_CAP_SECONDS` (default 960). Because checkpoints tighten to
+`PREEMPT_CHECKPOINT_SECONDS` for any kill schedule, the t+60s kill loses ~no work.
+Compare `scaling-clean` vs `scaling-preempt` at the same target to read the price
+of one preemption.
+
 ## Outputs
 
 `reports/scaling-experiment-<ts>/`:
