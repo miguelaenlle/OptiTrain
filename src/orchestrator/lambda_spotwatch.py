@@ -5,6 +5,8 @@ acquire GPU spot capacity?** Every tick appends a JSONL shard to
 ``s3://<bucket>/spotwatch/<YYYY-MM-DD>/<epoch>-<id>.jsonl``:
 
   * ``sps``          — Spot placement scores (1-10) for a FIXED request matrix
+  * ``sps_gap``      — a request that failed/threw after retries: a HOLE in the
+                       series, recorded so it can never be read as a low score
   * ``price``        — newest spot $/hr per (AZ, type) pool
   * ``offering`` / ``az_map`` / ``interruption`` — daily context (pools that
                        exist, AZ-name↔AZ-id join key, Spot Advisor reclaim rates)
@@ -12,20 +14,36 @@ acquire GPU spot capacity?** Every tick appends a JSONL shard to
                        calibrates the scores
   * ``tick``         — self-report of the tick (counts, errors, duration)
 
-Two rules drive most of the design:
+Three measured facts about GetSpotPlacementScores drive the request matrix:
 
-  1. **The SPS request matrix must never vary.** GetSpotPlacementScores throttles
-     on *distinct request configurations* per rolling 24h window, not on call
-     count. A matrix that adapts to what it sees (new region, new type) burns a
-     fresh configuration and gets the collector throttled mid-experiment. So the
-     matrix is a module constant, the region list is pinned in S3 on first use
-     and never silently rewritten, and every tick issues exactly the same
-     requests in the same order.
-  2. **Never interfere with a training run.** The truth probe is the only part
-     that spends money or takes capacity, so it is rate-limited to one per 6h
-     AND skipped outright if any instance tagged ``project=spot-train`` is
-     pending/running in the probe region — a probe must never lose a race for
-     the last g5 against the thing we are actually trying to run.
+  1. **Every response hard-caps at 10 scored rows.** MaxResults is ignored above
+     10 and NextToken does not extend it. So an all-regions query is a global
+     *top-10 leaderboard*, not a per-AZ series: a 17-region single-AZ query for
+     g5.xlarge came back with 10 rows covering 7 regions and silently dropped
+     ~70 AZs. Any AZ that falls out of the top 10 would record nothing, and the
+     hole would be indistinguishable from "the score dropped" — which destroys
+     the only question the study exists to answer ("does use1-az4 recover at
+     3 AM Saturday?"). Therefore: **one request per region**, which returns that
+     region's complete AZ set (<= 6 AZs, comfortably under the cap). The
+     all-regions query is kept as ONE cheap leaderboard per type, tagged
+     ``scope="global_top10"`` and excluded from every per-AZ analysis.
+  2. **The throttle is a token bucket, not a per-day configuration budget**
+     (service-quotas: bucket capacity 100, refill 20/s). That is a rate limit,
+     so a few hundred requests per 10-minute tick is fine — we pace at 10/s,
+     half the refill rate, so the bucket can never drain. The matrix is still a
+     pinned constant: comparability across days demands it, and an undocumented
+     per-configuration limit would be invisible until it bit us.
+  3. **Throttling is data, not failure.** A throttled or failed request is
+     retried with backoff and, if it still fails, written as an ``sps_gap``
+     record. A gap in a time series must never look like a bad score.
+
+And one rule that outranks all of them:
+
+  * **Never interfere with a training run.** The truth probe is the only part
+    that spends money or takes capacity, so it is rate-limited to one per 6h
+    AND skipped outright if any instance tagged ``project=spot-train`` is
+    pending/running in the probe region — a probe must never lose a race for
+    the last g5 against the thing we are actually trying to run.
 
 This file is uploaded to Lambda as a single-file zip. Unlike the rest of
 ``src/orchestrator`` it therefore imports boto3 directly instead of going
@@ -42,12 +60,12 @@ import time
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 import boto3
 
 # --------------------------------------------------------------------------- #
-# The FIXED request matrix (see rule 1 in the module docstring)
+# The FIXED request matrix (see the module docstring for the measured facts)
 # --------------------------------------------------------------------------- #
 # The GPU types this project can actually train on. Ordered, never sorted at
 # call time, never derived from anything observed at runtime.
@@ -59,7 +77,10 @@ INSTANCE_TYPES: tuple[str, ...] = (
     "g6.xlarge",
     "g6.2xlarge",
 )
-# 1 = "can I get a single box at all", 8 = the multinode goal (1c is N<=8 nodes).
+# 8 is THE decision query for this project: one training world, one AZ (NCCL
+# bandwidth + cross-AZ transfer charges make a split world pointless). 1 is the
+# optimistic lower bound, kept only as context — a good score at 1 says nothing
+# about getting eight at once.
 TARGET_CAPACITIES: tuple[int, ...] = (1, 8)
 # True  -> per-AZ scores (which AZ to aim at), False -> region-level score.
 SINGLE_AZ_MODES: tuple[bool, ...] = (True, False)
@@ -69,6 +90,37 @@ SINGLE_AZ_MODES: tuple[bool, ...] = (True, False)
 # per type (comparable to each other, conservative in absolute terms) plus one
 # "basket" request naming all six (the realistic "I'll take whatever runs" ask).
 BASKET_LABEL = "any"
+# Every response is truncated to this many rows regardless of MaxResults/
+# NextToken (measured). Per-region requests stay under it by construction; a
+# response that hits it exactly is flagged ``truncated`` so the report knows the
+# view is partial.
+SPS_MAX_ROWS = 10
+# Requests per second we allow ourselves. The measured bucket holds 100 tokens
+# and refills at 20/s, so pacing at half the refill rate makes draining it
+# impossible no matter how large the matrix grows.
+SPS_RATE_PER_S = 10.0
+# Error codes that mean "slow down" rather than "this request is wrong".
+THROTTLE_CODES = (
+    "RequestLimitExceeded",
+    "Throttling",
+    "ThrottlingException",
+    "TooManyRequestsException",
+)
+
+
+class SpsRequest(NamedTuple):
+    """One GetSpotPlacementScores call plus the labels its records carry.
+
+    ``scope`` is the important one: ``region`` means "complete AZ coverage for
+    this region" (safe to build a per-AZ time series from), ``global_top10``
+    means "the 10 best rows AWS chose to show us, worldwide" (a leaderboard —
+    absence of an AZ proves nothing).
+    """
+
+    kwargs: dict[str, Any]
+    label: str
+    scope: str
+
 
 # Regions used if the one-time enumeration fails. Deliberately a literal: a
 # fallback that queried AWS would make the matrix vary with the failure.
@@ -107,47 +159,52 @@ def _client(service: str, region: str):
 # --------------------------------------------------------------------------- #
 # Pure helpers (unit-tested; no AWS, no clock of their own)
 # --------------------------------------------------------------------------- #
-def sps_requests(regions: list[str]) -> list[dict[str, Any]]:
-    """The complete, deterministic list of GetSpotPlacementScores kwargs.
+def _req(types: list[str], capacity: int, single_az: bool, regions: list[str], scope: str):
+    return SpsRequest(
+        kwargs={
+            "InstanceTypes": list(types),
+            "TargetCapacity": capacity,
+            "TargetCapacityUnitType": "units",
+            "SingleAvailabilityZone": single_az,
+            "RegionNames": list(regions),
+        },
+        label=types[0] if len(types) == 1 else BASKET_LABEL,
+        scope=scope,
+    )
 
-    Same input regions => byte-identical requests in the same order, forever.
-    That is the whole point: 28 distinct configurations per 24h no matter how
-    many ticks run (6 types x 2 capacities x 2 AZ modes, plus the 6-type basket
-    x 2 x 2). The region list is sorted here so an unordered pin can't change
-    the request either.
+
+def sps_requests(regions: list[str]) -> list[SpsRequest]:
+    """The complete, deterministic request matrix.
+
+    Same input regions => byte-identical requests in the same order, forever
+    (the region list is sorted here so an unordered pin can't change it either).
+
+    Shape, and why: **per region** — because a response never returns more than
+    10 rows, so only a single-region ask is guaranteed to cover every AZ in it.
+    Per region we take each GPU type at both capacities in both AZ modes, plus
+    one all-six-types "basket" per capacity (per-AZ only — that is the "any GPU
+    in this AZ" question the switching analysis needs, and it dodges AWS's
+    "one instance type always scores low" caveat). Finally one all-regions query
+    per type/capacity as a *leaderboard*, tagged ``global_top10`` so nothing
+    downstream mistakes its 10 rows for coverage.
+
+    With 17 regions that is 17*26 + 14 = 456 requests/tick — ~46s at our 10/s
+    pacing, well inside the Lambda timeout, and far inside a 100-token bucket
+    refilling at 20/s.
     """
     region_names = sorted(regions)
-    out: list[dict[str, Any]] = []
+    out: list[SpsRequest] = []
+    for region in region_names:
+        for capacity in TARGET_CAPACITIES:
+            for single_az in SINGLE_AZ_MODES:
+                for instance_type in INSTANCE_TYPES:
+                    out.append(_req([instance_type], capacity, single_az, [region], "region"))
+            out.append(_req(list(INSTANCE_TYPES), capacity, True, [region], "region"))
     for capacity in TARGET_CAPACITIES:
-        for single_az in SINGLE_AZ_MODES:
-            for instance_type in INSTANCE_TYPES:
-                out.append(
-                    {
-                        "InstanceTypes": [instance_type],
-                        "TargetCapacity": capacity,
-                        "TargetCapacityUnitType": "units",
-                        "SingleAvailabilityZone": single_az,
-                        "RegionNames": region_names,
-                    }
-                )
-            out.append(
-                {
-                    "InstanceTypes": list(INSTANCE_TYPES),
-                    "TargetCapacity": capacity,
-                    "TargetCapacityUnitType": "units",
-                    "SingleAvailabilityZone": single_az,
-                    "RegionNames": region_names,
-                }
-            )
+        for instance_type in INSTANCE_TYPES:
+            out.append(_req([instance_type], capacity, True, region_names, "global_top10"))
+        out.append(_req(list(INSTANCE_TYPES), capacity, True, region_names, "global_top10"))
     return out
-
-
-def request_label(request: dict[str, Any]) -> str:
-    """The instance_type field a record gets: the single type, or "any" for the
-    basket request (so the report can compare "this exact GPU" against "any GPU
-    I can use")."""
-    types = request["InstanceTypes"]
-    return types[0] if len(types) == 1 else BASKET_LABEL
 
 
 def is_daily_tick(now: datetime, daily_hour: int = 3, tick_minutes: int = 10) -> bool:
@@ -276,11 +333,11 @@ def _put_json(bucket: str, key: str, doc: dict) -> None:
 def _pinned_regions(cfg: dict) -> tuple[list[str], list[dict]]:
     """The region list the SPS matrix is built from, enumerated ONCE.
 
-    Written to S3 on first use and never rewritten: the region list is part of
-    our request configuration, so re-enumerating (and picking up a newly enabled
-    region) would silently create 28 brand-new configurations and reset the
-    throttle budget mid-experiment. Region drift shows up in the daily
-    ``offering`` records instead, where it is data rather than a behaviour change.
+    Written to S3 on first use and never rewritten: the region list defines the
+    matrix, and a matrix that grows a region mid-experiment makes "score dropped"
+    and "we started asking about somewhere new" impossible to tell apart in the
+    series. Region drift shows up in the daily ``offering`` records instead,
+    where it is data rather than a behaviour change.
     """
     key = f"{cfg['prefix']}/meta/regions.json"
     doc = _get_json(cfg["bucket"], key)
@@ -325,46 +382,92 @@ def _pinned_regions(cfg: dict) -> tuple[list[str], list[dict]]:
     return regions, errors
 
 
+def error_code(exc: BaseException) -> str:
+    """botocore's error code, or the exception class for anything else."""
+    return getattr(exc, "response", {}).get("Error", {}).get("Code", type(exc).__name__)
+
+
+def is_throttle(code: str) -> bool:
+    return code in THROTTLE_CODES
+
+
+_last_sps_call = 0.0
+
+
+def _pace(rate_per_s: float = SPS_RATE_PER_S) -> None:
+    """Keep at most ``rate_per_s`` requests per second across the whole tick.
+    At half the measured refill rate the token bucket can never drain, so a
+    bigger matrix costs time and nothing else."""
+    global _last_sps_call
+    gap = (1.0 / rate_per_s) - (time.time() - _last_sps_call)
+    if gap > 0:
+        time.sleep(gap)
+    _last_sps_call = time.time()
+
+
+def _sps_call(ec2, kwargs: dict, attempts: int = 4) -> tuple[dict, int]:
+    """One scored request, retrying only on throttles. Returns (response,
+    retries) — the retry count rides in the tick record so a tick that had to
+    fight the bucket is visible before the data looks wrong."""
+    retries = 0
+    while True:
+        _pace()
+        try:
+            return ec2.get_spot_placement_scores(**kwargs), retries
+        except Exception as e:  # noqa: BLE001 — re-raised below unless throttled
+            if not is_throttle(error_code(e)) or retries >= attempts - 1:
+                raise
+            time.sleep(2**retries)
+            retries += 1
+
+
 def _collect_sps(cfg: dict, regions: list[str], tick_id: str, t: float) -> tuple[list, list]:
     ec2 = _client("ec2", cfg["home_region"])
     records: list[dict] = []
     errors: list[dict] = []
     for req in sps_requests(regions):
-        label = request_label(req)
+        asked_region = req.kwargs["RegionNames"][0] if req.scope == "region" else ""
         try:
-            token = None
-            while True:
-                kwargs = dict(req)
-                if token:
-                    kwargs["NextToken"] = token
-                resp = ec2.get_spot_placement_scores(**kwargs)
-                for s in resp.get("SpotPlacementScores", []):
-                    records.append(
-                        make_record(
-                            "sps",
-                            tick_id,
-                            t,
-                            region=s.get("Region", ""),
-                            az_id=s.get("AvailabilityZoneId", ""),
-                            instance_type=label,
-                            capacity=req["TargetCapacity"],
-                            single_az=req["SingleAvailabilityZone"],
-                            score=s.get("Score"),
-                        )
+            resp, retries = _sps_call(ec2, req.kwargs)
+            rows = resp.get("SpotPlacementScores", [])
+            # NextToken is deliberately NOT followed: responses hard-cap at 10
+            # rows either way, so paging would only re-serve the same top-10.
+            for s in rows:
+                records.append(
+                    make_record(
+                        "sps",
+                        tick_id,
+                        t,
+                        region=s.get("Region", ""),
+                        az_id=s.get("AvailabilityZoneId", ""),
+                        instance_type=req.label,
+                        capacity=req.kwargs["TargetCapacity"],
+                        single_az=req.kwargs["SingleAvailabilityZone"],
+                        score=s.get("Score"),
+                        scope=req.scope,
+                        truncated=len(rows) >= SPS_MAX_ROWS,
+                        retries=retries,
                     )
-                token = resp.get("NextToken")
-                if not token:
-                    break
-        except Exception as e:  # noqa: BLE001 — one bad config must not sink the tick
-            errors.append(
-                {
-                    "stage": "sps",
-                    "instance_type": label,
-                    "capacity": req["TargetCapacity"],
-                    "single_az": req["SingleAvailabilityZone"],
-                    "error": str(e),
-                }
+                )
+        except Exception as e:  # noqa: BLE001 — one bad request must not sink the tick
+            code = error_code(e)
+            # A HOLE, written down as such. Without this record the report
+            # cannot tell "AWS refused to answer" from "the score was low".
+            records.append(
+                make_record(
+                    "sps_gap",
+                    tick_id,
+                    t,
+                    region=asked_region,
+                    instance_type=req.label,
+                    capacity=req.kwargs["TargetCapacity"],
+                    single_az=req.kwargs["SingleAvailabilityZone"],
+                    scope=req.scope,
+                    error_code=code,
+                    throttled=is_throttle(code),
+                )
             )
+            errors.append({"stage": "sps", "region": asked_region, "error": str(e)[:200]})
     return records, errors
 
 
@@ -509,6 +612,19 @@ def _probe_ami(region: str) -> str:
     return images[-1]["ImageId"]
 
 
+def default_vpc_id(region: str) -> str:
+    """The region's default VPC, or "" if it has none.
+
+    RunInstances with no SubnetId only works inside a default VPC. Without one
+    the probe fails with VPCIdNotSpecified — an infrastructure gap that would
+    otherwise be logged next to InsufficientInstanceCapacity and read as "no
+    capacity". Checking first turns it into an explicit skip instead.
+    """
+    r = _client("ec2", region).describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
+    vpcs = r.get("Vpcs", [])
+    return vpcs[0]["VpcId"] if vpcs else ""
+
+
 def _probe(cfg: dict, tick_id: str, t: float) -> tuple[list, list]:
     region = cfg["probe_region"]
     instance_type = cfg["probe_type"]
@@ -530,6 +646,23 @@ def _probe(cfg: dict, tick_id: str, t: float) -> tuple[list, list]:
     )
     if not go:
         return [make_record("probe_skipped", tick_id, t, region=region, reason=reason)], []
+
+    try:
+        vpc = default_vpc_id(region)
+    except Exception as e:  # noqa: BLE001 — can't tell => don't guess "no capacity"
+        vpc, errors = "", [{"stage": "probe_vpc", "error": str(e)}]
+    if not vpc:
+        # NOT a capacity signal — recorded as its own skip reason so the
+        # calibration table never counts it as a failed launch.
+        return [
+            make_record(
+                "probe_skipped",
+                tick_id,
+                t,
+                region=region,
+                reason=f"no default VPC in {region} — probe cannot launch without a subnet",
+            )
+        ], errors
 
     # Record the attempt BEFORE launching: if this invocation dies mid-probe the
     # rate limiter still counts it, so a crash loop can't launch every 10 min.
@@ -600,7 +733,7 @@ def _probe(cfg: dict, tick_id: str, t: float) -> tuple[list, list]:
             )
         )
     except Exception as e:  # noqa: BLE001 — the failure IS the measurement
-        code = getattr(e, "response", {}).get("Error", {}).get("Code", type(e).__name__)
+        code = error_code(e)
         records.append(
             make_record(
                 "probe",
@@ -662,6 +795,7 @@ def handler(event, context):  # noqa: ARG001 — Lambda signature
         records.extend(recs)
         errors.extend(errs)
 
+    gaps = [r for r in records if r["type"] == "sps_gap"]
     records.append(
         make_record(
             "tick",
@@ -670,6 +804,12 @@ def handler(event, context):  # noqa: ARG001 — Lambda signature
             daily=daily,
             regions=regions,
             sps_requests=len(sps_requests(regions)),
+            sps_rows=sum(1 for r in records if r["type"] == "sps"),
+            # Coverage, not just health: the report divides by what we ASKED for,
+            # so a tick that lost half its requests can't look like a bad market.
+            sps_gaps=len(gaps),
+            sps_throttled=sum(1 for r in gaps if r.get("throttled")),
+            sps_retries=sum(int(r.get("retries", 0)) for r in records if r["type"] == "sps"),
             record_count=len(records) + 1,
             errors=errors[:20],  # cap: a total outage would otherwise write a novel
             error_count=len(errors),
