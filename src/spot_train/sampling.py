@@ -46,9 +46,7 @@ def _char_codec(
     return encode, decode
 
 
-def _bpe_codec() -> (
-    tuple[Callable[[str], list[int]], Callable[[list[int]], str]] | None
-):
+def _bpe_codec() -> tuple[Callable[[str], list[int]], Callable[[list[int]], str]] | None:
     """(encode, decode) for the GPT-2 BPE via tiktoken — the codec for BPE
     corpora (OpenWebText) that ship no meta.pkl. None if tiktoken isn't
     installed. decode drops ids in the model's padded-vocab tail (>= 50257,
