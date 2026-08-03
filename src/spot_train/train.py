@@ -270,6 +270,12 @@ def train(cfg: TrainConfig) -> dict:
             # stream it already consumed, and after an elastic world-size change
             # rank r draws a fresh stream for its new slice of the group.
             torch.manual_seed(cfg.seed + ddp.rank * 1_000_003 + start_step)
+        # Startup collectives are done (process group + DDP's weight broadcast and
+        # shape verification). Drop from the generous NCCL_INIT_TIMEOUT to the
+        # short steady-state NCCL_TIMEOUT so a preempted peer is detected fast.
+        applied = distributed.tighten_timeout(ddp)
+        if applied:
+            log(f"[ddp] collective timeout tightened to {applied}s for the training loop")
 
     # Constant-global-batch gradient accumulation (K=1 when GLOBAL_BATCH_SIZE=0).
     accum = grad_accum_steps(cfg.global_batch_size, ddp.world_size, cfg.batch_size)

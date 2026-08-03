@@ -13,6 +13,7 @@ Pins the boot-script shapes the experiments depend on:
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 
@@ -140,6 +141,8 @@ def test_multinode_budget_env_and_done_signal():
         # NCCL crash is the in-band backstop to the supervisor's epoch bump.
         assert 'export NCCL_TIMEOUT="20"' in ud
         assert 'export TORCH_NCCL_DUMP_ON_TIMEOUT="0"' in ud
+        # ...but startup gets its own, much longer budget (see below).
+        assert 'export NCCL_INIT_TIMEOUT="300"' in ud
         # NCCL net hygiene: pin off docker0/lo (else 4-node hangs on the first
         # collective), disable IB (none on g4dn/g5), WARN debug in the log.
         assert 'export NCCL_SOCKET_IFNAME="^docker0,lo"' in ud
@@ -268,3 +271,33 @@ def test_preempt_victim_schedule():
     cfg.preempt_victims = "1,x"
     with pytest.raises(SystemExit, match="comma-separated"):
         cfg.preempt_victim_schedule()
+
+
+def test_startup_timeout_scales_with_node_count_but_steady_state_stays_short():
+    """The 8-node failure this guards against: ONE timeout cannot serve both
+    phases. Standing up the process group over plain TCP builds an all-pairs
+    connection mesh (~O(N^2) — 28 peer pairs at 8 nodes vs 6 at 4), and the
+    20s steady-state value aborted DDP's shape-verification broadcast at
+    exactly 20000ms. torch reported that as "params[0] ... appears not to match
+    sizes ... in process 0", which reads like a model-config bug rather than a
+    comms timeout. Startup must scale with world size; the steady-state timeout
+    must NOT, because it is how a preempted peer's death is detected."""
+    seen = {}
+    for nodes in (2, 4, 8):
+        ud = _ud(ddp=True, nodes=nodes, node_index=0)
+        init = int(re.search(r'export NCCL_INIT_TIMEOUT="(\d+)"', ud).group(1))
+        steady = int(re.search(r'export NCCL_TIMEOUT="(\d+)"', ud).group(1))
+        seen[nodes] = (init, steady)
+        # Startup must comfortably exceed the value that actually failed at 8n.
+        assert init >= 300
+        assert init > steady, "startup budget must exceed the death-detection budget"
+        # Fast death detection is the whole point of the short one — never relax it.
+        assert steady == 20
+    # 8 nodes gets strictly more startup budget than 2 nodes.
+    assert seen[8][0] > seen[2][0]
+
+
+def test_startup_timeout_is_operator_overridable(monkeypatch):
+    monkeypatch.setenv("NCCL_INIT_TIMEOUT", "900")
+    ud = _ud(ddp=True, nodes=8, node_index=0)
+    assert 'export NCCL_INIT_TIMEOUT="900"' in ud

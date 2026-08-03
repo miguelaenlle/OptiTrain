@@ -903,6 +903,15 @@ def build_user_data(
         # Short collective timeout so survivors of a node kill abort fast (see
         # distributed.init) — the in-band backstop to the supervisor's epoch bump.
         env["NCCL_TIMEOUT"] = str(cfg.nccl_timeout_seconds)
+        # ...but STARTUP gets a much longer budget, because it is not the same
+        # problem. Standing up the process group + DDP over plain TCP (no EFA on
+        # g4dn/g5) builds an all-pairs connection mesh, so the cost grows ~O(N^2):
+        # 8 nodes is 28 peer pairs vs 6 at 4 nodes. Measured on g5.xlarge, 2- and
+        # 4-node came up well inside 20s while 8-node did not, and DDP's shape
+        # verification aborted at exactly the 20s mark — surfacing as a bogus
+        # "params[0] does not match process 0" that looks like a model-config bug.
+        # Scale with node count (floor 300s) and let the operator override.
+        env["NCCL_INIT_TIMEOUT"] = os.environ.get("NCCL_INIT_TIMEOUT", str(max(300, 60 * nodes)))
         # NCCL network hygiene (why 4-node hung where 2-node worked): with no
         # interface pinned, NCCL auto-selects one — and the DLAMI ships Docker, so
         # every box has a docker0 on the SAME non-routable 172.17.0.0/16. NCCL can

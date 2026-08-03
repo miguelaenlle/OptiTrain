@@ -34,11 +34,28 @@ def init(device: str) -> Dist:
         return Dist(enabled=False, rank=0, local_rank=0, world_size=1, master=True, device=device)
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    # Collective timeout: how long a rank blocks on a peer before aborting. The
-    # multi-node orchestrator exports a short NCCL_TIMEOUT so survivors of a node
-    # kill crash fast and their elastic agent can re-rendezvous; unset (single
-    # node) keeps torch's 10-minute default.
-    timeout = timedelta(seconds=int(os.environ.get("NCCL_TIMEOUT", "600")))
+    # Collective timeout: how long a rank blocks on a peer before aborting. ONE
+    # value cannot serve both phases, and using the steady-state value for startup
+    # breaks 8-node runs outright:
+    #
+    #   STARTUP wants a LONG timeout. Bringing up the process group + DDP's first
+    #   collectives establishes a mesh of NCCL connections over plain TCP (no EFA
+    #   on g4dn/g5) — the setup cost grows ~O(N^2) in nodes. Measured: 2- and
+    #   4-node came up inside 20s, 8-node did NOT, and the DDP shape-verification
+    #   broadcast aborted at exactly 20000ms. torch then reports that as
+    #   "params[0] ... appears not to match sizes ... in process 0", which reads
+    #   like a model-config bug and sends you hunting for a vocab mismatch that
+    #   isn't there. Every rank had an identical 123.69M-param model.
+    #
+    #   STEADY STATE wants a SHORT timeout, which is why NCCL_TIMEOUT exists: a
+    #   survivor of a node kill must abort fast so the supervisor can re-form the
+    #   world. Long here would directly slow preemption recovery.
+    #
+    # So: come up on NCCL_INIT_TIMEOUT, then tighten to NCCL_TIMEOUT once the
+    # startup collectives are done (see ``tighten_timeout``).
+    steady_s = int(os.environ.get("NCCL_TIMEOUT", "600"))
+    init_s = int(os.environ.get("NCCL_INIT_TIMEOUT", str(max(600, steady_s))))
+    timeout = timedelta(seconds=init_s)
     if device.startswith("cuda"):
         device = f"cuda:{local_rank}"
         torch.cuda.set_device(local_rank)
@@ -55,6 +72,40 @@ def init(device: str) -> Dist:
         master=(rank == 0),
         device=device,
     )
+
+
+def tighten_timeout(d: Dist) -> int | None:
+    """Shrink the process-group timeout to the steady-state NCCL_TIMEOUT.
+
+    Call once the startup collectives (process-group init + DDP construction)
+    are done. Until then we run on the generous NCCL_INIT_TIMEOUT so an 8-node
+    world has time to build its TCP connection mesh; from here on we want the
+    SHORT timeout, because it is the in-band signal that a peer died — a
+    survivor of a preemption must abort fast enough for the supervisor to
+    re-form the world.
+
+    Returns the applied timeout in seconds, or None if it could not be changed
+    (no process group, no steady value, or the torch build lacks the private
+    setter). Failing to tighten is degraded-but-correct — the run simply keeps
+    the longer timeout and detects a dead peer more slowly — so this never
+    raises into the training path.
+    """
+    if not d.enabled or not dist.is_initialized():
+        return None
+    steady = os.environ.get("NCCL_TIMEOUT")
+    if not steady:
+        return None
+    try:
+        seconds = int(steady)
+        from torch.distributed import distributed_c10d as _c10d
+
+        setter = getattr(_c10d, "_set_pg_timeout", None)
+        if setter is None:  # older torch: leave the init timeout in place
+            return None
+        setter(timedelta(seconds=seconds), _c10d._get_default_group())
+        return seconds
+    except Exception:  # noqa: BLE001 — a slower death signal must not kill the run
+        return None
 
 
 def shutdown(d: Dist) -> None:
