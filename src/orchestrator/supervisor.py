@@ -65,6 +65,12 @@ class Observation:
     metrics_exists: bool  # run's done signal landed
     no_progress_s: float | None  # seconds since the checkpoint step last advanced (None = n/a yet)
     due_kills: frozenset[int] = frozenset()  # scheduled victims whose time has arrived
+    # Epochs published in a row that never produced a checkpoint. The stall clock
+    # restarts on every epoch (a new world legitimately needs time before its
+    # first checkpoint), so this is what still catches a world that FLAPS —
+    # re-forming endlessly without ever training. Without it, resetting the clock
+    # would make the deadlock-breaker unreachable.
+    epochs_without_progress: int = 0
 
 
 @dataclass(frozen=True)
@@ -75,6 +81,11 @@ class Policy:
     replace_on_loss: bool  # relaunch a lost node (preempt) vs let the group shrink (shrink)
     recovery_timeout_s: float  # no checkpoint progress this long -> whole-group restart
     heartbeat_timeout_s: float = 90.0  # log key stale this long -> node presumed dead
+    # Consecutive epochs with no checkpoint before we stop believing the world can
+    # form. Each epoch gets a full recovery_timeout_s, so this many failures is
+    # already several minutes of evidence — enough to conclude the membership
+    # itself is the problem and only a clean slate will do.
+    max_epochs_without_progress: int = 3
 
 
 def _healthy(n: NodeObs, policy: Policy) -> bool:
@@ -144,10 +155,20 @@ def decide(obs: Observation, policy: Policy) -> list[Action]:
 
     healthy = frozenset(n.node for n in obs.nodes if _healthy(n, policy))
 
-    # Whole-group restart floor: the group stopped making progress, or every
-    # member is observed gone (no survivor to shrink onto).
+    # Whole-group restart floor: the group stopped making progress, kept
+    # re-forming without ever training, or every member is observed gone (no
+    # survivor to shrink onto).
+    #
+    # NB the no-progress clock is restarted by the shell on every epoch
+    # publication. It has to be: a preemption arriving late in a checkpoint
+    # interval would otherwise inherit a nearly-spent budget and trip this
+    # instantly, discarding healthy survivors to "recover" from a world that was
+    # recovering fine. The clock measures "this world has had its chance", not
+    # "time since some checkpoint" — and epochs_without_progress is what keeps
+    # the deadlock-breaker reachable once the clock can be reset.
     if obs.epoch > 0 and (
         (obs.no_progress_s is not None and obs.no_progress_s > policy.recovery_timeout_s)
+        or obs.epochs_without_progress >= policy.max_epochs_without_progress
         or not healthy
     ):
         return [WholeGroupRestart()]
@@ -317,6 +338,9 @@ class SupervisorState:
     ips: dict[int, str] = field(default_factory=dict)  # node -> private IP (from registration)
     ckpt_step: int = -1
     ckpt_changed_at: float = 0.0
+    # Epochs published since the last checkpoint advanced. Reset by real progress;
+    # bumped by each publication. See Observation.epochs_without_progress.
+    epochs_without_progress: int = 0
     shrink_baseline: int | None = None  # ckpt step at the last kill (for shrink_resume)
     full_ws: int | None = None  # world size before the last kill (for full_world)
     marks: set[str] = field(default_factory=set)  # one-shot marks already emitted per epoch cycle
@@ -457,7 +481,9 @@ class Supervisor:
         # Checkpoint progress: track when the max step last advanced.
         step = aws.max_checkpoint_step(self.cfg.bucket, self.ckpt_prefix)
         if step > self.st.ckpt_step:
+            # Real progress: the world is training. Clears BOTH stall signals.
             self.st.ckpt_step, self.st.ckpt_changed_at = step, now
+            self.st.epochs_without_progress = 0
         no_progress = (now - self.st.ckpt_changed_at) if self._train_start is not None else None
 
         due = set()
@@ -476,6 +502,7 @@ class Supervisor:
             metrics_exists=aws.object_exists(self.cfg.bucket, self.metrics_key),
             no_progress_s=no_progress,
             due_kills=frozenset(due),
+            epochs_without_progress=self.st.epochs_without_progress,
         )
 
     # -- current world size (for full_world), read from the profile stream -- #
@@ -495,6 +522,15 @@ class Supervisor:
         aws.put_text(self.cfg.bucket, self.cfg.run_epoch_key(self.run_id), json.dumps(doc))
         self.st.epoch, self.st.members, self.st.master = epoch, frozenset(members), master
         self.st.replacing -= set(members)  # any admitted member is no longer "in flight"
+        # Restart the stall clock: this world was just created and has not had a
+        # chance to checkpoint yet. Survivors must tear down and re-form the
+        # collective, and a replacement has to boot AND pull the dataset (~4-5 min
+        # for a 17 GB train.bin) before it can take a single step. Charging that
+        # against the PREVIOUS world's clock is what made every preemption look
+        # like a wedged group and trigger a whole-group restart. The counter below
+        # is what still catches a world that never trains at all.
+        self.st.ckpt_changed_at = time.monotonic()
+        self.st.epochs_without_progress += 1
         self._event(
             f"published epoch {epoch}: members {sorted(members)} master=node{master} "
             f"({doc['master_addr']}:{doc['master_port']})"

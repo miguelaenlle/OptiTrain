@@ -29,7 +29,17 @@ def _node(i, state="running", registered=True, log_age=None):
     return NodeObs(node=i, aws_state=state, registered=registered, log_age_s=log_age)
 
 
-def _obs(nodes, *, epoch, members, node_count=None, metrics=False, no_progress=None, due=()):
+def _obs(
+    nodes,
+    *,
+    epoch,
+    members,
+    node_count=None,
+    metrics=False,
+    no_progress=None,
+    due=(),
+    epochs_without_progress=0,
+):
     return Observation(
         node_count=node_count if node_count is not None else len(nodes),
         nodes=tuple(nodes),
@@ -38,6 +48,7 @@ def _obs(nodes, *, epoch, members, node_count=None, metrics=False, no_progress=N
         metrics_exists=metrics,
         no_progress_s=no_progress,
         due_kills=frozenset(due),
+        epochs_without_progress=epochs_without_progress,
     )
 
 
@@ -649,3 +660,58 @@ def test_scheduled_kill_fires_exactly_once_even_after_replacement(monkeypatch):
     s.node_ids[1] = "i-1-replacement"
     for t in (210.0, 220.0, 300.0):
         assert s._observe(now=t, wall=0.0).due_kills == frozenset()
+
+
+# --------------------------------------------------------------------------- #
+# Stall detection must not fire DURING a legitimate recovery
+# --------------------------------------------------------------------------- #
+def test_recovery_in_progress_is_not_a_stall():
+    """The bug this pins cost a live 8-node run.
+
+    A replacement has to boot AND pull the dataset (~4-5 min for a 17 GB
+    train.bin) before it can take one step, so a freshly published epoch shows
+    no checkpoint progress for minutes. That is recovery working, not a wedged
+    group — and the shell restarts the clock on every publication so the new
+    world is judged on its OWN elapsed time. Below the timeout, keep waiting.
+    """
+    obs = _obs(
+        [_node(0), _node(1)],
+        epoch=2,
+        members=[0, 1],
+        no_progress=120.0,  # well past the OLD 150s-era margin, still recovering
+        epochs_without_progress=1,
+    )
+    assert decide(obs, PREEMPT) == []
+
+
+def test_genuine_stall_still_breaks_the_deadlock():
+    # Past the timeout with the world nominally healthy: nothing is coming back.
+    obs = _obs([_node(0), _node(1)], epoch=2, members=[0, 1], no_progress=601.0)
+    assert decide(obs, PREEMPT) == [WholeGroupRestart()]
+
+
+def test_flapping_world_restarts_even_though_each_epoch_resets_the_clock():
+    """Resetting the stall clock per epoch would make the deadlock-breaker
+    unreachable for a world that re-forms endlessly without ever training —
+    each publication would hand it a fresh budget forever. The
+    epochs-without-progress counter is what closes that hole."""
+    obs = _obs(
+        [_node(0), _node(1)],
+        epoch=7,
+        members=[0, 1],
+        no_progress=5.0,  # clock just reset by the newest epoch
+        epochs_without_progress=3,  # ...but three worlds in a row never trained
+    )
+    assert decide(obs, PREEMPT) == [WholeGroupRestart()]
+
+
+def test_progress_clears_the_flap_counter_path():
+    # Same epoch count but progress happened (counter cleared by the shell).
+    obs = _obs(
+        [_node(0), _node(1)],
+        epoch=7,
+        members=[0, 1],
+        no_progress=5.0,
+        epochs_without_progress=0,
+    )
+    assert decide(obs, PREEMPT) == []
