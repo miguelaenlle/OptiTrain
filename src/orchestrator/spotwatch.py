@@ -1,12 +1,13 @@
 """Spotwatch — a 72-hour unattended answer to "can we even GET spot GPUs?".
 
 ``spot-orchestrate spotwatch deploy`` provisions a Lambda + a 10-minute
-EventBridge rule that collects, per tick: spot placement scores over a fixed
-PER-REGION request matrix (a response is capped at 10 rows, so only a
-single-region ask gives every AZ a continuous series), spot prices, (daily) pool
-offerings + AWS Spot Advisor interruption rates, and — at most once every 6
-hours — a real 1-instance spot launch that is immediately given back. Everything
-lands as append-only JSONL in ``s3://<bucket>/spotwatch/<date>/``.
+EventBridge rule that collects, per tick: spot placement scores over a small,
+priority-ordered request matrix (AWS caps DISTINCT CONFIGURATIONS per 24h — see
+lambda_spotwatch — so the budget, not the API's speed, decides what we can
+watch), spot prices, (daily) pool offerings + AWS Spot Advisor interruption
+rates, and — at most once every 6 hours — a real 1-instance spot launch that is
+immediately given back. Everything lands as append-only JSONL in
+``s3://<bucket>/spotwatch/<date>/``.
 
 ``report`` turns days of that into the availability picture, in this order:
 can we get an 8-node world in ONE AZ (the query that actually decides whether
@@ -17,9 +18,9 @@ interruption rates and the SPS-vs-probe calibration.
 
 The collector itself is ``lambda_spotwatch.py`` (runs in AWS, single-file zip,
 zero third-party deps). This module is the laptop side: provision, tear down,
-report. It costs ~$1-3/month — Lambda's free tier covers 144 ticks/day and the
-JSONL is ~1 GB/month; the truth probes are the only real spend, ~1 minute of
-g5.xlarge spot four times a day.
+report. It costs ~$1-2/month — Lambda's free tier covers 144 ticks/day and the
+JSONL is a few hundred MB/month; the truth probes are the only real spend, ~1
+minute of g5.xlarge spot four times a day.
 
 ``deploy`` and ``down`` are idempotent and honour ``--dry-run``; ``report`` is
 pure S3 reads (no mutation, no instances) so it is always safe to run.
@@ -51,12 +52,11 @@ TARGET_ID = "spotwatch-lambda"
 PERMISSION_SID = "spotwatch-events-invoke"
 RUNTIME = "python3.12"
 HANDLER = "lambda_spotwatch.handler"
-# The matrix is per-region (a placement-score response is capped at 10 rows, so
-# only a single-region ask covers every AZ): ~456 requests at 10/s pacing is
-# ~45-120s, plus a price call per region and up to a 45s probe wait. 600s leaves
-# 3x headroom on the worst observed tick; the Lambda is billed per ms, so a
-# generous ceiling costs nothing.
-TIMEOUT_SECONDS = 600
+# A tick is 14 placement-score requests (the configuration budget, not speed, is
+# what bounds the matrix), one price call per region, and up to a 45s probe wait
+# — under a minute in practice. 300s is ~5x headroom; the Lambda bills per ms, so
+# a generous ceiling costs nothing and covers a slow daily tick.
+TIMEOUT_SECONDS = 300
 MEMORY_MB = 256
 
 _MODULE = "lambda_spotwatch.py"
@@ -196,12 +196,16 @@ def deploy(cfg: OrchestratorConfig) -> None:
         f"{cfg.region} -> s3://{cfg.bucket}/{cfg.spotwatch_prefix}/",
         file=sys.stderr,
     )
-    from .lambda_spotwatch import sps_requests  # matrix size, without duplicating it
+    # Print the matrix size rather than restating it: the configuration budget is
+    # the scarce resource here, and it is spent the first time each request shape
+    # is used in a rolling 24h — so a matrix change is a real cost, not a tweak.
+    from .lambda_spotwatch import MAX_CONFIGURATIONS, sps_requests
 
-    per_region = len(sps_requests(["us-east-1"]))
+    matrix = sps_requests(["us-east-1"], cfg.region)
     print(
-        f"[spotwatch] placement-score matrix: {per_region - 14} requests per region + 14 "
-        "worldwide leaderboard, paced at 10/s (measured bucket: 100 tokens, 20/s refill)",
+        f"[spotwatch] placement-score matrix: {len(matrix)} distinct configurations "
+        f"(budget {MAX_CONFIGURATIONS}; AWS refuses the excess with MaxConfigLimitExceeded). "
+        "Editing the matrix spends NEW configurations against the same 24h cap.",
         file=sys.stderr,
     )
     probes = (
@@ -351,19 +355,40 @@ def sps_rows(
     return rows
 
 
+def record_config(rec: dict) -> tuple:
+    """The configuration a record came from — what AWS bills against its 24h
+    distinct-configuration budget. For a per-region ask the region is part of
+    the identity; for the worldwide leaderboard every row shares one."""
+    scope = rec.get("scope", "region")
+    return (
+        scope,
+        rec.get("instance_type", ""),
+        rec.get("capacity"),
+        bool(rec.get("single_az", True)),
+        rec.get("region", "") if scope == "region" else "*",
+    )
+
+
 def coverage(records: list[dict]) -> dict[str, Any]:
     """How much of what we asked for actually came back.
 
     Printed before any rate, because a rate computed over a half-collected
-    window is worse than no rate at all."""
+    window is worse than no rate at all. ``configs_ok`` is the EFFECTIVE
+    configuration budget: AWS does not publish the 24h distinct-configuration
+    cap, so the only way to know this account's is to count what succeeded."""
     ticks = _of(records, "tick")
     gaps = _of(records, "sps_gap")
     asked = sum(int(t.get("sps_requests", 0)) for t in ticks)
+    capped = [g for g in gaps if g.get("config_capped")]
     return {
         "ticks": len(ticks),
         "requested": asked,
         "gaps": len(gaps),
         "throttled": sum(1 for g in gaps if g.get("throttled")),
+        "config_capped": len(capped),
+        "configs_ok": len({record_config(r) for r in _of(records, "sps")}),
+        "configs_refused": len({record_config(g) for g in capped}),
+        "config_budget": max((int(t.get("config_budget", 0)) for t in ticks), default=0),
         "gap_pct": (len(gaps) / asked) if asked else None,
         "span_hours": (
             (max(t["t"] for t in ticks) - min(t["t"] for t in ticks)) / 3600 if ticks else 0.0
@@ -401,6 +426,23 @@ def odds(best_by_tick: dict[str, float], threshold: float) -> dict[str, Any]:
     }
 
 
+def home_az(records: list[dict], *, home_region: str, home_type: str, capacity: int) -> str:
+    """The AZ we would have launched into: the best-scoring one for the home GPU.
+
+    "Never switch" needs a pinned AZ to mean anything (a training world lands in
+    exactly one), and we never recorded which AZ the project uses. Picking the
+    best one is deliberately GENEROUS to the do-nothing row: if even the AZ you
+    would have chosen never clears the bar, no AZ does.
+    """
+    by_az: dict[str, list[float]] = defaultdict(list)
+    for r in sps_rows(records, capacity=capacity, single_az=True):
+        if r.get("region") == home_region and r.get("instance_type") == home_type:
+            by_az[r.get("az_id", "")].append(float(r["score"]))
+    if not by_az:
+        return ""
+    return max(by_az.items(), key=lambda kv: (statistics.fmean(kv[1]), kv[0]))[0]
+
+
 def scenarios(
     records: list[dict],
     *,
@@ -408,32 +450,38 @@ def scenarios(
     home_region: str,
     home_type: str,
     capacity: int,
+    az: str = "",
 ) -> list[dict]:
     """The five questions, answered as P(a pool scores >= threshold at a tick).
 
-    Each row widens what we are willing to change: nothing, when we ask, the GPU
-    type, the AZ, or both — and finally the region, which tells you whether the
-    home region is the binding constraint.
+    Each row widens what we are willing to change: nothing, the GPU type, the
+    AZ, both — and finally the region, which tells you whether the home region
+    is the binding constraint.
+
+    Every row uses single-AZ scores, because that is the only shape a training
+    world can use (NCCL bandwidth; cross-AZ traffic is billed) — and, since the
+    configuration budget is ~20, the only shape we spend requests on.
     """
-    region_rows = sps_rows(records, capacity=capacity, single_az=False)
     az_rows = sps_rows(records, capacity=capacity, single_az=True)
+    az = az or home_az(records, home_region=home_region, home_type=home_type, capacity=capacity)
 
     def _row(name: str, rows: list[dict], pred: Callable[[dict], bool]) -> dict:
         return {"scenario": name, **odds(per_tick_best(rows, pred), threshold)}
 
-    def _home(r: dict) -> bool:
-        return r.get("region") == home_region and r.get("instance_type") == home_type
-
-    # The first two rows are region-level scores: "8 instances somewhere in this
-    # region", which AWS is free to answer by spreading them across AZs. A
-    # training world cannot use that (NCCL bandwidth, cross-AZ transfer charges),
-    # so they are marked * and read as an UPPER BOUND, never as a plan.
     out = [
-        _row("never switch (same region, same GPU) *", region_rows, _home),
         _row(
-            "switch GPU only (same region, any of our GPUs) *",
-            region_rows,
-            lambda r: r.get("region") == home_region and r.get("instance_type") != "any",
+            "never switch (same AZ, same GPU)",
+            az_rows,
+            lambda r: r.get("region") == home_region
+            and r.get("az_id") == az
+            and r.get("instance_type") == home_type,
+        ),
+        _row(
+            "switch GPU only (same AZ, any of our GPUs)",
+            az_rows,
+            lambda r: r.get("region") == home_region
+            and r.get("az_id") == az
+            and r.get("instance_type") != "any",
         ),
         _row(
             "switch AZ only (same region+GPU, best AZ)",
@@ -920,11 +968,23 @@ def render_report(
     a(
         _wrap(
             f"{cov['gaps']} request(s) returned nothing ({_pct(cov['gap_pct']).strip()}), "
-            f"{cov['throttled']} of them throttled — those are GAPS, not zeros"
+            f"{cov['throttled']} throttled, {cov['config_capped']} refused by the 24h "
+            "configuration cap — those are GAPS, not zeros"
             if cov["gaps"]
             else "no gaps: every placement-score request in the window returned data"
         )
     )
+    # AWS publishes neither the cap nor the budget left, so the only measurement
+    # of it is what came back. Printed whenever a request was actually refused.
+    if cov["config_capped"]:
+        a(
+            _wrap(
+                f"EFFECTIVE CONFIGURATION BUDGET: {cov['configs_ok']} distinct configurations "
+                f"succeeded, {cov['configs_refused']} were refused with MaxConfigLimitExceeded "
+                f"(our self-imposed budget is {cov['config_budget']}). AWS does not publish "
+                "this limit — narrow the matrix in lambda_spotwatch.sps_requests."
+            )
+        )
     probes = _of(records, "probe")
     ok = sum(1 for p in probes if p.get("capacity_available"))
     a(
@@ -957,19 +1017,20 @@ def render_report(
             continue
         label = "THE DECISION QUERY" if capacity == 8 else "context only — optimistic"
         a(_head(f"IF WE SWITCH SOMETHING — {capacity} instance(s) ({label})"))
+        pinned = home_az(records, home_region=home_region, home_type=home_type, capacity=capacity)
+        a(
+            _wrap(
+                f"'same AZ' = {names.get(pinned, pinned) or 'n/a'}, the best-scoring AZ for "
+                f"{home_type} — generous to the do-nothing row on purpose. All rows are "
+                "single-AZ scores: a training world cannot be spread across AZs."
+            )
+        )
         a(f"{'scenario':<52}{'P(good)':>9}{'mean best':>11}{'peak':>6}{'ticks':>7}")
         for r in rows:
             a(
                 f"{r['scenario']:<52}{_pct(r['p_good']):>9}{_num(r['mean_best']):>11}"
                 f"{_num(r['max_best'], '4.0f'):>6}{r['ticks']:>7}"
             )
-        a(
-            _wrap(
-                "* region-level score: AWS may satisfy it by spreading instances across AZs. "
-                "A training world has to sit in ONE AZ, so those rows are an upper bound, not "
-                "a plan — compare them with the single-AZ rows below them."
-            )
-        )
         a("")
 
     # Scenario 1, resolved: when is the home pool actually available?
@@ -1149,14 +1210,6 @@ def verdict(records: list[dict], *, threshold: float, home_region: str, home_typ
                 f"Note: that answer moves us out of {home_region}, where the bucket and the "
                 "~17 GB dataset live. Price the dataset copy and the cross-region egress "
                 "before treating it as the plan."
-            )
-        )
-    if winner["scenario"].endswith("*"):
-        lines.append(
-            _wrap(
-                "Note: that row is a region-level score (instances may be spread across AZs). "
-                "A single-AZ training world may still be unattainable — check the single-AZ "
-                "rows before committing."
             )
         )
     hours = hourly_odds(

@@ -43,65 +43,62 @@ def test_sps_matrix_is_identical_across_ticks():
     assert lam.sps_requests(REGIONS) == lam.sps_requests(list(reversed(REGIONS)))
 
 
-def test_sps_matrix_size_and_shape():
+def test_matrix_fits_the_configuration_budget():
+    """The binding constraint: AWS caps DISTINCT CONFIGURATIONS per rolling 24h
+    (unpublished; 28 observed on this account, surfacing as
+    MaxConfigLimitExceeded). A 456-request matrix collected 9% of what it asked
+    for. The budget is asserted at build time so it cannot regress silently."""
     reqs = lam.sps_requests(REGIONS)
-    # Per region: 6 types x 2 capacities x 2 AZ modes + a per-AZ basket per
-    # capacity = 26. Plus one all-regions leaderboard per (type|basket, capacity).
-    per_region = (len(lam.INSTANCE_TYPES) * 2 + 1) * 2
-    globals_ = (len(lam.INSTANCE_TYPES) + 1) * 2
-    assert per_region == 26 and globals_ == 14
-    assert len(reqs) == len(REGIONS) * per_region + globals_ == 92
-    configs = {
-        (
-            tuple(r.kwargs["InstanceTypes"]),
-            r.kwargs["TargetCapacity"],
-            r.kwargs["TargetCapacityUnitType"],
-            r.kwargs["SingleAvailabilityZone"],
-            tuple(r.kwargs["RegionNames"]),
-        )
-        for r in reqs
-    }
-    assert len(configs) == len(reqs)  # every request is a DISTINCT configuration
-    assert {r.kwargs["TargetCapacity"] for r in reqs} == {1, 8}
-    assert {r.kwargs["SingleAvailabilityZone"] for r in reqs} == {True, False}
+    configs = {lam.config_key(r) for r in reqs}
+    assert len(configs) == len(reqs), "a duplicate configuration would waste budget"
+    assert len(configs) <= lam.MAX_CONFIGURATIONS <= 28
+    assert len(reqs) == 14
 
 
-def test_per_region_requests_name_exactly_one_region():
-    """The reason the matrix is per-region: a response is capped at 10 rows, so
-    only a single-region ask is guaranteed to cover every AZ in that region."""
+def test_matrix_refuses_to_exceed_the_budget(monkeypatch):
+    # The assertion is the point: adding to the matrix must be a conscious trade,
+    # not something that quietly starts failing in AWS a day later.
+    monkeypatch.setattr(lam, "MAX_CONFIGURATIONS", 5)
+    with pytest.raises(AssertionError, match="MaxConfigLimitExceeded"):
+        lam.sps_requests(REGIONS)
+
+
+def test_budget_is_spent_on_the_home_region_first():
+    """Priority order is the whole protection: if a configuration is ever
+    refused, we must lose the worldwide leaderboard, not us-east-1 at 8."""
+    reqs = lam.sps_requests(REGIONS, "us-east-1")
+    head = reqs[:4]
+    assert all(r.scope == "region" for r in head)
+    assert all(r.kwargs["RegionNames"] == ["us-east-1"] for r in head)
+    assert all(r.kwargs["TargetCapacity"] == 8 for r in head)
+    assert head[0].label == "any"  # the basket leads: the most realistic ask
+    assert {r.label for r in head} == {"any", *lam.PER_TYPE_TYPES}
+    # Capacity 1 (context) comes next, then the leaderboard, then relocation.
+    assert [r.kwargs["TargetCapacity"] for r in reqs[4:8]] == [1, 1, 1, 1]
+    assert all(r.scope == "global_top10" for r in reqs[8:12])
+    assert [r.kwargs["RegionNames"] for r in reqs[12:]] == [["us-east-2"], ["us-west-2"]]
+    # The leaderboard is the only ask allowed to span regions (its 10 rows are a
+    # top-10, not coverage); everything else names exactly one.
+    for r in reqs:
+        assert len(r.kwargs["RegionNames"]) == (len(REGIONS) if r.scope == "global_top10" else 1)
+
+
+def test_every_request_is_single_az():
+    # A training world lands in ONE AZ (NCCL bandwidth, cross-AZ transfer bills),
+    # so a region-level score answers a question we cannot use — and at ~20
+    # configurations we cannot afford to ask it.
+    assert all(r.kwargs["SingleAvailabilityZone"] for r in lam.sps_requests(REGIONS))
+
+
+def test_two_xlarge_variants_ride_in_the_basket_only():
+    # They score 1 consistently and are not what we would train on, so they get
+    # no configuration of their own — but stay in "any GPU I could use".
     reqs = lam.sps_requests(REGIONS)
-    scoped = [r for r in reqs if r.scope == "region"]
-    assert len(scoped) == len(REGIONS) * 26
-    assert all(len(r.kwargs["RegionNames"]) == 1 for r in scoped)
-    assert {r.kwargs["RegionNames"][0] for r in scoped} == set(REGIONS)
-
-    # ... and each region gets the identical sub-matrix.
-    def _shape(r):
-        k = r.kwargs
-        return (tuple(k["InstanceTypes"]), k["TargetCapacity"], k["SingleAvailabilityZone"])
-
-    per_region = {
-        region: [_shape(r) for r in scoped if r.kwargs["RegionNames"][0] == region]
-        for region in REGIONS
-    }
-    assert len({tuple(v) for v in per_region.values()}) == 1
-
-
-def test_global_leaderboard_requests_are_labelled_and_few():
-    board = [r for r in lam.sps_requests(REGIONS) if r.scope == "global_top10"]
-    assert len(board) == 14
-    # All regions in one ask — the only requests allowed to do that, because
-    # their 10 rows are a leaderboard rather than coverage.
-    assert all(r.kwargs["RegionNames"] == sorted(REGIONS) for r in board)
-    assert all(r.kwargs["SingleAvailabilityZone"] for r in board)
-
-
-def test_basket_requests_are_labelled_any():
-    reqs = lam.sps_requests(REGIONS)
-    labels = [r.label for r in reqs]
-    # One per (region, capacity) plus one per capacity globally.
-    assert labels.count(lam.BASKET_LABEL) == len(REGIONS) * 2 + 2
-    assert set(labels) == {*lam.INSTANCE_TYPES, "any"}
+    assert "g5.2xlarge" not in lam.PER_TYPE_TYPES
+    assert "g5.2xlarge" in lam.INSTANCE_TYPES
+    assert {r.label for r in reqs} == {"any", *lam.PER_TYPE_TYPES}
+    basket = next(r for r in reqs if r.label == "any")
+    assert basket.kwargs["InstanceTypes"] == list(lam.INSTANCE_TYPES)
 
 
 def test_matrix_does_not_depend_on_module_level_mutation():
@@ -123,12 +120,16 @@ def test_pagination_is_not_used_because_responses_hard_cap_at_ten():
     assert lam.SPS_MAX_ROWS == 10
 
 
-def test_throttle_codes_and_pacing_stay_under_the_measured_bucket():
-    # Measured: bucket capacity 100, refill 20/s. Half the refill rate can never
-    # drain it however big the matrix gets.
-    assert lam.SPS_RATE_PER_S <= 10.0
+def test_config_cap_is_distinguished_from_the_rate_limit():
+    # Different errors, different fixes: a throttle means wait, a config cap
+    # means the matrix is too wide. Never retried, so it can't burn the tick.
+    assert lam.is_config_capped("MaxConfigLimitExceeded")
+    assert not lam.is_throttle("MaxConfigLimitExceeded")
     assert lam.is_throttle("RequestLimitExceeded")
+    assert not lam.is_config_capped("RequestLimitExceeded")
     assert not lam.is_throttle("InsufficientInstanceCapacity")
+    # Measured bucket: capacity 100, refill 20/s — we pace at half the refill.
+    assert lam.SPS_RATE_PER_S <= 10.0
 
 
 # --------------------------------------------------------------------------- #
@@ -408,7 +409,7 @@ class FakeAws:
         return {}
 
 
-PINNED = json.dumps({"regions": ["us-east-1"]})
+PINNED = json.dumps({"regions": ["us-east-1", "us-west-2"]})
 
 
 @pytest.fixture
@@ -436,7 +437,7 @@ def test_tick_writes_one_shard_with_every_record_type(tick_env, monkeypatch):
     assert result["records"] == len(records)
     assert result["key"].startswith("spotwatch/2026-08-01/")
     # Exactly the fixed matrix went out — no more, no fewer, no ad-hoc extras.
-    assert len(fake.sps_calls) == 26 + 14  # one pinned region + the leaderboard
+    assert len(fake.sps_calls) == 14 == len(lam.sps_requests(["us-east-1", "us-west-2"]))
     assert all(r["tick_id"] == records[0]["tick_id"] for r in records)
     # Every scored row is tagged with the scope it came from, so the report can
     # keep the truncated leaderboard out of its coverage math.
@@ -453,13 +454,29 @@ def test_failed_requests_become_gaps_not_silence(tick_env, monkeypatch):
     fake = FakeAws(objects={"spotwatch/meta/regions.json": PINNED}, sps_error=err)
     _, records, _ = _run_tick(monkeypatch, fake)
     gaps = [r for r in records if r["type"] == "sps_gap"]
-    assert len(gaps) == 40  # one per request in the matrix
+    assert len(gaps) == 14  # one per request in the matrix
     assert all(g["throttled"] and g["error_code"] == "RequestLimitExceeded" for g in gaps)
     assert not any(r["type"] == "sps" for r in records)  # nothing masquerades as a score
     tick = next(r for r in records if r["type"] == "tick")
-    assert tick["sps_gaps"] == 40 and tick["sps_throttled"] == 40
+    assert tick["sps_gaps"] == 14 and tick["sps_throttled"] == 14
+    assert tick["sps_config_capped"] == 0  # a throttle is not a config refusal
     # Throttles are retried with backoff before being written off as a gap.
-    assert len(fake.sps_calls) == 40 * 4
+    assert len(fake.sps_calls) == 14 * 4
+
+
+def test_config_cap_refusals_are_recorded_and_never_retried(tick_env, monkeypatch):
+    """The unpublished 24h configuration cap. Retrying would only burn the tick —
+    it will not clear for hours — so it is written down and counted instead."""
+    err = RuntimeError("too many configurations")
+    err.response = {"Error": {"Code": "MaxConfigLimitExceeded"}}
+    fake = FakeAws(objects={"spotwatch/meta/regions.json": PINNED}, sps_error=err)
+    _, records, _ = _run_tick(monkeypatch, fake)
+    gaps = [r for r in records if r["type"] == "sps_gap"]
+    assert len(fake.sps_calls) == 14  # one attempt each, no retries
+    assert all(g["config_capped"] and not g["throttled"] for g in gaps)
+    tick = next(r for r in records if r["type"] == "tick")
+    assert tick["sps_config_capped"] == 14
+    assert tick["config_budget"] == lam.MAX_CONFIGURATIONS
 
 
 def test_daily_tick_adds_the_expensive_context(tick_env, monkeypatch):
@@ -537,7 +554,7 @@ def test_pinned_region_list_is_never_rewritten(tick_env, monkeypatch):
     # the 24h throttle budget mid-experiment.
     fake = FakeAws(objects={"spotwatch/meta/regions.json": PINNED})
     _run_tick(monkeypatch, fake)
-    assert json.loads(fake.objects["spotwatch/meta/regions.json"]) == {"regions": ["us-east-1"]}
+    assert json.loads(fake.objects["spotwatch/meta/regions.json"]) == json.loads(PINNED)
     first = [r["RegionNames"] for r in fake.sps_calls]
     _run_tick(monkeypatch, fake, at_hour=13)
     assert [r["RegionNames"] for r in fake.sps_calls][: len(first)] == first
@@ -685,20 +702,31 @@ def test_odds_counts_ticks_not_records():
     assert empty == {"ticks": 0, "p_good": None, "mean_best": None, "max_best": None}
 
 
+def test_home_az_is_the_one_we_would_have_picked():
+    # Generous by design: "never switch" is pinned to the BEST AZ for the home
+    # GPU, so a bad result there is unarguable.
+    az = spotwatch.home_az(_synthetic(), home_region="us-east-1", home_type="g5.xlarge", capacity=1)
+    assert az == "use1-az4"  # mean 5.5 vs az1's 2.0
+    assert (
+        spotwatch.home_az(_synthetic(), home_region="eu-west-1", home_type="g5.xlarge", capacity=1)
+        == ""
+    )
+
+
 def test_scenario_ranking_widens_monotonically():
     rows = spotwatch.scenarios(
         _synthetic(), threshold=7, home_region="us-east-1", home_type="g5.xlarge", capacity=1
     )
     by_name = {r["scenario"]: r for r in rows}
-    never = by_name["never switch (same region, same GPU) *"]
-    gpu = by_name["switch GPU only (same region, any of our GPUs) *"]
+    never = by_name["never switch (same AZ, same GPU)"]
+    gpu = by_name["switch GPU only (same AZ, any of our GPUs)"]
     az = by_name["switch AZ only (same region+GPU, best AZ)"]
     both = by_name["switch both (same region, any GPU, best AZ)"]
     anywhere = by_name["switch region too (anywhere, any GPU, best AZ)"]
 
-    # home pool is never good; switching GPU or AZ each rescue one of two ticks;
-    # widening to both can only ever help; another region is always available.
-    assert never["p_good"] == 0.0
+    # In use1-az4 the home GPU clears the bar at 03:00 only; widening can only
+    # ever help; another region is available at every tick.
+    assert never["p_good"] == pytest.approx(0.5)
     assert gpu["p_good"] == pytest.approx(0.5)
     assert az["p_good"] == pytest.approx(0.5)
     assert both["p_good"] == pytest.approx(0.5)
@@ -707,6 +735,19 @@ def test_scenario_ranking_widens_monotonically():
     assert never["p_good"] <= az["p_good"] <= both["p_good"]
     # every scenario saw both ticks (a scenario with no data reports ticks=0)
     assert {r["ticks"] for r in rows} == {2}
+
+
+def test_scenarios_use_single_az_scores_only():
+    # A region-level score describes a fleet spread across AZs, which a training
+    # world cannot use — and which we no longer spend a configuration on.
+    spread_only = [
+        _sps("t0", 0, "us-east-1", "", "g5.xlarge", 10, single_az=False, capacity=8),
+        _sps("t1", 1, "us-east-1", "", "g5.xlarge", 10, single_az=False, capacity=8),
+    ]
+    rows = spotwatch.scenarios(
+        spread_only, threshold=7, home_region="us-east-1", home_type="g5.xlarge", capacity=8
+    )
+    assert all(r["ticks"] == 0 for r in rows)
 
 
 def test_hourly_odds_finds_the_good_hour():
@@ -947,7 +988,7 @@ def test_render_report_is_plain_text_and_answers_the_question():
         _synthetic(), threshold=7, home_region="us-east-1", home_type="g5.xlarge", since_hours=72
     )
     assert "SPOTWATCH" in text
-    assert "never switch (same region, same GPU)" in text
+    assert "never switch (same AZ, same GPU)" in text
     assert "WAIT FOR A GOOD TIME" in text
     assert "AVAILABILITY BY AZ x HOUR" in text
     assert "us-east-1d" in text  # az-id resolved to a name via the az_map records
@@ -994,13 +1035,15 @@ def test_verdict_judges_at_capacity_8_when_it_has_the_data():
 
 
 def test_verdict_names_the_cheapest_working_strategy():
+    # single_az=True: "never switch (same AZ, same GPU)" is an AZ-level claim, and
+    # a training world has to land in ONE AZ. Region-level rows are deliberately
+    # excluded from the scenario math (AWS may spread them across AZs), so feeding
+    # them here would assert on a strategy the report can't honestly recommend.
     always = []
     for i in range(10):
-        always.append(
-            _sps(f"t{i}", i % 24, "us-east-1", "", "g5.xlarge", 9, single_az=False, capacity=8)
-        )
+        always.append(_sps(f"t{i}", i % 24, "us-east-1", "use1-az4", "g5.xlarge", 9, capacity=8))
     text = spotwatch.verdict(always, threshold=7, home_region="us-east-1", home_type="g5.xlarge")
-    assert "never switch (same region, same GPU)" in text and "100.0%" in text
+    assert "never switch (same AZ, same GPU)" in text and "100.0%" in text
 
 
 def test_heatmap_render_marks_missing_hours():

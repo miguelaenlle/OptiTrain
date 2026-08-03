@@ -16,26 +16,35 @@ acquire GPU spot capacity?** Every tick appends a JSONL shard to
 
 Three measured facts about GetSpotPlacementScores drive the request matrix:
 
-  1. **Every response hard-caps at 10 scored rows.** MaxResults is ignored above
+  1. **There is a hard cap on DISTINCT CONFIGURATIONS per rolling 24h, and it is
+     the binding constraint.** It is not published and does not appear in
+     service-quotas; it surfaces only as ``MaxConfigLimitExceeded``. Measured on
+     this account: 28 distinct configurations succeeded and every further one
+     failed — a 456-request matrix collected 9% of what it asked for, and *which*
+     9% was decided by request ordering. Re-querying a configuration already
+     spent costs nothing, so the budget is spent on the FIRST use of each
+     configuration and a tick can poll them forever. Hence ``MAX_CONFIGURATIONS``
+     below, a pinned priority-ordered matrix well under the observed cap, and a
+     hard assert that the generated matrix fits. **Changing the matrix
+     mid-experiment spends NEW configurations against the same daily cap** — so
+     churn is expensive and the matrix should be settled once, then left alone.
+  2. **Every response hard-caps at 10 scored rows.** MaxResults is ignored above
      10 and NextToken does not extend it. So an all-regions query is a global
      *top-10 leaderboard*, not a per-AZ series: a 17-region single-AZ query for
      g5.xlarge came back with 10 rows covering 7 regions and silently dropped
-     ~70 AZs. Any AZ that falls out of the top 10 would record nothing, and the
-     hole would be indistinguishable from "the score dropped" — which destroys
-     the only question the study exists to answer ("does use1-az4 recover at
-     3 AM Saturday?"). Therefore: **one request per region**, which returns that
-     region's complete AZ set (<= 6 AZs, comfortably under the cap). The
-     all-regions query is kept as ONE cheap leaderboard per type, tagged
-     ``scope="global_top10"`` and excluded from every per-AZ analysis.
-  2. **The throttle is a token bucket, not a per-day configuration budget**
-     (service-quotas: bucket capacity 100, refill 20/s). That is a rate limit,
-     so a few hundred requests per 10-minute tick is fine — we pace at 10/s,
-     half the refill rate, so the bucket can never drain. The matrix is still a
-     pinned constant: comparability across days demands it, and an undocumented
-     per-configuration limit would be invisible until it bit us.
-  3. **Throttling is data, not failure.** A throttled or failed request is
-     retried with backoff and, if it still fails, written as an ``sps_gap``
-     record. A gap in a time series must never look like a bad score.
+     ~70 AZs, and a dropped AZ is indistinguishable from "the score fell" —
+     which destroys the only question the study exists to answer ("does
+     use1-az4 recover at 3 AM Saturday?"). Only a SINGLE-region request returns
+     that region's complete AZ set. Given (1) we cannot afford one request per
+     region, so per-AZ coverage is bought where it matters (the home region and
+     two relocation candidates) and the all-regions query is kept purely as a
+     cheap leaderboard, tagged ``scope="global_top10"`` and excluded from every
+     per-AZ analysis.
+  3. **Throttling is data, not failure.** The token bucket is real too (bucket
+     100, refill 20/s), so requests are paced at 10/s; a throttled request is
+     retried with backoff and, if it still fails — or if it is refused by the
+     configuration cap — it is written as an ``sps_gap`` record. A gap in a time
+     series must never look like a bad score.
 
 And one rule that outranks all of them:
 
@@ -77,19 +86,32 @@ INSTANCE_TYPES: tuple[str, ...] = (
     "g6.xlarge",
     "g6.2xlarge",
 )
+# Types worth a configuration of their own. The .2xlarge variants are dropped
+# from the per-type expansion — they score 1 consistently and are not what we
+# would train on — but they stay inside the basket, where they cost nothing
+# extra and still count towards "any GPU I could use".
+PER_TYPE_TYPES: tuple[str, ...] = ("g5.xlarge", "g4dn.xlarge", "g6.xlarge")
 # 8 is THE decision query for this project: one training world, one AZ (NCCL
 # bandwidth + cross-AZ transfer charges make a split world pointless). 1 is the
 # optimistic lower bound, kept only as context — a good score at 1 says nothing
 # about getting eight at once.
 TARGET_CAPACITIES: tuple[int, ...] = (1, 8)
-# True  -> per-AZ scores (which AZ to aim at), False -> region-level score.
-SINGLE_AZ_MODES: tuple[bool, ...] = (True, False)
 # AWS warns that a score for one or two instance types is always pessimistic
 # ("specify at least three"). We still want per-type resolution — it is the only
 # way to answer "would switching GPU type help?" — so we ask BOTH: one request
 # per type (comparable to each other, conservative in absolute terms) plus one
 # "basket" request naming all six (the realistic "I'll take whatever runs" ask).
 BASKET_LABEL = "any"
+# Where we would go if leaving the home region were worth it: same continent, so
+# the dataset copy and the egress bill are as small as relocation gets. Basket
+# only, capacity 8 — enough to answer "is relocating even on the table?".
+CANDIDATE_REGIONS: tuple[str, ...] = ("us-east-2", "us-west-2")
+# The self-imposed configuration budget. The real cap is unpublished and may
+# vary by account; 28 was observed on ours, so we sit well under it and leave
+# room for a future addition without a redesign. sps_requests() asserts against
+# this, and the report surfaces the EFFECTIVE budget (configurations that
+# actually succeeded) so an account with a smaller cap shows up as data.
+MAX_CONFIGURATIONS = 20
 # Every response is truncated to this many rows regardless of MaxResults/
 # NextToken (measured). Per-region requests stay under it by construction; a
 # response that hits it exactly is flagged ``truncated`` so the report knows the
@@ -106,6 +128,11 @@ THROTTLE_CODES = (
     "ThrottlingException",
     "TooManyRequestsException",
 )
+# "You have already used your distinct-configuration budget for the last 24h."
+# NOT retried: unlike a throttle it will not clear within a tick, and retrying
+# would only burn time. It is recorded, because an unpublished limit can only be
+# observed through its own error.
+CONFIG_CAP_CODES = ("MaxConfigLimitExceeded",)
 
 
 class SpsRequest(NamedTuple):
@@ -159,13 +186,17 @@ def _client(service: str, region: str):
 # --------------------------------------------------------------------------- #
 # Pure helpers (unit-tested; no AWS, no clock of their own)
 # --------------------------------------------------------------------------- #
-def _req(types: list[str], capacity: int, single_az: bool, regions: list[str], scope: str):
+def _req(types: list[str], capacity: int, regions: list[str], scope: str) -> SpsRequest:
+    """One configuration. SingleAvailabilityZone is always true: a training world
+    has to land in ONE AZ (NCCL bandwidth, cross-AZ transfer charges), so a
+    region-level score answers a question we cannot use — and at ~20 available
+    configurations, we cannot afford to ask it."""
     return SpsRequest(
         kwargs={
             "InstanceTypes": list(types),
             "TargetCapacity": capacity,
             "TargetCapacityUnitType": "units",
-            "SingleAvailabilityZone": single_az,
+            "SingleAvailabilityZone": True,
             "RegionNames": list(regions),
         },
         label=types[0] if len(types) == 1 else BASKET_LABEL,
@@ -173,38 +204,77 @@ def _req(types: list[str], capacity: int, single_az: bool, regions: list[str], s
     )
 
 
-def sps_requests(regions: list[str]) -> list[SpsRequest]:
-    """The complete, deterministic request matrix.
+def sps_requests(regions: list[str], home_region: str = "us-east-1") -> list[SpsRequest]:
+    """The complete, deterministic request matrix, in PRIORITY ORDER.
 
-    Same input regions => byte-identical requests in the same order, forever
-    (the region list is sorted here so an unordered pin can't change it either).
+    Same inputs => byte-identical requests in the same order, forever (the
+    leaderboard's region list is sorted so an unordered pin can't change it).
 
-    Shape, and why: **per region** — because a response never returns more than
-    10 rows, so only a single-region ask is guaranteed to cover every AZ in it.
-    Per region we take each GPU type at both capacities in both AZ modes, plus
-    one all-six-types "basket" per capacity (per-AZ only — that is the "any GPU
-    in this AZ" question the switching analysis needs, and it dodges AWS's
-    "one instance type always scores low" caveat). Finally one all-regions query
-    per type/capacity as a *leaderboard*, tagged ``global_top10`` so nothing
-    downstream mistakes its 10 rows for coverage.
+    The budget, not the API's speed, is what shapes this. ~20 configurations is
+    all we get per 24h, so they are spent where they answer the actual question,
+    highest value first — if a configuration is ever refused, we lose the tail
+    (the worldwide leaderboard), never the head (us-east-1 at capacity 8):
 
-    With 17 regions that is 17*26 + 14 = 456 requests/tick — ~46s at our 10/s
-    pacing, well inside the Lambda timeout, and far inside a 100-token bucket
-    refilling at 20/s.
+      1. home region, per AZ, capacity 8 — basket + 3 trainable types (4)
+         The decision query: can we get a whole 8-node world in one AZ, where
+         the bucket and the 17 GB dataset already live?
+      2. home region, per AZ, capacity 1 — same four asks (4)
+         Context: how much of the drought is about *size* rather than supply.
+      3. worldwide leaderboard, capacity 8 — same four asks (4)
+         "Is there capacity anywhere?" for 4 configurations instead of 4 per
+         region; its 10 rows are a top-10, never coverage.
+      4. relocation candidates, per AZ, capacity 8, basket only (2)
+
+    14 configurations, 14 requests per tick — seconds of wall clock, and it
+    re-polls the SAME configurations forever, which is free once they are spent.
     """
-    region_names = sorted(regions)
+    board_regions = sorted(regions)
     out: list[SpsRequest] = []
-    for region in region_names:
-        for capacity in TARGET_CAPACITIES:
-            for single_az in SINGLE_AZ_MODES:
-                for instance_type in INSTANCE_TYPES:
-                    out.append(_req([instance_type], capacity, single_az, [region], "region"))
-            out.append(_req(list(INSTANCE_TYPES), capacity, True, [region], "region"))
-    for capacity in TARGET_CAPACITIES:
-        for instance_type in INSTANCE_TYPES:
-            out.append(_req([instance_type], capacity, True, region_names, "global_top10"))
-        out.append(_req(list(INSTANCE_TYPES), capacity, True, region_names, "global_top10"))
+    seen: set[tuple] = set()
+
+    def _add(types: list[str], capacity: int, request_regions: list[str], scope: str) -> None:
+        # First use of a configuration is what costs budget, so an accidental
+        # repeat is pure waste. It happens for real: on a single-region account
+        # the "worldwide" leaderboard IS the home-region ask.
+        req = _req(types, capacity, request_regions, scope)
+        key = config_key(req)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(req)
+
+    for capacity in (8, 1):  # 8 first: the query that decides the project
+        _add(list(INSTANCE_TYPES), capacity, [home_region], "region")
+        for instance_type in PER_TYPE_TYPES:
+            _add([instance_type], capacity, [home_region], "region")
+    _add(list(INSTANCE_TYPES), 8, board_regions, "global_top10")
+    for instance_type in PER_TYPE_TYPES:
+        _add([instance_type], 8, board_regions, "global_top10")
+    for region in CANDIDATE_REGIONS:
+        if region != home_region:
+            _add(list(INSTANCE_TYPES), 8, [region], "region")
+
+    # Self-enforcing budget: the matrix cannot grow past the cap by accident,
+    # and anyone adding to it has to consciously decide what to spend it on.
+    assert len(seen) <= MAX_CONFIGURATIONS, (
+        f"matrix asks for {len(seen)} distinct configurations but the budget is "
+        f"{MAX_CONFIGURATIONS}; AWS refuses the excess with MaxConfigLimitExceeded"
+    )
     return out
+
+
+def config_key(req: SpsRequest) -> tuple:
+    """What AWS counts against the 24h budget: the request shape itself. Used to
+    police the matrix here and, in the report, to measure the EFFECTIVE budget
+    from what actually came back."""
+    k = req.kwargs
+    return (
+        tuple(k["InstanceTypes"]),
+        k["TargetCapacity"],
+        k["TargetCapacityUnitType"],
+        k["SingleAvailabilityZone"],
+        tuple(k["RegionNames"]),
+    )
 
 
 def is_daily_tick(now: datetime, daily_hour: int = 3, tick_minutes: int = 10) -> bool:
@@ -391,6 +461,10 @@ def is_throttle(code: str) -> bool:
     return code in THROTTLE_CODES
 
 
+def is_config_capped(code: str) -> bool:
+    return code in CONFIG_CAP_CODES
+
+
 _last_sps_call = 0.0
 
 
@@ -425,7 +499,7 @@ def _collect_sps(cfg: dict, regions: list[str], tick_id: str, t: float) -> tuple
     ec2 = _client("ec2", cfg["home_region"])
     records: list[dict] = []
     errors: list[dict] = []
-    for req in sps_requests(regions):
+    for req in sps_requests(regions, cfg["home_region"]):
         asked_region = req.kwargs["RegionNames"][0] if req.scope == "region" else ""
         try:
             resp, retries = _sps_call(ec2, req.kwargs)
@@ -465,6 +539,10 @@ def _collect_sps(cfg: dict, regions: list[str], tick_id: str, t: float) -> tuple
                     scope=req.scope,
                     error_code=code,
                     throttled=is_throttle(code),
+                    # The unpublished 24h configuration cap. Counted separately
+                    # from throttles because the fix is different: a throttle
+                    # means wait, this means the matrix is too wide.
+                    config_capped=is_config_capped(code),
                 )
             )
             errors.append({"stage": "sps", "region": asked_region, "error": str(e)[:200]})
@@ -803,12 +881,16 @@ def handler(event, context):  # noqa: ARG001 — Lambda signature
             t,
             daily=daily,
             regions=regions,
-            sps_requests=len(sps_requests(regions)),
+            sps_requests=len(sps_requests(regions, cfg["home_region"])),
             sps_rows=sum(1 for r in records if r["type"] == "sps"),
             # Coverage, not just health: the report divides by what we ASKED for,
             # so a tick that lost half its requests can't look like a bad market.
             sps_gaps=len(gaps),
             sps_throttled=sum(1 for r in gaps if r.get("throttled")),
+            # The observable form of an unpublished limit. Non-zero here means
+            # the matrix is wider than this account's 24h configuration budget.
+            sps_config_capped=sum(1 for r in gaps if r.get("config_capped")),
+            config_budget=MAX_CONFIGURATIONS,
             sps_retries=sum(int(r.get("retries", 0)) for r in records if r["type"] == "sps"),
             record_count=len(records) + 1,
             errors=errors[:20],  # cap: a total outage would otherwise write a novel
