@@ -122,7 +122,14 @@ class LaunchReplacement:
 
 @dataclass(frozen=True)
 class WholeGroupRestart:
-    pass
+    # WHY the floor fired. This is the most destructive action the supervisor can
+    # take — it discards every healthy survivor and relaunches the fleet — and it
+    # used to be logged as a bare "whole-group restart (floor)". When an 8-node
+    # run amplified 6 injected kills into 22 node slots, the log could not say
+    # which of the three conditions was responsible, so the cause had to be
+    # guessed. Never again: the reason travels with the action.
+    # Compared by identity of the reason too, so tables stay explicit.
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -166,12 +173,30 @@ def decide(obs: Observation, policy: Policy) -> list[Action]:
     # recovering fine. The clock measures "this world has had its chance", not
     # "time since some checkpoint" — and epochs_without_progress is what keeps
     # the deadlock-breaker reachable once the clock can be reset.
-    if obs.epoch > 0 and (
-        (obs.no_progress_s is not None and obs.no_progress_s > policy.recovery_timeout_s)
-        or obs.epochs_without_progress >= policy.max_epochs_without_progress
-        or not healthy
-    ):
-        return [WholeGroupRestart()]
+    #
+    # Under a HIGH failure rate the first two conditions need care: every kill
+    # publishes two epochs (shrink, then grow), so a naive per-epoch counter
+    # spends its whole budget on ~1.5 preemptions and nukes a fleet that is
+    # recovering exactly as designed. Both are therefore judged against a world
+    # that still has healthy members — if survivors are present and the world is
+    # re-forming around them, that is the mechanism working, not a deadlock.
+    if obs.epoch > 0:
+        reason = ""
+        if not healthy:
+            # Nothing left to shrink onto: the only way back is a full relaunch.
+            reason = "no healthy members"
+        elif obs.no_progress_s is not None and obs.no_progress_s > policy.recovery_timeout_s:
+            reason = (
+                f"no checkpoint progress for {obs.no_progress_s:.0f}s "
+                f"(> recovery_timeout {policy.recovery_timeout_s:.0f}s)"
+            )
+        elif obs.epochs_without_progress >= policy.max_epochs_without_progress:
+            reason = (
+                f"{obs.epochs_without_progress} epochs published with no checkpoint "
+                f"(>= max {policy.max_epochs_without_progress})"
+            )
+        if reason:
+            return [WholeGroupRestart(reason)]
 
     # Startup: don't begin training degraded — wait for the whole group to
     # register and reach running, then publish epoch 1.
@@ -577,8 +602,8 @@ class Supervisor:
         self.node_ids[node] = self._launch_node(node)
         self.profile.mark("relaunch")
 
-    def _whole_group_restart(self) -> None:
-        self._event("whole-group restart (floor)")
+    def _whole_group_restart(self, reason: str = "") -> None:
+        self._event(f"whole-group restart (floor): {reason or 'unspecified'}")
         aws.delete_object(self.cfg.bucket, self.cfg.run_epoch_key(self.run_id))
         for iid in self.node_ids.values():
             aws.terminate(iid)
@@ -602,7 +627,7 @@ class Supervisor:
             elif isinstance(a, LaunchReplacement):
                 self._launch_replacement(a.node)
             elif isinstance(a, WholeGroupRestart):
-                self._whole_group_restart()
+                self._whole_group_restart(a.reason)
             elif isinstance(a, Done):
                 pass
 

@@ -139,7 +139,11 @@ def test_metrics_exists_is_done():
 
 def test_stall_triggers_whole_group_restart():
     obs = _obs([_node(0), _node(1)], epoch=2, members=[0, 1], no_progress=700)
-    assert decide(obs, PREEMPT) == [WholeGroupRestart()]
+    (act,) = decide(obs, PREEMPT)
+    assert isinstance(act, WholeGroupRestart)
+    # The reason must name the condition — this is the most destructive action
+    # the supervisor takes, and a bare "floor" left a real incident undiagnosable.
+    assert "no checkpoint progress" in act.reason and "700" in act.reason
 
 
 def test_all_gone_triggers_whole_group_restart():
@@ -148,7 +152,9 @@ def test_all_gone_triggers_whole_group_restart():
         epoch=2,
         members=[0, 1],
     )
-    assert decide(obs, PREEMPT) == [WholeGroupRestart()]
+    (act,) = decide(obs, PREEMPT)
+    assert isinstance(act, WholeGroupRestart)
+    assert "no healthy members" in act.reason
 
 
 def test_stale_heartbeat_counts_as_lost():
@@ -687,7 +693,9 @@ def test_recovery_in_progress_is_not_a_stall():
 def test_genuine_stall_still_breaks_the_deadlock():
     # Past the timeout with the world nominally healthy: nothing is coming back.
     obs = _obs([_node(0), _node(1)], epoch=2, members=[0, 1], no_progress=601.0)
-    assert decide(obs, PREEMPT) == [WholeGroupRestart()]
+    (act,) = decide(obs, PREEMPT)
+    assert isinstance(act, WholeGroupRestart)
+    assert "no checkpoint progress" in act.reason
 
 
 def test_flapping_world_restarts_even_though_each_epoch_resets_the_clock():
@@ -702,7 +710,9 @@ def test_flapping_world_restarts_even_though_each_epoch_resets_the_clock():
         no_progress=5.0,  # clock just reset by the newest epoch
         epochs_without_progress=3,  # ...but three worlds in a row never trained
     )
-    assert decide(obs, PREEMPT) == [WholeGroupRestart()]
+    (act,) = decide(obs, PREEMPT)
+    assert isinstance(act, WholeGroupRestart)
+    assert "epochs published with no checkpoint" in act.reason
 
 
 def test_progress_clears_the_flap_counter_path():
