@@ -708,7 +708,7 @@ def test_flapping_world_restarts_even_though_each_epoch_resets_the_clock():
         epoch=7,
         members=[0, 1],
         no_progress=5.0,  # clock just reset by the newest epoch
-        epochs_without_progress=3,  # ...but three worlds in a row never trained
+        epochs_without_progress=6,  # ...but six worlds in a row never trained
     )
     (act,) = decide(obs, PREEMPT)
     assert isinstance(act, WholeGroupRestart)
@@ -725,3 +725,32 @@ def test_progress_clears_the_flap_counter_path():
         epochs_without_progress=0,
     )
     assert decide(obs, PREEMPT) == []
+
+
+def test_two_normal_preemptions_do_not_exhaust_the_restart_budget():
+    """One preemption publishes TWO epochs — shrink onto survivors, then grow
+    when the replacement joins. With the budget at 3, ~1.5 textbook recoveries
+    spent it, so the mechanism working correctly could trigger the most
+    destructive action available (discard every healthy survivor and relaunch).
+    The budget is counted in preemptions now, not epochs."""
+    p = Policy(replace_on_loss=True, recovery_timeout_s=600)
+    # Two preemptions = 4 epoch publications with no checkpoint in between.
+    obs = _obs(
+        [_node(0), _node(1)],
+        epoch=5,
+        members=[0, 1],
+        no_progress=30.0,
+        epochs_without_progress=4,
+    )
+    assert decide(obs, p) == [], "two normal recoveries must not trip the floor"
+    # A third full preemption (6 epochs) is genuine evidence the world is stuck.
+    stuck = _obs(
+        [_node(0), _node(1)],
+        epoch=7,
+        members=[0, 1],
+        no_progress=30.0,
+        epochs_without_progress=6,
+    )
+    (act,) = decide(stuck, p)
+    assert isinstance(act, WholeGroupRestart)
+    assert "epochs published with no checkpoint" in act.reason

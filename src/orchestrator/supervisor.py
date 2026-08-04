@@ -85,7 +85,14 @@ class Policy:
     # form. Each epoch gets a full recovery_timeout_s, so this many failures is
     # already several minutes of evidence — enough to conclude the membership
     # itself is the problem and only a clean slate will do.
-    max_epochs_without_progress: int = 3
+    #
+    # Budget it in PREEMPTIONS, not epochs: one preemption publishes TWO epochs
+    # (shrink onto the survivors, then grow when the replacement joins). At 3,
+    # ~1.5 normal recoveries exhausted it — so a counter meant to catch "this
+    # world can NEVER form" could be spent by the mechanism working exactly as
+    # designed, and its penalty is the most destructive action available:
+    # discarding every healthy survivor. 6 = three full preemptions.
+    max_epochs_without_progress: int = 6
 
 
 def _healthy(n: NodeObs, policy: Policy) -> bool:
