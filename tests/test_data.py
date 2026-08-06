@@ -206,3 +206,28 @@ def test_stage_data_is_a_no_op_when_both_bins_are_present(tmp_path, monkeypatch)
     )
     dataset_mod.stage_data(cfg)
     assert fake.uploaded == []
+
+
+def test_dataset_download_is_tuned_for_a_17gb_bin():
+    """boto3's transfer defaults (10 threads / 8 MB chunks) are sized for small
+    objects. Measured on g5.xlarge pulling the 17 GB train.bin from same-region
+    S3: 148 MB/s on a link rated "Up to 10 Gigabit" — ~12% of the instance, and
+    116s of EVERY cold boot and EVERY preemption replacement, which is about half
+    of a recovery. The managed transfer must be given a real TransferConfig."""
+    from spot_train import s3_store
+
+    cfg = s3_store._transfer_config()
+    assert cfg.max_concurrency >= 32, "too few threads to fill the pipe"
+    assert cfg.multipart_chunksize >= 16 * 1024 * 1024, "8 MB chunks throttle a 17 GB object"
+
+
+def test_download_tuning_is_overridable(monkeypatch):
+    # The ceiling is min(network, destination disk), so a box with a slow root
+    # volume gains nothing from more concurrency — operators must be able to cap it.
+    from spot_train import s3_store
+
+    monkeypatch.setenv("S3_MAX_CONCURRENCY", "4")
+    monkeypatch.setenv("S3_CHUNK_MB", "8")
+    cfg = s3_store._transfer_config()
+    assert cfg.max_concurrency == 4
+    assert cfg.multipart_chunksize == 8 * 1024 * 1024

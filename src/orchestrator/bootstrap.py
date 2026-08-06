@@ -69,6 +69,11 @@ def _trainer_env(
         "MARKET": market,
         "DEVICE": "auto",  # trainer auto-detects cuda vs cpu on the box
         "DDP_DATA_MODE": cfg.ddp_data_mode,  # only used when launched via torchrun
+        # Saturate the pipe when pulling the 17 GB dataset bin: boto3's
+        # defaults hit only 148 MB/s of a "Up to 10 Gigabit" link, and that
+        # download is ~half of every cold boot AND every preemption recovery.
+        "S3_MAX_CONCURRENCY": os.environ.get("S3_MAX_CONCURRENCY", "32"),
+        "S3_CHUNK_MB": os.environ.get("S3_CHUNK_MB", "16"),
         "PYTHONUNBUFFERED": "1",  # unbuffered so `tail -f` shows per-step lines live
     }
     # Recipe/cadence knobs (MAX_STEPS, LR schedule, EVAL/SAMPLE intervals, …)

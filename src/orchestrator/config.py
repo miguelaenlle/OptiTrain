@@ -112,6 +112,8 @@ _ORCH_RELAY_ENV = (
     "INSTANCE_VCPUS",
     "METRICS_TIMEOUT",
     "METRICS_OVERHEAD",
+    "S3_MAX_CONCURRENCY",
+    "S3_CHUNK_MB",
     "LOG_STREAM_SECONDS",
     "WANDB_PROJECT",
     "WANDB_ENTITY",
@@ -251,10 +253,17 @@ class OrchestratorConfig:
     # evenly across segments. Set small (e.g. PREEMPT_AFTER=15) to exercise the
     # kill/resume path fast while debugging; the number of kills stays preempt_count.
     preempt_after_seconds: int = field(default_factory=lambda: _env_int("PREEMPT_AFTER", 0))
-    # Small checkpoint interval during preemption so training-start is detectable fast
-    # (graceful SIGTERM also checkpoints, so lost work is ~0 regardless).
+    # Checkpoint interval while a kill schedule is armed. Bounds lost work per
+    # hard kill (no warning) — but it is paid on EVERY step of the whole run, so
+    # it must be priced against the checkpoint's real size. 5s was right when a
+    # Shakespeare checkpoint was a few MB; at GPT-2 124M a checkpoint is 1.5 GB,
+    # and 5s meant serializing + pushing 1.5 GB toward S3 continuously on the
+    # same NIC the gradient all-reduce rides. Measured on the 2-kill 1h run:
+    # 6330 ms/step vs 4013 clean — a +58% tax on every step, dwarfing the
+    # downtime it was meant to bound. At 60s the worst case loses ~15 steps
+    # (~1 min) per kill, and the tax drops to ~2-3%.
     preempt_checkpoint_seconds: int = field(
-        default_factory=lambda: _env_int("PREEMPT_CHECKPOINT_SECONDS", 5)
+        default_factory=lambda: _env_int("PREEMPT_CHECKPOINT_SECONDS", 60)
     )
     # How often the trainer runs the (noisy) checkpoint verify+smoke test. Set per
     # experiment so frequent preemption checkpoints don't flood the loss output.

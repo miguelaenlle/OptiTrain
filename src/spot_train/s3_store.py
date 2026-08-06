@@ -123,6 +123,31 @@ def ref_for(uri: str, name: str) -> str:
     return os.path.join(uri, name)
 
 
+def _transfer_config():
+    """Transfer tuning for the ONE object that dominates boot: the dataset bin.
+
+    boto3's defaults (10 threads, 8 MB chunks) were written for small objects and
+    leave most of the pipe idle on a big one. Measured on g5.xlarge pulling a
+    17 GB train.bin from same-region S3 onto the instance-store NVMe:
+    **148 MB/s = 1.18 Gbps on a link rated "Up to 10 Gigabit"** — about 12% of
+    what the instance can do, and 116s of every cold boot AND every preemption
+    replacement.
+
+    More threads and bigger chunks let the managed transfer actually saturate the
+    link. Kept overridable because the right value is instance-shaped: the ceiling
+    is min(network, destination disk), and a box with a slow root volume gains
+    nothing from more concurrency.
+    """
+    from boto3.s3.transfer import TransferConfig
+
+    return TransferConfig(
+        max_concurrency=int(os.environ.get("S3_MAX_CONCURRENCY", "32")),
+        multipart_chunksize=int(os.environ.get("S3_CHUNK_MB", "16")) * 1024 * 1024,
+        multipart_threshold=8 * 1024 * 1024,
+        use_threads=True,
+    )
+
+
 def download(ref: str, verify: bool = True, dest_dir: str = "") -> str:
     """Return a local path for ``ref``. For S3, download to a temp file (and let
     S3/boto3 validate the SHA-256 when ``verify``). For local, ``ref`` already is
@@ -145,7 +170,7 @@ def download(ref: str, verify: bool = True, dest_dir: str = "") -> str:
     fd, local = tempfile.mkstemp(suffix="-" + key.rsplit("/", 1)[-1], dir=dest_dir or None)
     os.close(fd)
     extra = {"ChecksumMode": "ENABLED"} if verify else {}
-    _client().download_file(bucket, key, local, ExtraArgs=extra)
+    _client().download_file(bucket, key, local, ExtraArgs=extra, Config=_transfer_config())
     return local
 
 
