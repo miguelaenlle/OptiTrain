@@ -43,11 +43,18 @@ cd <repo>
 set -a && . ./.env && . ./recipes/gpt2-owt.env && set +a
 export MARKET=on-demand VCPU_QUOTA=64 MAX_INSTANCE_LIFETIME_SECONDS=7200 \
        WARMUP_STEPS=100 LR_DECAY_STEPS=2000 EVAL_INTERVAL_STEPS=0 EVAL_ITERS=50 \
-       METRICS_OVERHEAD=1800
+       LOG_INTERVAL_STEPS=1 METRICS_OVERHEAD=1800
 ```
 
 `EVAL_INTERVAL_STEPS=0` — a full val pass is pure overhead here and would land at
 different points in each arm. We are measuring throughput, not convergence.
+
+`LOG_INTERVAL_STEPS=1` — **this setting is the second experiment, for free.** Every
+step line carries its world size (`ws N`), so the preempt arm answers a question
+the existing data cannot: *do the survivors actually train while a replacement
+boots?* See "Does elastic actually pay?" below. At the default of 10, a short
+degraded window can pass without emitting a single line, which is exactly why
+the current evidence is ambiguous.
 
 **Arm A — clean baseline**
 
@@ -138,6 +145,48 @@ Written automatically by each run:
   result, and the reason to run both.
 - **`trained_seconds_total` differing between arms invalidates the run.** Check
   it before believing anything else.
+
+---
+
+## Does elastic actually pay? (the second result, free)
+
+The design shrinks membership onto the survivors so training continues while a
+replacement boots. Whether that produces *work* is unverified — and the current
+evidence says probably not:
+
+- the Gantt's "degraded 86s, world dipped to 4" is `ws = len(members)`, i.e. the
+  **epoch document's membership count**. It proves the supervisor shrank. It does
+  not prove anyone trained.
+- the trainer's own step lines in two preemption runs contain **only `ws 8`**,
+  with 361s and 566s stretches where no step was logged at all.
+
+**Why it might not pay.** A membership change restarts *every* node, so one
+preemption costs **two** full world restarts (shrink to N−1, then grow back to
+N) — each one reloading a 1.5 GB checkpoint and re-initialising NCCL. Survivors
+only get useful work if
+
+```
+degraded window  >  2 x T_restart
+```
+
+At 8 nodes T_restart is plausibly 60–90s (NCCL init alone needed >20s), so
+2 x T_restart is about the size of the whole window.
+
+**What to look for in arm B's log:** any `step N: ... ws 3` (4-node) or `ws 7`
+(8-node) lines. Count them.
+
+- **Some** -> elastic pays; report steps completed at reduced world.
+- **None** -> the double restart eats the entire window. The fix is a supervisor
+  policy, not tuning: when a replacement is already in flight and expected within
+  ~2 x T_restart, **do not shrink** — hold the world and pay one restart instead
+  of two.
+
+Worth stating plainly because it inverts the intuition: **shrink-and-continue is
+only worth it when replacements are SLOW.** Add hot spares (~10s replacement) and
+shrinking becomes strictly worse than pausing.
+
+While you are here, `T_restart` falls out of the same log for free: the gap
+between the last step before a membership change and the first step after it.
 
 ## Variants worth one extra run each
 
