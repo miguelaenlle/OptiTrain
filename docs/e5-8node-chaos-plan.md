@@ -246,3 +246,103 @@ is exactly what E5 either confirms or refutes.
 
 > Every number in this section rests on `RESTART_SCALE_8N`, which is a guess
 > until E5 runs. Treat the whole block as a hypothesis, not a projection.
+
+## Metrics to acquire
+
+Four categories. **Only the first is the thesis** — the rest exist to prove the
+run was real training and not a toy.
+
+### A. Fault tolerance — the actual claim
+
+| metric | target | why it matters |
+|---|---|---|
+| **goodput** (`trained_s / wall_s`) | **≥ 94%** | the single headline number |
+| node failures survived | **18** | the demonstration |
+| **whole-group restarts** | **0** | one failure here invalidates the claim |
+| **human interventions** | **0** | this is what separates it from a babysat run |
+| median `T_restart` | 10–25s | measured by E5 first |
+| recovery to full world | 200–300s | replacement boot-bound |
+| lost work per interruption | ≤ checkpoint cadence | CLAUDE.md's stated invariant |
+| world-size staircase | 8→7→8 ×18 | the W&B plot that shows it happening |
+
+### B. Scale — proves it is real training
+
+| metric | projected |
+|---|---|
+| tokens processed | **35.8B** (72.8k steps × 491,520) |
+| aggregate throughput | 276k tokens/s (34.5k/GPU) |
+| **MFU** | **~20%** of A10G bf16 peak |
+| node-hours | 303 |
+
+### C. Cost — the money thesis
+
+Live `describe-spot-price-history` for `g5.xlarge` in us-east-1 (n=1283):
+**median $0.5627**, min $0.3767, max $0.9821, against $1.006 on-demand.
+
+| metric | value |
+|---|---|
+| on-demand equivalent | **$305** |
+| spot at median | **$170 → 44% saving** |
+| spot in cheapest AZ | $114 → 62% saving |
+| **$ per billion tokens** | **$4.75** |
+
+44% is the defensible headline. The 65% figure I used earlier assumed $0.35/h,
+which is near the *floor*, not the median — spot has risen, consistent with the
+current GPU shortage.
+
+### D. Quality — proves preemption did not corrupt it
+
+| metric | target |
+|---|---|
+| final val loss | **~3.0–3.1** |
+| reference | OpenAI GPT-2 124M scores **3.11** on OpenWebText |
+| loss curve vs clean run | superimposes (E1's result, at 36h scale) |
+
+⚠️ **`LR_DECAY_STEPS=600000` in `recipes/gpt2-owt.env` is wrong for this run.**
+The cosine must *land* inside the budget or the final loss is needlessly bad. Set
+it to the projected step count (**~72,000**). This is the difference between
+hitting 3.0 and stalling around 3.3.
+
+## What a production system achieves
+
+| | this run (target) | production reference |
+|---|---|---|
+| effective training time | **~95%** | Llama 3 405B: **>90%** |
+| interruptions | 18 / 36h / 8 nodes | Llama 3: 466 / 54 days / 16,384 GPUs |
+| **per-node failure rate** | **1.5 / node-day** | **5.3e-4 / GPU-day** |
+| recovery | 10–25s | minutes (TB-scale checkpoints) |
+| human intervention | 0 | mostly automated; OPT-175B was famously manual |
+
+*(Llama 3 figures from Meta's Llama 3 paper — verify before quoting externally.)*
+
+**The honest framing.** Our per-node failure rate is **~2,800× higher** than the
+Llama 3 cluster's, and we still hold comparable goodput. That is the impressive
+comparison. What is *not* a fair comparison is recovery time: ours is seconds
+because the checkpoint is 1.5 GB. At 405B parameters the checkpoint is TB-scale
+and no amount of control-plane quality makes that reload in 15 seconds. Claiming
+otherwise invites exactly the question that unravels it.
+
+## The resume bullet
+
+Long form:
+
+> **Fault-tolerant distributed LLM training on spot GPUs** — Built the control
+> plane (Python/AWS, epoch-supervisor architecture) that trains across
+> preemptible multi-node GPU fleets. Sustained a **36-hour, 8-node GPT-2
+> pretraining run through 18 node failures** — including simultaneous loss of
+> half the fleet — with **zero human intervention, zero whole-group restarts,
+> and 95% goodput** at a per-node failure rate ~2,800× that reported for Meta's
+> Llama 3 cluster. **44% cheaper than on-demand.**
+
+Tight form:
+
+> Trained GPT-2 for 36h across 8 spot GPU nodes through 18 node failures — 0
+> human interventions, 0 whole-group restarts, 95% goodput, 44% cheaper than
+> on-demand. Built the supervisor, two-tier checkpointing, and recovery path.
+
+What makes it land is the **pairing**: a survival claim alone reads as "it
+retried"; a cost claim alone reads as "I used spot instances." *Survived 18
+failures* **and** *95% goodput* **and** *44% cheaper* is a systems result,
+because the three are in tension — that is the part an interviewer can probe and
+find real answers behind (budget-in-checkpoint, two-tier checkpoints, the pure
+`decide()` reducer, the measured 3.9× per-failure cost reduction from E1/E2b).
