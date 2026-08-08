@@ -281,8 +281,12 @@ def _runs() -> list[str]:
     """Run ids with exported data, newest first (ids embed a unix timestamp)."""
     if not DATA.exists():
         return []
+    # Every run directory is listed, including ones with no data yet. A run that
+    # is still booting SHOULD be selectable -- hiding it makes a launched run
+    # look like it never started, which is exactly the confusion this variable
+    # exists to prevent. An empty run renders empty panels, which is honest.
     return sorted(
-        (d.name for d in DATA.iterdir() if d.is_dir() and (d / "timeseries.csv").exists()),
+        (d.name for d in DATA.iterdir() if d.is_dir()),
         key=lambda n: n.rsplit("-", 1)[-1],
         reverse=True,
     )

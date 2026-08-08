@@ -46,17 +46,22 @@
     "name": "run",
     "label": "Run",
     "type": "custom",
-    "query": "multinode-preempt-1786207072",
+    "query": "multinode-preempt-1786227708,multinode-preempt-1786207072",
     "options": [
+     {
+      "text": "multinode-preempt-1786227708",
+      "value": "multinode-preempt-1786227708",
+      "selected": true
+     },
      {
       "text": "multinode-preempt-1786207072",
       "value": "multinode-preempt-1786207072",
-      "selected": true
+      "selected": false
      }
     ],
     "current": {
-     "text": "multinode-preempt-1786207072",
-     "value": "multinode-preempt-1786207072",
+     "text": "multinode-preempt-1786227708",
+     "value": "multinode-preempt-1786227708",
      "selected": true
     },
     "includeAll": false,
