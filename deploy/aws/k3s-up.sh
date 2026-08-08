@@ -119,10 +119,25 @@ PUBLIC_IP=\$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
 mkdir -p /var/lib/rancher/k3s/agent/images
 aws s3 cp ${IMAGES_S3} /var/lib/rancher/k3s/agent/images/fleet-images.tar --region ${INF_REGION} || true
 
-# --tls-san lets kubectl connect from outside using the public IP; without it
-# the served cert only covers the private address and every call fails on name
-# mismatch.
-curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --tls-san \$PUBLIC_IP --node-external-ip \$PUBLIC_IP --write-kubeconfig-mode 644" sh -
+# --tls-san adds the public IP to the SERVING CERT so kubectl can connect from
+# outside; without it every external call fails on name mismatch.
+#
+# --node-external-ip is deliberately NOT set on the server, and the advertise
+# address is pinned to the private IP. Setting it here publishes the PUBLIC ip
+# as the `kubernetes` Service endpoint, so every pod that needs the API server
+# dials out through the internet gateway and back — where the security group's
+# self-referencing rule does not apply, because that matches SG members by
+# group, not traffic arriving from an external address. The result is subtle
+# and total: nodes stay Ready (kubelet heartbeats are outbound) while CoreDNS
+# reports 'Plugins not ready: "kubernetes"', metrics-server and
+# local-path-provisioner crashloop, and cluster DNS never answers — so the
+# router resolves nothing and the fleet looks empty for no visible reason.
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server \
+  --tls-san \$PUBLIC_IP \
+  --advertise-address \$PRIVATE_IP \
+  --node-ip \$PRIVATE_IP \
+  --disable traefik --disable metrics-server --disable local-storage \
+  --write-kubeconfig-mode 644" sh -
 
 until [ -f /var/lib/rancher/k3s/server/node-token ]; do sleep 2; done
 until kubectl get nodes 2>/dev/null | grep -q Ready; do sleep 3; done
