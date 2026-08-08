@@ -119,3 +119,30 @@ Consequences:
 Behaviour is acceptable as-is. If it ever needs reducing, the levers are
 `SMOKE_TEST_EVERY > 1` or moving verify off the completion path — not the
 interval.
+
+---
+
+## `status.json` goes stale during recovery (observability)
+
+Found during E5. `updated_at` showed a **24s hole** spanning the epoch-2
+transition, and similar gaps at every round: the supervisor loop blocks on the
+synchronous replacement launch, so the observability document stops being
+rewritten *exactly* during a recovery.
+
+Consequence on a long run: `orch status` and the logview dashboard appear frozen
+at the moment an operator is most likely to be watching — and the world-size /
+`ckpt_step` history for that window is unrecoverable afterwards, because
+`status.json` is overwritten in place rather than appended.
+
+It cost E5 nothing only because the step log now carries its own wall clock
+(`t <unix>`), so the world timeline could be read from node logs instead at ~2s
+resolution. Without that change the per-round numbers would have had to be
+reconstructed.
+
+Two candidate fixes, either sufficient:
+1. Write `status.json` *before* launching replacements, not after.
+2. Move `RunInstances` off the decision loop (a thread or a queue), which also
+   removes the ~17.6s-per-launch serialization measured in E5.
+
+Option 2 is the better one — it fixes the observability gap and shortens
+recovery — but it touches the loop's single-writer property, so it needs care.
