@@ -787,3 +787,70 @@ def test_regrow_waits_for_the_replacement_to_announce_itself():
     assert decide(_obs([_node(0), ready], epoch=2, members=[0], node_count=2), PREEMPT) == [
         PublishEpoch(3, (0, 1))
     ]
+
+
+def test_dead_nodes_registration_does_not_outlive_it(monkeypatch):
+    """The bug that cost 155s of survivor idle time per failure.
+
+    nodes/node<i>.json is keyed by node INDEX and persists in S3, so a killed
+    node's registration is still sitting there after it dies. _node_ip falls
+    through to S3 on a cache miss, so the slot read as registered again within
+    one tick — and _healthy passed it (EC2 still said running, log seconds old).
+    The reducer then published a 4-member epoch while the replacement had not
+    begun booting, and every survivor blocked in init_process_group waiting for
+    a rank that did not exist.
+
+    A registration only counts when the box that wrote it is the box now in the
+    slot. The doc carries instance_id; the supervisor knows node_ids[node].
+    """
+    from orchestrator import supervisor as sup_mod
+    from orchestrator.profile import RunProfile
+
+    cfg = OrchestratorConfig(bucket="b")
+    # node 1's doc was written by i-OLD, which we have since replaced with i-NEW.
+    node_docs = {
+        cfg.run_node_uri("r", 0): b'{"ip": "10.0.0.0", "instance_id": "i-0"}',
+        cfg.run_node_uri("r", 1): b'{"ip": "10.0.0.1", "instance_id": "i-OLD"}',
+    }
+    monkeypatch.setattr(sup_mod.s3_store, "read_bytes", lambda uri: node_docs.get(uri))
+    s = sup_mod.Supervisor(
+        cfg,
+        RunProfile("r", kind="multinode-preempt", market="spot"),
+        run_id="r",
+        policy=PREEMPT,
+        node_ids={0: "i-0", 1: "i-NEW"},  # slot 1 now belongs to the replacement
+        logs={0: {"key": "k0", "state": {"printed": 0}}, 1: {"key": "k1", "state": {"printed": 0}}},
+        launch_node=lambda n: "i-NEW",
+        pull_logs=lambda: None,
+    )
+    assert s._node_ip(0) == "10.0.0.0", "the live node stays registered"
+    assert s._node_ip(1) is None, "the DEAD occupant's registration must not count"
+
+    # ...and once the replacement writes its OWN doc, the slot registers again.
+    node_docs[cfg.run_node_uri("r", 1)] = b'{"ip": "10.0.0.9", "instance_id": "i-NEW"}'
+    assert s._node_ip(1) == "10.0.0.9"
+
+
+def test_registration_trusted_when_instance_id_is_unavailable(monkeypatch):
+    """IMDS is absent in the localhost E2E, where register() writes "unknown".
+    Refusing those would make the harness never form a world at all."""
+    from orchestrator import supervisor as sup_mod
+    from orchestrator.profile import RunProfile
+
+    cfg = OrchestratorConfig(bucket="b")
+    monkeypatch.setattr(
+        sup_mod.s3_store,
+        "read_bytes",
+        lambda uri: b'{"ip": "127.0.0.1", "instance_id": "unknown"}',
+    )
+    s = sup_mod.Supervisor(
+        cfg,
+        RunProfile("r", kind="multinode", market="spot"),
+        run_id="r",
+        policy=PREEMPT,
+        node_ids={0: "i-0"},
+        logs={0: {"key": "k0", "state": {"printed": 0}}},
+        launch_node=lambda n: "i-x",
+        pull_logs=lambda: None,
+    )
+    assert s._node_ip(0) == "127.0.0.1"

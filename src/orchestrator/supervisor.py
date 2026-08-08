@@ -491,8 +491,22 @@ class Supervisor:
         if raw is None:
             return None
         try:
-            ip = json.loads(raw)["ip"]
+            doc = json.loads(raw)
+            ip = doc["ip"]
         except (ValueError, KeyError):
+            return None
+        # A registration is only OURS if the box that wrote it is the box now
+        # occupying this slot. nodes/node<i>.json is keyed by node INDEX and
+        # persists in S3, so after a kill the DEAD occupant's doc is still there:
+        # clearing the in-memory cache just forced a re-read of it, and the slot
+        # read as registered again within one tick. That is what let the reducer
+        # regrow onto a corpse at t+288s while the replacement did not boot until
+        # t+440s — 204s of survivors idling. Comparing instance ids makes the slot
+        # unregistered until the REPLACEMENT writes its own doc.
+        # ("unknown" = IMDS unavailable, i.e. the localhost E2E; trust it there.)
+        expected = self.node_ids.get(node)
+        got = doc.get("instance_id")
+        if expected and got and got != "unknown" and got != expected:
             return None
         self.st.ips[node] = ip
         return ip
