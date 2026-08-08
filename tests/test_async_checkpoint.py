@@ -193,3 +193,84 @@ def test_local_saver_flush_is_safe_when_idle(tmp_path):
     from spot_train import checkpoint as ckpt
 
     ckpt.AsyncLocalSaver(str(tmp_path)).flush()
+
+
+def test_snapshot_does_not_alias_live_tensors(tmp_path):
+    """The whole reason the CPU copy stays on the critical path: the optimizer
+    keeps mutating the live tensors while a background thread serializes. If the
+    snapshot aliased them the checkpoint would be torn. Batching the copies must
+    not weaken this."""
+    import torch
+
+    from spot_train import checkpoint
+
+    model = torch.nn.Linear(8, 4)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model(torch.randn(2, 8)).sum().backward()
+    opt.step()
+
+    class _L:
+        def state_dict(self):
+            return {"step": 1, "epoch": 0}
+
+    blob = checkpoint.snapshot(model=model, optimizer=opt, loader=_L(), step=1)
+    before = blob["model"]["weight"].clone()
+    with torch.no_grad():  # mutate the LIVE weight after snapshotting
+        model.weight.add_(100.0)
+    assert torch.equal(blob["model"]["weight"], before), "snapshot aliased a live tensor"
+
+
+def test_shared_blob_serializes_identically_for_both_tiers(tmp_path):
+    """Rank 0 hands ONE blob to the S3 writer and the local writer. Both only
+    read it, so the two artifacts must be byte-identical in content — that is
+    what makes sharing safe instead of a second 1.5 GB copy."""
+    import torch
+
+    from spot_train import checkpoint
+
+    model = torch.nn.Linear(8, 4)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    class _L:
+        def state_dict(self):
+            return {"step": 3, "epoch": 0}
+
+    blob = checkpoint.snapshot(model=model, optimizer=opt, loader=_L(), step=3)
+    a = checkpoint.save_local(blob, str(tmp_path / "a"), 3)
+    b = checkpoint.save_local(blob, str(tmp_path / "b"), 3)
+    la = torch.load(a, map_location="cpu", weights_only=False)
+    lb = torch.load(b, map_location="cpu", weights_only=False)
+    assert la["step"] == lb["step"] == 3
+    assert torch.equal(la["model"]["weight"], lb["model"]["weight"])
+
+
+def test_submit_accepts_a_prebuilt_blob(tmp_path):
+    """AsyncCheckpointer.submit(blob=...) must skip its own snapshot entirely —
+    that skip IS the fix; otherwise rank 0 still pays two device->host copies."""
+    from spot_train import checkpoint
+
+    calls = {"n": 0}
+    real = checkpoint.snapshot
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    checkpoint.snapshot = counting
+    try:
+        saver = checkpoint.AsyncCheckpointer(str(tmp_path / "ck"))
+        blob = {
+            "version": checkpoint.CKPT_VERSION,
+            "step": 5,
+            "trained_seconds": 0.0,
+            "model": {},
+            "optimizer": {},
+            "rng": {},
+            "loader": {"step": 5, "epoch": 0},
+            "scaler": None,
+        }
+        assert saver.submit(step=5, blob=blob) is True
+        saver.flush()
+        assert calls["n"] == 0, "submit(blob=...) must not snapshot again"
+    finally:
+        checkpoint.snapshot = real

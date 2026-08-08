@@ -488,19 +488,28 @@ def train(cfg: TrainConfig) -> dict:
         now = time.monotonic()
         trained_now = trained_before + (now - start_time)
         submitted = False
+        # Rank 0 feeds BOTH tiers from ONE snapshot. Taking two was a second full
+        # 1.5 GB device->host copy of byte-identical state — the dominant cost
+        # left after the writes went async (measured: stall/step 1.47s -> 0.83s
+        # with async writes alone, and rank 0's pause stalls every rank at the
+        # next all-reduce). Nodes 1..N-1 are unaffected; they only ever snapshot
+        # once, for their local tier.
+        shared_blob = None
         if ddp.master and now - last_ckpt >= cfg.checkpoint_interval_seconds:
             if async_ckpt is not None:
                 # Busy => the previous upload is still in flight: don't advance
                 # last_ckpt, so we retry within a few steps instead of waiting a
                 # whole interval. Bounded: one snapshot in memory at a time.
-                if async_ckpt.submit(
-                    model=raw_model,
-                    optimizer=optimizer,
-                    loader=loader,
-                    step=step,
-                    trained_seconds=trained_now,
-                    scaler=scaler,
-                ):
+                if not async_ckpt.busy():
+                    shared_blob = checkpoint.snapshot(
+                        model=raw_model,
+                        optimizer=optimizer,
+                        loader=loader,
+                        step=step,
+                        trained_seconds=trained_now,
+                        scaler=scaler,
+                    )
+                if shared_blob is not None and async_ckpt.submit(step=step, blob=shared_blob):
                     ckpt_count += 1
                     last_ckpt = now
                     submitted = True
@@ -520,7 +529,9 @@ def train(cfg: TrainConfig) -> dict:
                 # The snapshot (point-in-time CPU copy) stays here — it is what
                 # makes the write safe while the optimizer mutates the live
                 # tensors. Only serialize+write moves off the critical path.
-                blob = checkpoint.snapshot(
+                # Rank 0 reuses the blob it just took for S3 (identical state,
+                # same step) instead of paying a second device->host copy.
+                blob = shared_blob or checkpoint.snapshot(
                     model=raw_model,
                     optimizer=optimizer,
                     loader=loader,

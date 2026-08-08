@@ -99,18 +99,79 @@ def _scaler_state(scaler) -> dict | None:
     return scaler.state_dict()
 
 
-def _cpu_copy(obj: Any) -> Any:
+def _cuda_tensors(obj: Any, out: list) -> None:
+    """Collect every CUDA tensor in a state tree, in deterministic walk order."""
+    if isinstance(obj, torch.Tensor):
+        if obj.is_cuda:
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _cuda_tensors(v, out)
+    elif isinstance(obj, list | tuple):
+        for v in obj:
+            _cuda_tensors(v, out)
+
+
+def _batched_d2h(tensors: list) -> dict[int, torch.Tensor]:
+    """One pinned staging buffer, one async copy per tensor, ONE sync at the end.
+
+    The naive ``t.to("cpu", copy=True)`` per tensor is a SYNCHRONISING call: it
+    waits for the GPU, which is busy with queued training kernels. GPT-2 124M has
+    ~450 such tensors (weights + Adam's two moments each), so the cost is ~450
+    stalls rather than bandwidth — raw PCIe Gen4 x16 moves the whole 1.5 GB in
+    ~250 ms, but measured stalls were seconds.
+
+    Instead: allocate one pinned (page-locked) host buffer, issue every copy as
+    non_blocking into slices of it, then synchronise ONCE. Pinned memory also
+    lets the driver DMA directly instead of staging through its own bounce
+    buffer, which is worth roughly 3x on its own.
+
+    Returns id(tensor) -> CPU tensor so the tree walk can substitute them.
+    """
+    if not tensors:
+        return {}
+    total = sum(t.numel() * t.element_size() for t in tensors)
+    try:
+        flat = torch.empty(total, dtype=torch.uint8, device="cpu", pin_memory=True)
+    except RuntimeError:
+        # Pinned allocation can fail under host-memory pressure; fall back to
+        # pageable rather than failing the checkpoint.
+        flat = torch.empty(total, dtype=torch.uint8, device="cpu")
+    out: dict[int, torch.Tensor] = {}
+    off = 0
+    for t in tensors:
+        nbytes = t.numel() * t.element_size()
+        view = flat[off : off + nbytes].view(torch.uint8)
+        # A contiguous byte view of the destination, reinterpreted as the source
+        # dtype/shape, so one copy_ moves the tensor with no per-element work.
+        dst = view.view(t.dtype).view(t.shape) if t.is_contiguous() else None
+        if dst is None:
+            out[id(t)] = t.detach().to("cpu", copy=True)  # rare: non-contiguous
+        else:
+            dst.copy_(t.detach(), non_blocking=True)
+            out[id(t)] = dst
+        off += nbytes
+    torch.cuda.synchronize()  # the ONE sync: every copy above is now complete
+    return out
+
+
+def _cpu_copy(obj: Any, mapping: dict[int, torch.Tensor] | None = None) -> Any:
     """Deep copy a state tree with every tensor moved to CPU. The copy is the
     point: the optimizer keeps mutating the live tensors while the background
-    writer serializes, so the snapshot must not alias them."""
+    writer serializes, so the snapshot must not alias them.
+
+    ``mapping`` supplies already-copied CUDA tensors from :func:`_batched_d2h`;
+    without it each tensor is copied individually (the CPU-test path)."""
     if isinstance(obj, torch.Tensor):
+        if mapping is not None and id(obj) in mapping:
+            return mapping[id(obj)]
         return obj.detach().to("cpu", copy=True)
     if isinstance(obj, dict):
-        return {k: _cpu_copy(v) for k, v in obj.items()}
+        return {k: _cpu_copy(v, mapping) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_cpu_copy(v) for v in obj]
+        return [_cpu_copy(v, mapping) for v in obj]
     if isinstance(obj, tuple):
-        return tuple(_cpu_copy(v) for v in obj)
+        return tuple(_cpu_copy(v, mapping) for v in obj)
     return copy.deepcopy(obj)
 
 
@@ -126,15 +187,26 @@ def snapshot(
     it so the stall is amortized, not per-step. RNG and loader state are captured
     in the same instant as the weights — the invariant that keeps resume from
     silently diverging."""
+    model_sd, opt_sd = model.state_dict(), optimizer.state_dict()
+    scaler_sd = _scaler_state(scaler)
+    # ONE batched device->host transfer for every CUDA tensor across all three
+    # trees, then one sync — instead of ~450 individually synchronising copies.
+    mapping = None
+    if torch.cuda.is_available():
+        cuda: list = []
+        for tree in (model_sd, opt_sd, scaler_sd):
+            _cuda_tensors(tree, cuda)
+        if cuda:
+            mapping = _batched_d2h(cuda)
     return {
         "version": CKPT_VERSION,
         "step": step,
         "trained_seconds": trained_seconds,
-        "model": _cpu_copy(model.state_dict()),
-        "optimizer": _cpu_copy(optimizer.state_dict()),
+        "model": _cpu_copy(model_sd, mapping),
+        "optimizer": _cpu_copy(opt_sd, mapping),
         "rng": rng.capture(),  # capture() already returns copies
         "loader": dict(loader.state_dict()),
-        "scaler": _cpu_copy(_scaler_state(scaler)),
+        "scaler": _cpu_copy(scaler_sd, mapping),
     }
 
 
@@ -275,20 +347,37 @@ class AsyncCheckpointer:
         return self._thread is not None and self._thread.is_alive()
 
     def submit(
-        self, *, model, optimizer, loader, step: int, trained_seconds: float = 0.0, scaler=None
+        self,
+        *,
+        model=None,
+        optimizer=None,
+        loader=None,
+        step: int,
+        trained_seconds: float = 0.0,
+        scaler=None,
+        blob: dict[str, Any] | None = None,
     ) -> bool:
         """Snapshot now and hand off to the writer. False = previous save still
-        in flight (skipped; nothing was snapshotted)."""
+        in flight (skipped; nothing was snapshotted).
+
+        Pass ``blob`` to reuse a snapshot the caller already took. Rank 0 feeds
+        BOTH tiers, and the two snapshots were identical by construction (same
+        model, optimizer and step, with a collective between them guaranteeing
+        training had not advanced) — so taking two was a second full 1.5 GB
+        device->host copy for nothing. The writers only ever READ the blob, so
+        sharing one is safe; it also halves peak host memory, at the cost of the
+        blob living until BOTH writers finish."""
         if self.busy():
             return False
-        blob = snapshot(
-            model=model,
-            optimizer=optimizer,
-            loader=loader,
-            step=step,
-            trained_seconds=trained_seconds,
-            scaler=scaler,
-        )
+        if blob is None:
+            blob = snapshot(
+                model=model,
+                optimizer=optimizer,
+                loader=loader,
+                step=step,
+                trained_seconds=trained_seconds,
+                scaler=scaler,
+            )
         self._count += 1
         self._thread = threading.Thread(
             target=self._write, args=(blob, step, self._count), name="ckpt-writer", daemon=True
