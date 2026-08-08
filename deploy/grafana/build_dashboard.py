@@ -95,9 +95,11 @@ def embed_target(wanted: list[tuple[str, str]], src: str = "timeseries.csv") -> 
     ]
 
 
-def ts_target(cols: list[tuple[str, str]], url: str = TS_URL) -> list[dict]:
+def ts_target(
+    cols: list[tuple[str, str]], url: str = TS_URL, src: str = "timeseries.csv"
+) -> list[dict]:
     if EMBED:
-        return embed_target(cols)
+        return embed_target(cols, src)
     return [
         {
             "refId": "A",
@@ -137,7 +139,7 @@ def timeseries(title: str, cols: list[tuple[str, str]], h: int, **opts) -> dict:
         "title": title,
         "datasource": DS,
         "gridPos": _pos(h),
-        "targets": ts_target(cols),
+        "targets": ts_target(cols, src=opts.get("src", "timeseries.csv")),
         "fieldConfig": {"defaults": field, "overrides": opts.get("overrides", [])},
         "options": {
             "legend": {"displayMode": "list", "placement": "bottom", "showLegend": True},
@@ -231,10 +233,22 @@ def state_timeline(title: str, h: int) -> dict:
             "defaults": {
                 "custom": {"lineWidth": 0, "fillOpacity": 90},
                 "color": {"mode": "palette-classic"},
+                # Four states, documented by colour. Leader is a distinct state
+                # rather than an overlay because State Timeline has no marker
+                # layer -- it is "training, and holds rank 0".
                 "mappings": [
                     {
                         "type": "value",
-                        "options": {"down": {"color": "#b9bec4", "index": 0, "text": "down"}},
+                        "options": {
+                            "training": {"color": "#1b7f4b", "index": 0, "text": "training"},
+                            "leader": {"color": "#0b5b34", "index": 1, "text": "training (leader)"},
+                            "provisioning": {
+                                "color": "#3b6fd4",
+                                "index": 2,
+                                "text": "provisioning",
+                            },
+                            "down": {"color": "#b9bec4", "index": 3, "text": "down"},
+                        },
                     }
                 ],
             },
@@ -245,7 +259,9 @@ def state_timeline(title: str, h: int) -> dict:
             "showValue": "auto",
             "alignValue": "left",
             "rowHeight": 0.9,
-            "legend": {"displayMode": "list", "placement": "bottom", "showLegend": True},
+            # Legend off: with one entry per instance it became a wall of
+            # swatches restating labels already drawn inside each band.
+            "legend": {"displayMode": "list", "placement": "bottom", "showLegend": False},
             "tooltip": {"mode": "single"},
         },
     }
@@ -291,6 +307,43 @@ def _time_range() -> dict:
         return {"from": "now-6h", "to": "now"}
 
 
+def _annotations() -> list[dict]:
+    """Degraded windows, shaded on EVERY time-series panel.
+
+    Grafana annotations are dashboard-scoped, so one definition shades progress,
+    world size, goodput and cost identically -- which is exactly what the static
+    figures in docs/ do by hand.
+    """
+    base = [
+        {
+            "builtIn": 1,
+            "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+            "enable": True,
+            "hide": True,
+            "name": "Annotations & Alerts",
+            "type": "dashboard",
+        }
+    ]
+    try:
+        regions = json.loads((DATA / "degraded.json").read_text())
+    except Exception:
+        return base
+    csv_rows = "time,timeEnd,text\n" + "".join(
+        f"{r['time']},{r['timeEnd']},degraded\n" for r in regions
+    )
+    base.append(
+        {
+            "datasource": DS_EMBED,
+            "enable": True,
+            "hide": False,
+            "iconColor": "rgba(255, 96, 96, 0.35)",
+            "name": "degraded world",
+            "target": {"scenarioId": "csv_content", "csvContent": csv_rows},
+        }
+    )
+    return base
+
+
 def build() -> dict:
     panels: list[dict] = []
 
@@ -311,7 +364,11 @@ def build() -> dict:
     panels.append(
         timeseries(
             "Durable progress vs. current frontier",
-            [("durable_step", "durable step (survives failure)"), ("current_step", "current step")],
+            [
+                ("durable_step", "durable (checkpointed)"),
+                ("furthest_step", "furthest reached"),
+                ("current_step", "current step"),
+            ],
             10,
             unit_label="training step",
         )
@@ -321,6 +378,7 @@ def build() -> dict:
             "World size",
             [("nodes_training", "nodes training")],
             5,
+            src="world.csv",
             interp="stepAfter",
             fill=15,
             unit_label="nodes",
@@ -414,6 +472,7 @@ def build() -> dict:
             "hidden": False,
         },
         "refresh": "10s",  # live-ready: pass 2 only changes who writes the CSVs
+        "annotations": {"list": _annotations()},
         "schemaVersion": 39,
         "panels": panels,
     }
