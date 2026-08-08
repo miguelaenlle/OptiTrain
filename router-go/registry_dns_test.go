@@ -129,3 +129,31 @@ func TestNewRegistryStillPicksDirForPlainPaths(t *testing.T) {
 		t.Fatalf("want DirRegistry, got %T", reg)
 	}
 }
+
+func TestDNSRegistrySurfacesResolverOutages(t *testing.T) {
+	// The P3.3 regression: cluster DNS was DOWN, which is IsTemporary, not
+	// IsNotFound. Swallowing it made a dead resolver look exactly like an empty
+	// fleet — live_workers=0 with no error anywhere. NXDOMAIN means "no ready
+	// pods"; a timeout means "I could not ask".
+	for _, tc := range []struct {
+		name    string
+		err     error
+		wantErr bool
+	}{
+		{"nxdomain is an empty fleet", &net.DNSError{Err: "no such host", IsNotFound: true}, false},
+		{"resolver timeout is a fault", &net.DNSError{Err: "i/o timeout", IsTimeout: true, IsTemporary: true}, true},
+		{"connection refused is a fault", &net.DNSError{Err: "connection refused", IsTemporary: true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := DNSRegistry{Host: "fleet-worker", Port: "8001",
+				LookupHost: lookupReturning(nil, tc.err)}
+			_, err := r.ListWorkers(context.Background())
+			if tc.wantErr && err == nil {
+				t.Fatal("resolver outage was swallowed — a broken resolver must not look like an empty fleet")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("NXDOMAIN should be an empty fleet, got %v", err)
+			}
+		})
+	}
+}

@@ -52,11 +52,20 @@ func (r DNSRegistry) ListWorkers(ctx context.Context) ([]WorkerDoc, error) {
 	}
 	addrs, err := lookup(ctx, r.Host)
 	if err != nil {
-		// NXDOMAIN is normal, not an error: a headless Service with zero Ready
-		// pods has no records. Report "no workers" and let the router return
-		// 503, rather than logging a failure every poll during a rollout.
+		// ONLY NXDOMAIN counts as "no workers". A headless Service with zero
+		// Ready pods genuinely has no records, so that is a normal rollout
+		// state, not a failure -- reporting it as an error would log on every
+		// poll while a deployment rolls.
+		//
+		// Everything else must surface. This previously also swallowed
+		// IsTemporary, which is the opposite condition: it means the RESOLVER
+		// could not be reached, not that the name is absent. When cluster DNS
+		// went down in P3.3 the router reported live_workers=0 with no error
+		// anywhere, and a dead resolver was indistinguishable from an empty
+		// fleet -- three layers between cause and symptom. Timeouts and
+		// connection failures are infrastructure faults and are now returned.
 		var dnsErr *net.DNSError
-		if errors.As(err, &dnsErr) && (dnsErr.IsNotFound || dnsErr.IsTemporary) {
+		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("resolve %s: %w", r.Host, err)
