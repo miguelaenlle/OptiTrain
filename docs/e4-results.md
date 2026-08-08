@@ -133,6 +133,91 @@ Epoch progression, clean throughout:
 
 - W&B — https://wandb.ai/bot-developer3-Miguel%20Aenlle/spot-train/runs/5kdn29l3
 
+## What six kills actually cost — vs. a clean 4-node run
+
+Everything above is internal to E4: rounds compared against each other. This is
+the external comparison — **what would the same 900 training-seconds have
+produced with nothing dying?**
+
+### The baseline, and why it is interpolated
+
+No clean 4-node run exists at a 900s budget. The nearest is **E1b**
+(`multinode-1786166169`) — 4 nodes, **300s**, and critically the *first* run with
+async checkpointing, so it is the only clean control on the same code E4 ran.
+Identical recipe, verified from both `profile.json`s: `openwebtext`,
+`world_size 4`, `grad_accum_steps 10`, `effective_global_batch 480`.
+
+So E1b is extrapolated 300s → 902s. Extrapolation is done **two independent
+ways**, because a single linear scaling would hide the startup transient:
+
+| method | steps @ 901.7 train-s |
+|---|---|
+| naive — E1b's average rate (0.2691 steps/s) × 902 | 242.7 |
+| modelled — one-time warmup + steady 3.123 s/step + amortised checkpoint cycles | 246.7 |
+
+They agree to **1.6%**, so the baseline is taken as **~245 steps**. The model
+comes from decomposing E1b's 81 `ms_per_step` samples: median 3039 ms, a 4.8s
+one-time warmup on step 1, and checkpoint stalls arriving in **pairs** (steps
+10/13, 39/42, 67/71 — ~14.6s excess every ~28.5 steps). Wall clock scales only
+in its training term; provisioning (196.5s), final saves (74.3s), eval and
+sampling are fixed costs that a longer run amortises.
+
+### The comparison
+
+| metric | clean 4-node (interpolated) | **E4 — 6 kills** | delta |
+|---|---|---|---|
+| steps | ~245 | **195** | **−50 (−20.3%)** |
+| wall clock | 1188.7s | **1667.8s** | **+479.2s (+40.3%)** |
+| cost | $1.358 | **$1.838** | **+$0.480 (+35.4%)** |
+| instances | 4 | 10 | +6 |
+| instance-seconds | 4860 | 6579 | +1719 (+35.4%) |
+| **instance-s / step** | 19.86 | **33.74** | **+69.9%** |
+| **$ / step** | $0.00555 | **$0.00943** | **+69.9%** |
+| goodput (`trained/wall`) | 75.9% | **54.1%** | −21.8 pp |
+| train loss at end | ~5.49 *(est.)* | 5.665 | +0.175 |
+
+`trained_seconds_total` is 901.74 against a 900s budget, so the *training* budget
+was fully honoured — the loss deficit is not lost training time. It is that a
+world-2 step is slower than a world-4 step, so the same 900 seconds buys fewer
+of them.
+
+The loss estimate fits `loss = 9.7069 − 0.7669·ln(step)` on E4's own tail
+(step ≥ 78, max residual 0.065). It predicts **5.6628** at step 195 against an
+actual **5.6648**, so the ~5.49 at step 245 is a modest extrapolation, not a
+guess. E1 established that loss-vs-step superimposes across these configs.
+
+### Normalised per failure
+
+| | wall clock | cost | steps |
+|---|---|---|---|
+| per kill (6) | +79.9s | +$0.080 | −8.3 |
+| per pair-event (3) | +159.7s | +$0.160 | −16.6 |
+
+**This is the number that improved most.** The pre-fix failure-cost A/B measured
+a *single* node loss at **+314.4s and +$0.351**. E4 loses **two nodes at once**
+for **+159.7s and +$0.160** — so per node lost, 314s → 80s, a **3.9× reduction**,
+attributable to E1/E1b (async checkpointing) and E2b (survivors train through the
+replacement's boot instead of idling).
+
+### Reading it honestly
+
+Two true statements, and both belong in any writeup:
+
+- **Per unit of work, fault tolerance is not free: +70% cost per step.** Six
+  destructive events on a 15-minute run is an extreme rate — one every ~2.5
+  minutes, each removing half the fleet — so this is a stress-test upper bound,
+  not a steady-state spot tax. Real spot interruption rates would spread the same
+  fixed recovery cost across far more steps.
+- **The run finished.** 20% fewer steps and 35% more money is the price of
+  *surviving* six kills. The alternative without this machinery is not a cheaper
+  run; it is a dead run and 900 seconds of discarded work, three times over.
+
+The fixed costs are what dominate: 196.5s provisioning and 74.3s of final saves
+are ~23% of a 1189s clean run and would be ~1.3% of a 4-hour one. **Both columns
+improve with run length, and the gap between them narrows** — which is the case
+for measuring this again at the 1h/4h scale before quoting a spot-vs-on-demand
+headline.
+
 ## The risk that did not fire
 
 Three rounds × 2 epochs = 6 epoch publications, against
@@ -167,6 +252,18 @@ it), the counter reset each round, and the floor stayed dormant across six kills
 - reduced-world counts and resume points read from **raw node logs**, not
   `profile.json` (which dedupes by step and drops rolled-back work)
 - driver ran under a `trap reap` guard; fleet terminated, 0 instances billing
+
+## Reproducing the comparison
+
+```bash
+set -a && . ./.env && set +a
+python3 .context/e4/compare_clean.py --fetch    # re-pull the three profiles from S3
+```
+
+Every number in the comparison table above is printed by that script. It asserts
+the recipe match between control and E4 and **exits rather than compare** if they
+differ, prints both extrapolation methods with their spread, and reports the loss
+fit's residual so the projection can be judged rather than trusted.
 
 ## Driver
 
