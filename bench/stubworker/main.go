@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -56,8 +57,27 @@ func completionBody(workerID string) []byte {
 	return b
 }
 
+func envInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envStr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
 func main() {
-	port := flag.Int("port", 9001, "listen port")
+	// Env fallbacks so the same binary works under Kubernetes, which sets
+	// configuration through the environment rather than argv.
+	port := flag.Int("port", envInt("PORT", 9001), "listen port")
+	host := flag.String("host", envStr("STUB_HOST", "0.0.0.0"), "bind address")
 	workerID := flag.String("worker-id", "", "worker id (default stub-<port>)")
 	registry := flag.String("registry", "", "heartbeat directory")
 	flag.Parse()
@@ -66,7 +86,12 @@ func main() {
 	if id == "" {
 		id = fmt.Sprintf("stub-%d", *port)
 	}
-	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	// Bind ALL interfaces, not loopback. Inside a container 127.0.0.1 is
+	// reachable only from the pod itself, so the kubelet's probe and the router
+	// both get "connection refused" while the process looks perfectly healthy
+	// from within. That is what this originally did, and it made the stub
+	// silently unusable in Kubernetes.
+	addr := fmt.Sprintf("%s:%d", *host, *port)
 	body := completionBody(id)
 
 	mux := http.NewServeMux()
