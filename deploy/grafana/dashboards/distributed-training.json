@@ -93,9 +93,17 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/summary.csv",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
      "parser": "backend",
      "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
       {
        "selector": "nodes_lost",
        "text": "Nodes lost",
@@ -154,9 +162,17 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/summary.csv",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
      "parser": "backend",
      "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
       {
        "selector": "replacements",
        "text": "Replacements",
@@ -215,9 +231,17 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/summary.csv",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
      "parser": "backend",
      "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
       {
        "selector": "whole_group_restarts",
        "text": "Whole-group restarts",
@@ -276,11 +300,19 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/summary.csv",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
      "parser": "backend",
      "columns": [
       {
-       "selector": "steps",
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "furthest_step",
        "text": "Steps",
        "type": "number"
       }
@@ -337,9 +369,17 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/summary.csv",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
      "parser": "backend",
      "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
       {
        "selector": "usd",
        "text": "Cost (USD)",

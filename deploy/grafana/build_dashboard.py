@@ -159,36 +159,21 @@ def timeseries(title: str, cols: list[tuple[str, str]], h: int, **opts) -> dict:
 
 
 def stat(title: str, selector: str, h: int, w: int, x: int, **opts) -> dict:
-    if EMBED:
-        meta = json.loads((DATA / "summary.json").read_text())
-        targets = [
-            {
-                "refId": "A",
-                "datasource": DS_EMBED,
-                "scenarioId": "csv_content",
-                "csvContent": f"{title}\n{meta.get(selector, '')}\n",
-            }
-        ]
-    else:
-        targets = [
-            {
-                "refId": "A",
-                "datasource": DS,
-                "type": "csv",
-                "source": "url",
-                "format": "table",
-                "url": SUM_URL,
-                "parser": "backend",
-                "columns": [{"selector": selector, "text": title, "type": opts.get("t", "number")}],
-            }
-        ]
+    """Headline tile: lastNotNull over a column of timeseries.csv.
+
+    Deliberately NOT a separate summary file. A one-row CSV comes back tagged
+    "numeric-long", which Grafana reinterprets as label/value pairs and renders
+    as "No data" even though the backend returns the right number -- adding a
+    time column did not change that. Reusing the series every other panel
+    already renders removes the whole failure mode.
+    """
     return {
         "type": "stat",
         "id": _next_id(),
         "title": title,
         "datasource": DS,
         "gridPos": _pos(h, w, x),
-        "targets": targets,
+        "targets": ts_target([(selector, title)]),
         "fieldConfig": {
             "defaults": {
                 "unit": opts.get("unit", "none"),
@@ -363,7 +348,7 @@ def build() -> dict:
             ("Nodes lost", "nodes_lost", {"color": AMBER}),
             ("Replacements", "replacements", {"color": BLUE}),
             ("Whole-group restarts", "whole_group_restarts", {"color": RED}),
-            ("Steps", "steps", {}),
+            ("Steps", "furthest_step", {}),
             ("Cost (USD)", "usd", {"unit": "currencyUSD", "decimals": 2}),
         ]
     ):

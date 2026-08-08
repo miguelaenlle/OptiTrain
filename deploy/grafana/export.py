@@ -452,9 +452,14 @@ def main() -> int:
     # else on this dashboard -- one row keeps every panel on the proven path.
     with (DATA / "summary.csv").open("w", newline="") as fh:
         wr = csv.writer(fh)
+        # A `time` column matters: without it Infinity tags the frame
+        # "numeric-long", which Grafana tries to reinterpret as label/value pairs
+        # and the stat panel renders "No data" even though the backend returned
+        # the right number. With time present it is an ordinary series and
+        # lastNotNull works, matching every other panel on the dashboard.
         keys = [k for k, v in summary.items() if isinstance(v, int | float)]
-        wr.writerow(keys)
-        wr.writerow([summary[k] for k in keys])
+        wr.writerow(["time", *keys])
+        wr.writerow([t_end_ms, *[summary[k] for k in keys]])
     print(
         f"timeseries.csv {n1} · occupancy.csv {n2} epochs · world.csv {n3} · "
         f"degraded.json {n4} regions"
