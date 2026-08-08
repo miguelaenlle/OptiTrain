@@ -361,7 +361,6 @@ def build() -> dict:
     panels.append(row("Headline"))
     for i, (t, sel, kw) in enumerate(
         [
-            ("Goodput", "goodput", {"unit": "percentunit", "decimals": 1, "color": GREEN}),
             ("Nodes lost", "nodes_lost", {"color": AMBER}),
             ("Replacements", "replacements", {"color": BLUE}),
             ("Whole-group restarts", "whole_group_restarts", {"color": RED}),
@@ -369,7 +368,7 @@ def build() -> dict:
             ("Cost (USD)", "usd", {"unit": "currencyUSD", "decimals": 2}),
         ]
     ):
-        panels.append(stat(t, sel, 4, 4, i * 4, **kw))
+        panels.append(stat(t, sel, 4, 24 // 5 + (1 if i < 24 % 5 else 0), i * 5, **kw))
 
     panels.append(row("1 · The run"))
     panels.append(
@@ -436,17 +435,6 @@ def build() -> dict:
     )
 
     panels.append(row("3 · Efficiency"))
-    panels.append(
-        timeseries(
-            "Goodput — fraction of wall clock spent training",
-            [("goodput", "goodput")],
-            6,
-            fill=10,
-            min=0,
-            max=1,
-            decimals=3,
-        )
-    )
     panels.append(
         timeseries("Step time", [("ms_per_step", "ms per step")], 6, unit_label="ms", min=0)
     )

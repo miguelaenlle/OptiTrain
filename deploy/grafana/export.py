@@ -150,7 +150,7 @@ def write_timeseries(steps, st_ts, st_vals, prof, met, path: Path) -> int:
     # fix for it. A median of 15 rejects them outright while still tracking the
     # real shift when the world shrinks. The raw series is kept alongside it, so
     # the spikes remain visible rather than being hidden.
-    WIN = 15
+    WIN = 31
     ms_all = [r["ms"] for r in steps]
 
     def typical(i: int) -> int:
@@ -252,39 +252,86 @@ def kill_times(prof: dict, log_path: Path) -> dict[str, float]:
 def write_occupancy(
     epochs: list[dict], steps_by_slot: dict, prof: dict, path: Path, target: int
 ) -> int:
-    """State per slot at every epoch boundary: training / provisioning / down.
+    """Per-slot state at every transition: provisioning / training / leader / down.
 
-    A slot in `members` is training. A slot absent from members but whose
-    replacement has been launched is provisioning. Otherwise it is down. The
-    leader is flagged separately so it can be styled without stealing a state.
+    Provisioning is derived from the INSTANCE LEDGER rather than from relaunch
+    marks. When a slot drops out of `members` at t_out and rejoins at t_in, its
+    replacement is the instance whose `started_at` falls in that gap; the slot is
+    therefore DOWN from t_out until that box starts, and PROVISIONING from then
+    until it rejoins the world.
+
+    The previous version asked "did any relaunch happen near this epoch?", which
+    is slot-blind -- it fired only when an epoch boundary happened to coincide
+    with some relaunch, so provisioning rendered as a sliver instead of the
+    ~150-250s boot it actually is.
     """
-    relaunch = sorted(e["t_wall"] for e in prof["events"] if e["event"] == "relaunch")
+    inst = sorted(prof["cost"]["instances"], key=lambda i: i["started_at"])
+    starts = [i["started_at"] for i in inst]
+    used: set[int] = set()
+    # Originals all start before the first epoch; only replacements matter here.
+    run_start = epochs[0]["t"] - 60 if epochs else 0.0
+
+    # base state at each epoch boundary
+    base: list[tuple[float, list[str]]] = []
+    for ep in epochs:
+        vals = []
+        for sl in range(target):
+            if sl in ep["members"]:
+                vals.append("leader" if sl == ep["master"] else "training")
+            else:
+                vals.append("down")
+        base.append((ep["t"], vals))
+
+    # Per-slot provisioning WINDOWS, not point marks. The replacement's start
+    # precedes the shrink epoch, so a point mark applied at that instant lands
+    # while the slot still reads "training" and gets discarded. An interval is
+    # applied whenever the base state says "down", which is the correct overlay.
+    prov: dict[int, list[tuple[float, float]]] = {}
+    for sl in range(target):
+        i = 0
+        while i < len(base):
+            if base[i][1][sl] != "down":
+                i += 1
+                continue
+            t_out = base[i][0]
+            j = i
+            while j < len(base) and base[j][1][sl] == "down":
+                j += 1
+            t_in = base[j][0] if j < len(base) else float("inf")
+            cand = [
+                (k, st_)
+                for k, st_ in enumerate(starts)
+                if t_out - 180 <= st_ < t_in and k not in used and st_ > run_start
+            ]
+            if cand:
+                k, st_ = cand[0]
+                used.add(k)
+                prov.setdefault(sl, []).append((max(st_, t_out), t_in))
+            i = j
+
+    # transition times: epoch boundaries plus each provisioning start
+    times = sorted({t for t, _ in base} | {w[0] for ws in prov.values() for w in ws})
     cols = [f"slot{s}" for s in range(target)]
+    cur = ["down"] * target
+    bi = 0
     rows = 0
     with path.open("w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["time", *cols])
-        for i, ep in enumerate(epochs):
-            t = ep["t"]
-            vals = []
-            for s in range(target):
-                if s in ep["members"]:
-                    tag = "leader" if s == ep["master"] else "training"
-                else:
-                    # provisioning once a replacement has been launched for it
-                    launched = any(t - 1 <= r <= t + 240 for r in relaunch)
-                    tag = "provisioning" if launched else "down"
-                vals.append(tag)
-            w.writerow([int(t * 1000), *vals])
+        for t in times:
+            while bi < len(base) and base[bi][0] <= t:
+                cur = list(base[bi][1])
+                bi += 1
+            out = list(cur)
+            for sl, windows in prov.items():
+                if out[sl] == "down" and any(a_ <= t < b_ for a_, b_ in windows):
+                    out[sl] = "provisioning"
+            w.writerow([int(t * 1000), *out])
             rows += 1
-            # hold the state until the next epoch; State Timeline needs no
-            # intermediate rows, but a trailing row pins the final span
-            if i == len(epochs) - 1:
-                w.writerow([int((t + 1) * 1000), *vals])
     return rows
 
 
-def write_world(epochs: list[dict], path: Path, target: int) -> int:
+def write_world(epochs: list[dict], path: Path, target: int, end_t: float = 0.0) -> int:
     """World size on the EPOCH clock, not the step clock.
 
     Worlds that exist between restarts carry no training steps, so sampling at
@@ -294,9 +341,15 @@ def write_world(epochs: list[dict], path: Path, target: int) -> int:
     with path.open("w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["time", "nodes_training", "below_full_world"])
+        n = target
         for ep in epochs:
             n = len(ep["members"])
             w.writerow([int(ep["t"] * 1000), n, 1 if n < target else 0])
+        # Hold the final world to the end of the run. Epochs stop being published
+        # once membership settles, so without this the line simply ends at the
+        # last epoch -- E5's stopped at 10:18 while the run went to 10:35.
+        if end_t and epochs and end_t > epochs[-1]["t"]:
+            w.writerow([int(end_t * 1000), n, 1 if n < target else 0])
     return len(epochs)
 
 
@@ -347,7 +400,7 @@ def main() -> int:
     epochs = epoch_timeline(SRC / "status_hist.jsonl", SRC / "run.log")
     n1 = write_timeseries(steps, st_ts, st_vals, prof, met, DATA / "timeseries.csv")
     n2 = write_occupancy(epochs, {}, prof, DATA / "occupancy.csv", TARGET_WORLD)
-    n3 = write_world(epochs, DATA / "world.csv", TARGET_WORLD)
+    n3 = write_world(epochs, DATA / "world.csv", TARGET_WORLD, end_t=steps[-1]["t"])
     n4 = write_degraded(epochs, DATA / "degraded.json", TARGET_WORLD)
 
     t_start_ms = int(steps[0]["t"] * 1000)
