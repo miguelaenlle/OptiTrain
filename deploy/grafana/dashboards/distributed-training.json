@@ -10,8 +10,8 @@
  "editable": true,
  "graphTooltip": 1,
  "time": {
-  "from": "2026-08-08T16:43:19.455000Z",
-  "to": "2026-08-08T17:34:59.284000Z"
+  "from": "now-6h",
+  "to": "now"
  },
  "timepicker": {
   "refresh_intervals": [
@@ -37,20 +37,30 @@
     "hide": true,
     "name": "Annotations & Alerts",
     "type": "dashboard"
-   },
+   }
+  ]
+ },
+ "templating": {
+  "list": [
    {
-    "datasource": {
-     "type": "grafana-testdata-datasource",
-     "uid": "testdata-embedded"
+    "name": "run",
+    "label": "Run",
+    "type": "custom",
+    "query": "multinode-preempt-1786207072",
+    "options": [
+     {
+      "text": "multinode-preempt-1786207072",
+      "value": "multinode-preempt-1786207072",
+      "selected": true
+     }
+    ],
+    "current": {
+     "text": "multinode-preempt-1786207072",
+     "value": "multinode-preempt-1786207072",
+     "selected": true
     },
-    "enable": true,
-    "hide": false,
-    "iconColor": "rgba(255, 96, 96, 0.35)",
-    "name": "degraded world",
-    "target": {
-     "scenarioId": "csv_content",
-     "csvContent": "time,timeEnd,text\n1786207718000,1786207942000,degraded\n1786208255000,1786208431000,degraded\n1786208818000,1786208991000,degraded\n1786209310000,1786209464000,degraded\n"
-    }
+    "includeAll": false,
+    "multi": false
    }
   ]
  },
@@ -93,7 +103,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -162,7 +172,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -231,7 +241,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -300,7 +310,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -369,7 +379,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -451,7 +461,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -533,7 +543,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/world.csv",
      "url_options": {
       "method": "GET"
      },
@@ -606,7 +616,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -692,7 +702,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/occupancy.csv",
+     "url": "http://data/${run}/occupancy.csv",
      "parser": "backend",
      "columns": [
       {
@@ -821,7 +831,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/world.csv",
      "url_options": {
       "method": "GET"
      },
@@ -894,7 +904,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -985,7 +995,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -1071,7 +1081,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -1143,7 +1153,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -1229,7 +1239,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -1303,7 +1313,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },
@@ -1389,7 +1399,7 @@
      "type": "csv",
      "source": "url",
      "format": "table",
-     "url": "http://data/timeseries.csv",
+     "url": "http://data/${run}/timeseries.csv",
      "url_options": {
       "method": "GET"
      },

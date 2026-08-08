@@ -35,9 +35,9 @@ EMBED = False
 DS_EMBED = {"type": "grafana-testdata-datasource", "uid": "testdata-embedded"}
 DS_INFINITY = {"type": "yesoreyeram-infinity-datasource", "uid": "rundata"}
 DS = DS_EMBED if EMBED else DS_INFINITY
-TS_URL = "http://data/timeseries.csv"
-OCC_URL = "http://data/occupancy.csv"
-SUM_URL = "http://data/summary.csv"
+TS_URL = "http://data/${run}/timeseries.csv"
+OCC_URL = "http://data/${run}/occupancy.csv"
+SUM_URL = "http://data/${run}/summary.csv"
 
 # Colour-blind-safe pairs, and consistent with the static figures in docs/ so a
 # reader moving between the dashboard and the writeups sees one visual language.
@@ -107,6 +107,7 @@ def ts_target(
 ) -> list[dict]:
     if EMBED:
         return embed_target(cols, src)
+    url = f"http://data/${{run}}/{src}"
     return [
         {
             "refId": "A",
@@ -274,6 +275,43 @@ def row(title: str) -> dict:
 
 def _iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _runs() -> list[str]:
+    """Run ids with exported data, newest first (ids embed a unix timestamp)."""
+    if not DATA.exists():
+        return []
+    return sorted(
+        (d.name for d in DATA.iterdir() if d.is_dir() and (d / "timeseries.csv").exists()),
+        key=lambda n: n.rsplit("-", 1)[-1],
+        reverse=True,
+    )
+
+
+def _run_variable() -> dict:
+    """The run selector.
+
+    Without this every export overwrote one shared data/ directory, so opening
+    the dashboard during a new run showed the PREVIOUS run's numbers -- worse
+    than empty, because stale data looks live. It is also the thing that makes
+    Grafana worth more than a static PNG: switching and comparing runs.
+
+    A CUSTOM variable (baked at build time) rather than a query variable: the
+    list changes only when a run is exported, and it avoids depending on a
+    second datasource query path.
+    """
+    runs = _runs()
+    cur = runs[0] if runs else ""
+    return {
+        "name": "run",
+        "label": "Run",
+        "type": "custom",
+        "query": ",".join(runs),
+        "options": [{"text": r, "value": r, "selected": r == cur} for r in runs],
+        "current": {"text": cur, "value": cur, "selected": True},
+        "includeAll": False,
+        "multi": False,
+    }
 
 
 def _time_range() -> dict:
@@ -471,6 +509,7 @@ def build() -> dict:
         },
         "refresh": "10s",  # live-ready: pass 2 only changes who writes the CSVs
         "annotations": {"list": _annotations()},
+        "templating": {"list": [_run_variable()]},
         "schemaVersion": 39,
         "panels": panels,
     }

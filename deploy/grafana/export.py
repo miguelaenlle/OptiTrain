@@ -29,6 +29,18 @@ HERE = Path(__file__).parent
 SRC = HERE / ".live" if "--live" in sys.argv else HERE.parent.parent / ".context" / "e5"
 DATA = HERE / "data"
 
+
+def run_dir(run_id: str) -> Path:
+    """Per-run output directory.
+
+    A single shared data/ directory means the last export wins, so opening the
+    dashboard during a new run shows the PREVIOUS run's numbers -- which is
+    worse than showing nothing, because it looks like live data. Namespacing by
+    run_id fixes that and gives run switching at the same time.
+    """
+    return DATA / run_id
+
+
 STEP_RE = re.compile(
     r"step (\d+): loss ([0-9.]+), (\d+)ms/step, (\d+) tok/s, ws (\d+), t ([0-9.]+)"
 )
@@ -401,7 +413,8 @@ def write_degraded(epochs: list[dict], path: Path, target: int) -> int:
 
 def main() -> int:
     run_id = sys.argv[1] if len(sys.argv) > 1 else "multinode-preempt-1786207072"
-    DATA.mkdir(parents=True, exist_ok=True)
+    OUT_DIR = run_dir(run_id)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     # Mid-run neither profile.json nor metrics.json exists yet; both are written
     # at the end. Everything the live panels need comes from status + logs, so
     # missing files degrade the cost/summary tiles rather than failing the tick.
@@ -422,10 +435,10 @@ def main() -> int:
     st_ts, st_vals = load_status(SRC / "status_hist.jsonl")
 
     epochs = epoch_timeline(SRC / "status_hist.jsonl", SRC / "run.log")
-    n1 = write_timeseries(steps, st_ts, st_vals, prof, met, DATA / "timeseries.csv")
-    n2 = write_occupancy(epochs, {}, prof, DATA / "occupancy.csv", TARGET_WORLD)
-    n3 = write_world(epochs, DATA / "world.csv", TARGET_WORLD, end_t=steps[-1]["t"])
-    n4 = write_degraded(epochs, DATA / "degraded.json", TARGET_WORLD)
+    n1 = write_timeseries(steps, st_ts, st_vals, prof, met, OUT_DIR / "timeseries.csv")
+    n2 = write_occupancy(epochs, {}, prof, OUT_DIR / "occupancy.csv", TARGET_WORLD)
+    n3 = write_world(epochs, OUT_DIR / "world.csv", TARGET_WORLD, end_t=steps[-1]["t"])
+    n4 = write_degraded(epochs, OUT_DIR / "degraded.json", TARGET_WORLD)
 
     t_start_ms = int(steps[0]["t"] * 1000)
     t_end_ms = int(steps[-1]["t"] * 1000)
@@ -446,11 +459,11 @@ def main() -> int:
         "usd": round(sum(i.get("usd") or 0 for i in prof["cost"]["instances"]), 2),
         "wall_hours": round((prof["durations"].get("total_s") or 0) / 3600, 3),
     }
-    (DATA / "summary.json").write_text(json.dumps(summary, indent=1))
+    (OUT_DIR / "summary.json").write_text(json.dumps(summary, indent=1))
     # Stat tiles read this, not summary.json. Infinity's JSON parser returned no
     # usable frame for scalar selectors while its CSV parser works everywhere
     # else on this dashboard -- one row keeps every panel on the proven path.
-    with (DATA / "summary.csv").open("w", newline="") as fh:
+    with (OUT_DIR / "summary.csv").open("w", newline="") as fh:
         wr = csv.writer(fh)
         # A `time` column matters: without it Infinity tags the frame
         # "numeric-long", which Grafana tries to reinterpret as label/value pairs
@@ -460,8 +473,11 @@ def main() -> int:
         keys = [k for k, v in summary.items() if isinstance(v, int | float)]
         wr.writerow(["time", *keys])
         wr.writerow([t_end_ms, *[summary[k] for k in keys]])
+    index = sorted(d.name for d in DATA.iterdir() if d.is_dir())
+    (DATA / "runs.csv").write_text("run\n" + "\n".join(index) + "\n")
+
     print(
-        f"timeseries.csv {n1} · occupancy.csv {n2} epochs · world.csv {n3} · "
+        f"[{run_id}] timeseries.csv {n1} · occupancy.csv {n2} epochs · world.csv {n3} · "
         f"degraded.json {n4} regions"
     )
     print(json.dumps(summary))
