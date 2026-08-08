@@ -80,3 +80,42 @@ Closed. E2b widened the degraded window from 24s to 173s, which the normal 30s
 checkpoint interval crosses several times, so reduced-world work banks on its
 own: the regrow resumed from step 68 rather than the pre-kill step 39. Re-open
 only if a future degraded window is shorter than the checkpoint interval.
+
+---
+
+## Checkpointing is saturated — the 30s interval never binds
+
+Not a bug; recorded because two documented claims are wrong about it.
+
+Rank 0 re-fires save+verify+smoke on the **first step after the previous one
+completes**. Evidence from E4's node0-r1 log — every `[verify] ... passed` is
+followed by the next checkpoint stall within two log lines, three times in a row:
+
+```
+line 356  [verify] checkpoint at step 104 passed
+line 358  step 120: 17282ms/step        <- next checkpoint, immediately
+line 516  [verify] checkpoint at step 128 passed
+line 518  step 158: 14021ms/step
+line 546  [verify] checkpoint at step 157 passed
+line 548  step 186: 12390ms/step
+```
+
+`last_ckpt` only advances on a **successful** submit, so while a save is in
+flight the interval condition stays true and it retries every step. Effective
+cadence is `max(30s, save+verify+smoke)` = **~104s measured** (median gap between
+stalls). 8 checkpoints completed in 1300s, not the ~43 a strict 30s period implies.
+
+Consequences:
+
+1. **`CHECKPOINT_INTERVAL_SECONDS` is inoperative below ~104s.** Lowering it to
+   10s changes nothing; raising it to 60s changes nothing. Only a value *above*
+   the save duration creates an idle gap.
+2. **CLAUDE.md's invariant is wrong.** It says "lost-work-per-interruption should
+   never exceed the checkpoint interval". The real bound is the effective cadence
+   (~104s), ~3.5x the configured 30s. E4's observed rollbacks were 8 and 6 steps
+   (~24s, ~18s), but that is phase luck between fixed kill times and the
+   checkpoint cycle — expected rollback under this cadence is ~52s.
+
+Behaviour is acceptable as-is. If it ever needs reducing, the levers are
+`SMOKE_TEST_EVERY > 1` or moving verify off the completion path — not the
+interval.
