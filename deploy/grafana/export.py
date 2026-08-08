@@ -156,18 +156,31 @@ def node_spans(logs: Path, step_time: dict[int, float]) -> list[dict]:
     return out
 
 
-def write_timeseries(steps, st_ts, st_vals, prof, met, path: Path) -> int:
+def write_timeseries(steps, st_ts, st_vals, prof, met, path: Path, log_counts=None) -> int:
     inst = prof["cost"]["instances"]
     kills = sorted(e["t_wall"] for e in prof["events"] if e["event"] == "kill")
     rel = sorted(e["t_wall"] for e in prof["events"] if e["event"] == "relaunch")
+    # profile.json does not exist until the run ENDS, so mid-run every one of
+    # these is empty and the fleet/cost panels read zero while the run is
+    # visibly losing nodes. Fall back to the supervisor log, which is live.
+    if not kills and log_counts:
+        kills = log_counts.get("kills", [])
+    if not rel and log_counts:
+        rel = log_counts.get("relaunches", [])
     t0 = steps[0]["t"]
 
     def cost_at(t: float) -> float:
-        return sum(
-            i["hourly_usd"] * max(0.0, min(t, i["stopped_at"]) - i["started_at"]) / 3600
-            for i in inst
-            if t > i["started_at"]
-        )
+        if inst:
+            return sum(
+                i["hourly_usd"] * max(0.0, min(t, i["stopped_at"]) - i["started_at"]) / 3600
+                for i in inst
+                if t > i["started_at"]
+            )
+        # Live estimate: no instance ledger until the run ends. N nodes billed
+        # from the first step is an underestimate (it ignores boot), but a cost
+        # panel reading 0.00 through a run that is spending money is worse.
+        rate = float(__import__("os").environ.get("HOURLY_USD") or 1.006)
+        return TARGET_WORLD * rate * max(0.0, t - steps[0]["t"]) / 3600
 
     # Rolling MEDIAN, not mean: checkpoint steps run ~10x the steady step, and a
     # mean would drag the line toward them -- which is the spike problem, not a
@@ -220,6 +233,28 @@ def write_timeseries(steps, st_ts, st_vals, prof, met, path: Path) -> int:
                 ]
             )
     return len(steps)
+
+
+def log_events(epochs: list[dict], target: int) -> dict:
+    """Kill/relaunch timestamps inferred from the EPOCH timeline.
+
+    Used only when profile.json is absent (i.e. the run is still going). A slot
+    leaving `members` is a loss; the epoch at which it happens is the timestamp.
+    Coarser than the profile's own marks -- epoch-poll resolution rather than the
+    exact API call -- but it makes the fleet counters move during a run instead
+    of sitting at zero.
+    """
+    kills, rel = [], []
+    prev: set[int] = set()
+    for i, ep in enumerate(epochs):
+        cur = set(ep["members"])
+        if i:
+            for _ in prev - cur:
+                kills.append(ep["t"])
+            for _ in cur - prev:
+                rel.append(ep["t"])
+        prev = cur
+    return {"kills": sorted(kills), "relaunches": sorted(rel)}
 
 
 def epoch_timeline(status_path: Path, log_path: Path) -> list[dict]:
@@ -454,7 +489,15 @@ def main() -> int:
     st_ts, st_vals = load_status(SRC / "status_hist.jsonl")
 
     epochs = epoch_timeline(SRC / "status_hist.jsonl", SRC / "run.log")
-    n1 = write_timeseries(steps, st_ts, st_vals, prof, met, OUT_DIR / "timeseries.csv")
+    n1 = write_timeseries(
+        steps,
+        st_ts,
+        st_vals,
+        prof,
+        met,
+        OUT_DIR / "timeseries.csv",
+        log_counts=log_events(epochs, TARGET_WORLD),
+    )
     n2 = write_occupancy(epochs, {}, prof, OUT_DIR / "occupancy.csv", TARGET_WORLD)
     n3 = write_world(epochs, OUT_DIR / "world.csv", TARGET_WORLD, end_t=steps[-1]["t"])
     n4 = write_degraded(epochs, OUT_DIR / "degraded.json", TARGET_WORLD)

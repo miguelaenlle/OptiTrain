@@ -194,6 +194,25 @@ def stat(title: str, selector: str, h: int, w: int, x: int, **opts) -> dict:
     }
 
 
+def _slot_columns() -> list[str]:
+    """Slot columns actually present in the current run's occupancy.csv.
+
+    Hardcoding range(8) meant a 2-node run had six nonexistent columns
+    requested, and the State Timeline rendered NOTHING at all -- not a partial
+    chart, a blank panel. Read the header instead so the Gantt follows the run.
+    """
+    runs = _runs()
+    for r in runs:
+        f = DATA / r / "occupancy.csv"
+        if f.exists():
+            head = f.read_text().splitlines()[:1]
+            if head:
+                cols = [c for c in head[0].split(",") if c.startswith("slot")]
+                if cols:
+                    return cols
+    return [f"slot{i}" for i in range(8)]
+
+
 def state_timeline(title: str, h: int) -> dict:
     """The Gantt. Grafana's State Timeline is exactly this chart, natively:
     it holds each series' value until it changes, so transitions alone suffice
@@ -204,7 +223,7 @@ def state_timeline(title: str, h: int) -> dict:
         "title": title,
         "datasource": DS,
         "gridPos": _pos(h),
-        "targets": embed_target([(f"slot{i}", f"slot{i}") for i in range(8)], "occupancy.csv")
+        "targets": embed_target([(c, c) for c in _slot_columns()], "occupancy.csv")
         if EMBED
         else [
             {
@@ -217,10 +236,7 @@ def state_timeline(title: str, h: int) -> dict:
                 "parser": "backend",
                 "columns": [
                     {"selector": "time", "text": "time", "type": "timestamp_epoch"},
-                    *[
-                        {"selector": f"slot{i}", "text": f"slot{i}", "type": "string"}
-                        for i in range(8)
-                    ],
+                    *[{"selector": c, "text": c, "type": "string"} for c in _slot_columns()],
                 ],
             }
         ],
@@ -331,12 +347,17 @@ def _time_range() -> dict:
     "Invalid date" and every panel as "No data" while the datasource works
     perfectly. That cost a full debug cycle; hence this note.
     """
-    summary = Path(__file__).parent / "data" / "summary.json"
+    # Per-run now; the flat path stopped existing when exports were namespaced,
+    # which silently dropped the window back to a rolling now-6h.
+    runs = _runs()
+    summary = (DATA / runs[0] / "summary.json") if runs else DATA / "summary.json"
     try:
         meta = json.loads(summary.read_text())
         start = int(meta["run_start_ms"])
         pad = 30_000
         if meta.get("active"):
+            # A live run must show its whole history, not a rolling tail: the
+            # default landed on a few recent minutes and hid everything before it.
             return {"from": _iso(start - pad), "to": "now"}
         return {"from": _iso(start - pad), "to": _iso(int(meta["run_end_ms"]) + pad)}
     except Exception:

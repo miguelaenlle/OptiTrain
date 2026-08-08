@@ -10,7 +10,7 @@
  "editable": true,
  "graphTooltip": 1,
  "time": {
-  "from": "now-6h",
+  "from": "2026-08-08T22:25:13.643000Z",
   "to": "now"
  },
  "timepicker": {
@@ -723,36 +723,6 @@
       {
        "selector": "slot1",
        "text": "slot1",
-       "type": "string"
-      },
-      {
-       "selector": "slot2",
-       "text": "slot2",
-       "type": "string"
-      },
-      {
-       "selector": "slot3",
-       "text": "slot3",
-       "type": "string"
-      },
-      {
-       "selector": "slot4",
-       "text": "slot4",
-       "type": "string"
-      },
-      {
-       "selector": "slot5",
-       "text": "slot5",
-       "type": "string"
-      },
-      {
-       "selector": "slot6",
-       "text": "slot6",
-       "type": "string"
-      },
-      {
-       "selector": "slot7",
-       "text": "slot7",
        "type": "string"
       }
      ]

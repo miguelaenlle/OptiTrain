@@ -110,10 +110,23 @@ to the driver's log, which never reaches S3. Without `--log=` the world-size and
 Gantt panels render **empty while every other panel works** — a partial failure
 that is easy to miss. `run_with_dashboard.sh` passes it automatically.
 
-**7. Panels below the fold do not render in a `fullPage` screenshot.** Grafana
+**7. The Gantt's slot columns are baked at BUILD time from the newest run's
+`occupancy.csv`.** They used to be hardcoded `range(8)`, so a 2-node run
+requested six nonexistent columns and the State Timeline rendered *nothing* — a
+blank panel, not a partial one. It now reads the header, but switching to a run
+with a DIFFERENT node count still needs `build_dashboard.py` re-run. Making the
+columns follow `$run` at query time is the proper fix.
+
+**8. profile.json does not exist until the run ENDS.** Everything sourced from
+it — kills, relaunches, the instance cost ledger — reads zero mid-run while the
+fleet is visibly losing nodes. There are now fallbacks (fleet counts from the
+epoch timeline, cost from `nodes x elapsed x rate`), but any NEW panel sourced
+from `profile.*` will silently be blank live unless it gets one too.
+
+**9. Panels below the fold do not render in a `fullPage` screenshot.** Grafana
 lazy-renders. Use `?viewPanel=<id>` per panel, or the image-renderer service.
 
-**8. `multinode-preempt` requires NODES ≥ 2.** The guard is not hit by
+**10. `multinode-preempt` requires NODES ≥ 2.** The guard is not hit by
 `--dry-run`, which skips supervision — a 1-node run fails only after launch.
 
 ## Open items
