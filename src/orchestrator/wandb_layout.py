@@ -35,8 +35,6 @@ def _sections():
     """
     import wandb_workspaces.reports.v2 as wr
 
-    p, f, h, perf, cost = D.PROGRESS, D.FLEET, D.HEALTH, D.PERF, D.COST
-
     return [
         (
             "1 · The run",
@@ -50,26 +48,26 @@ def _sections():
                 wr.LinePlot(
                     title="Durable progress vs. current frontier",
                     x="t_rel",
-                    y=[f"{p}/ckpt_step", f"{p}/step"],
+                    y=[D.K_DURABLE, D.K_CURRENT],
                     title_x="wall clock (s)",
                     title_y="training step",
-                    layout=wr.Layout(w=24, h=8),
+                    layout=wr.Layout(w=24, h=10),
                 ),
                 wr.LinePlot(
                     title="World size",
                     x="t_rel",
-                    y=[f"{f}/world_size"],
+                    y=[D.K_WORLD],
                     title_x="wall clock (s)",
                     title_y="nodes training",
-                    layout=wr.Layout(w=24, h=6),
+                    layout=wr.Layout(w=24, h=5),
                 ),
                 wr.LinePlot(
                     title="Work at risk — steps since the last durable checkpoint",
                     x="t_rel",
-                    y=[f"{p}/at_risk_steps"],
+                    y=[D.K_AT_RISK],
                     title_x="wall clock (s)",
                     title_y="steps",
-                    layout=wr.Layout(w=24, h=6),
+                    layout=wr.Layout(w=24, h=5),
                 ),
             ],
         ),
@@ -85,13 +83,13 @@ def _sections():
             "replacement for every node lost.",
             [
                 wr.MediaBrowser(
-                    media_keys=[f"{f}/gantt"],
-                    layout=wr.Layout(w=24, h=10),
+                    media_keys=[D.K_GANTT],
+                    layout=wr.Layout(w=24, h=16),
                 ),
                 wr.LinePlot(
                     title="Nodes lost and replacements launched (cumulative)",
                     x="t_rel",
-                    y=[f"{f}/nodes_lost", f"{f}/replacements"],
+                    y=[D.K_LOST, D.K_REPL],
                     title_x="wall clock (s)",
                     title_y="count",
                     layout=wr.Layout(w=24, h=7),
@@ -111,7 +109,7 @@ def _sections():
                 wr.LinePlot(
                     title="Goodput",
                     x="t_rel",
-                    y=[f"{h}/goodput"],
+                    y=[D.K_GOODPUT],
                     title_x="wall clock (s)",
                     title_y="trained seconds / wall seconds",
                     range_y=(0.0, 1.0),
@@ -120,7 +118,7 @@ def _sections():
                 wr.LinePlot(
                     title="Step time (checkpoint spikes clipped)",
                     x="train_step",
-                    y=[f"{perf}/ms_per_step"],
+                    y=[D.K_MS],
                     title_x="training step",
                     title_y="ms / step",
                     ignore_outliers=True,
@@ -139,7 +137,7 @@ def _sections():
                 wr.LinePlot(
                     title="Training loss",
                     x="train_step",
-                    y=[f"{p}/loss"],
+                    y=[D.K_LOSS],
                     title_x="training step",
                     title_y="cross-entropy loss",
                     smoothing_factor=0,
@@ -148,7 +146,7 @@ def _sections():
                 wr.LinePlot(
                     title="Tokens processed",
                     x="t_rel",
-                    y=[f"{p}/tokens_billions"],
+                    y=[D.K_TOKENS],
                     title_x="wall clock (s)",
                     title_y="tokens (billions)",
                     layout=wr.Layout(w=12, h=7),
@@ -166,7 +164,7 @@ def _sections():
                 wr.LinePlot(
                     title="Cumulative spend",
                     x="t_rel",
-                    y=[f"{cost}/usd"],
+                    y=[D.K_USD],
                     title_x="wall clock (s)",
                     title_y="USD",
                     layout=wr.Layout(w=12, h=7),
@@ -174,7 +172,7 @@ def _sections():
                 wr.LinePlot(
                     title="Unit cost",
                     x="t_rel",
-                    y=[f"{cost}/usd_per_1k_steps"],
+                    y=[D.K_USD_1K],
                     title_x="wall clock (s)",
                     title_y="USD per 1000 steps",
                     layout=wr.Layout(w=12, h=7),
@@ -191,7 +189,7 @@ def _sections():
                 wr.LinePlot(
                     title="Whole-group restarts (expected: flat at zero)",
                     x="t_rel",
-                    y=[f"{h}/whole_group_restarts"],
+                    y=[D.K_WGR],
                     title_x="wall clock (s)",
                     title_y="restarts",
                     layout=wr.Layout(w=12, h=6),
@@ -199,7 +197,7 @@ def _sections():
                 wr.LinePlot(
                     title="Degraded intervals",
                     x="t_rel",
-                    y=[f"{f}/degraded"],
+                    y=[D.K_DEGRADED],
                     title_x="wall clock (s)",
                     title_y="1 = below target world",
                     layout=wr.Layout(w=12, h=6),
@@ -211,18 +209,14 @@ def _sections():
 
 def apply(entity: str, project: str = "spot-train", name: str = "Distributed training") -> str:
     """Create/overwrite the saved workspace view. Returns its URL."""
-    import wandb_workspaces.reports.v2 as wr
     import wandb_workspaces.workspaces as ws
 
     sections = []
-    for title, caption, panels in _sections():
-        sections.append(
-            ws.Section(
-                name=title,
-                panels=[wr.MarkdownPanel(markdown=caption, layout=wr.Layout(w=24, h=3))] + panels,
-                is_open=True,
-            )
-        )
+    for title, _caption, panels in _sections():
+        # No caption panels. Each consumed a full-width row and read as filler;
+        # panel titles and axis labels carry the meaning instead, and the
+        # reasoning lives in this module's docstrings and docs/e5-results.md.
+        sections.append(ws.Section(name=title, panels=panels, is_open=True))
     view = ws.Workspace(entity=entity, project=project, name=name, sections=sections)
     view.save()
     return view.url

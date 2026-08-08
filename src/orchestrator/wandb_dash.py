@@ -51,6 +51,28 @@ COST = "5_cost"
 
 SLOT_COLUMNS = ["slot", "instance", "state", "t_start", "t_end", "generation"]
 
+# Metric leaf names are the LEGEND TEXT. W&B renders a series as
+# "<run name> <full metric key>", so an abbreviation like `ckpt_step` reaches the
+# reader as "multinode-preempt-1786207072-dash 1_progress/ckpt_step" and explains
+# nothing. Spelling the leaf out is the only lever that reliably improves the
+# legend without depending on template placeholders we cannot preview.
+K_DURABLE = f"{PROGRESS}/durable step (survives failure)"
+K_CURRENT = f"{PROGRESS}/current step"
+K_AT_RISK = f"{PROGRESS}/steps at risk"
+K_LOSS = f"{PROGRESS}/train loss"
+K_VAL = f"{PROGRESS}/val loss"
+K_TOKENS = f"{PROGRESS}/tokens (billions)"
+K_WORLD = f"{FLEET}/nodes training"
+K_DEGRADED = f"{FLEET}/below full world"
+K_LOST = f"{FLEET}/nodes lost (cumulative)"
+K_REPL = f"{FLEET}/replacements launched (cumulative)"
+K_GOODPUT = f"{HEALTH}/goodput"
+K_WGR = f"{HEALTH}/whole-group restarts"
+K_MS = f"{PERF}/ms per step"
+K_USD = f"{COST}/spend (USD)"
+K_USD_1K = f"{COST}/USD per 1k steps"
+K_GANTT = f"{FLEET}/gantt"
+
 
 @dataclass
 class RunState:
@@ -94,44 +116,44 @@ def tick_payload(s: RunState) -> dict:
     out: dict[str, float] = {
         "train_step": s.step,
         "t_rel": s.t_rel,
-        f"{PROGRESS}/step": s.step,
+        K_CURRENT: s.step,
     }
     if s.ckpt_step >= 0:
-        out[f"{PROGRESS}/ckpt_step"] = s.ckpt_step
+        out[K_DURABLE] = s.ckpt_step
         # How far ahead of durable progress we are running: this is exactly what
         # a failure would discard right now. Reads as a sawtooth, and each tooth
         # is the rollback that a kill at that instant would have cost.
-        out[f"{PROGRESS}/at_risk_steps"] = max(0, s.step - s.ckpt_step)
+        out[K_AT_RISK] = max(0, s.step - s.ckpt_step)
     if s.loss is not None:
-        out[f"{PROGRESS}/loss"] = s.loss
+        out[K_LOSS] = s.loss
     if s.tokens is not None:
-        out[f"{PROGRESS}/tokens_billions"] = round(s.tokens / 1e9, 6)
+        out[K_TOKENS] = round(s.tokens / 1e9, 6)
 
     if s.world_size is not None:
-        out[f"{FLEET}/world_size"] = s.world_size
+        out[K_WORLD] = s.world_size
         if s.target_world:
-            out[f"{FLEET}/degraded"] = 1 if s.world_size < s.target_world else 0
-    out[f"{FLEET}/nodes_lost"] = s.nodes_lost
-    out[f"{FLEET}/replacements"] = s.replacements
+            out[K_DEGRADED] = 1 if s.world_size < s.target_world else 0
+    out[K_LOST] = s.nodes_lost
+    out[K_REPL] = s.replacements
 
     # Goodput is the headline: fraction of wall clock actually spent training.
     # trained_seconds is checkpoint-carried, so downtime can never inflate it.
     if s.t_rel > 0 and s.trained_seconds:
-        out[f"{HEALTH}/goodput"] = round(s.trained_seconds / s.t_rel, 4)
-    out[f"{HEALTH}/whole_group_restarts"] = s.whole_group_restarts
+        out[K_GOODPUT] = round(s.trained_seconds / s.t_rel, 4)
+    out[K_WGR] = s.whole_group_restarts
 
     if s.ms_per_step:
-        out[f"{PERF}/ms_per_step"] = s.ms_per_step
+        out[K_MS] = s.ms_per_step
 
     if s.usd is not None:
-        out[f"{COST}/usd"] = round(s.usd, 4)
+        out[K_USD] = round(s.usd, 4)
         if s.step > 0:
-            out[f"{COST}/usd_per_1k_steps"] = round(s.usd / s.step * 1000, 4)
+            out[K_USD_1K] = round(s.usd / s.step * 1000, 4)
     return out
 
 
 def val_payload(step: int, val_loss: float) -> dict:
-    return {"train_step": step, f"{PROGRESS}/val_loss": val_loss}
+    return {"train_step": step, K_VAL: val_loss}
 
 
 def slot_rows(occupancy: list[dict]) -> list[list]:
@@ -160,78 +182,120 @@ def slot_rows(occupancy: list[dict]) -> list[list]:
 _STATE_COLORS = {
     # Chosen for lightness separation, not hue alone, so the three states stay
     # distinguishable under deuteranopia/protanopia and in greyscale print.
-    "train": ("#1b7f4b", "training"),
     "prov": ("#3b6fd4", "provisioning"),
+    "train": ("#1b7f4b", "training"),
     "down": ("#b9bec4", "down / replaced"),
 }
 
 
-def gantt_html(occupancy: list[dict], target_world: int, now_s: float) -> str:
-    """A scrollable SVG Gantt of slot occupancy, as a self-contained HTML string.
+def gantt_html(
+    occupancy: list[dict],
+    target_world: int,
+    now_s: float,
+    events: list[dict] | None = None,
+) -> str:
+    """A scrollable SVG Gantt, as a self-contained HTML string.
 
-    Horizontal scroll rather than time-compression is deliberate: squeezing 36h
-    into one viewport makes a 250s recovery ~3px wide and effectively deletes it.
-    Here the pixels-per-second rate is FIXED, the canvas grows with the run, and
-    the container scrolls -- so a recovery is the same size at hour 1 and hour 35
-    and no interval is ever aggregated away.
+    ONE ROW PER INSTANCE (node0, node0-r1, ...), matching the matplotlib figure
+    in the writeups: an operator debugging a recovery needs to know *which box*
+    took over a slot, and collapsing to slots throws that away.
 
-    Rows are SLOTS (always ``target_world`` of them), not instances, so the chart
-    height is constant no matter how many replacements a run burns through.
+    Scale is handled by SCROLLING, not by compressing. Pixels-per-second is
+    fixed, so a 250s recovery is the same width at hour 1 and hour 35, and the
+    canvas simply grows; the container scrolls in BOTH axes, so a 36h run with
+    forty instances loses no interval and no row. Compressing 36h into one
+    viewport would make each recovery ~3px and effectively delete it.
     """
-    px_per_s = 0.05  # 36h -> ~6500px of scrollable canvas
-    row_h, pad, label_w = 26, 8, 78
-    width = max(600, int(now_s * px_per_s) + label_w + 40)
-    height = target_world * row_h + 2 * pad + 26
-
-    by_slot: dict[int, list[dict]] = {}
-    for o in occupancy:
-        by_slot.setdefault(int(o["slot"]), []).append(o)
+    px_per_s = 0.06
+    row_h, pad, label_w, axis_h = 22, 10, 96, 22
+    rows = sorted(occupancy, key=lambda o: (int(o["slot"]), int(o.get("generation", 0))))
+    n = max(1, len(rows))
+    width = max(760, int(now_s * px_per_s) + label_w + 60)
+    height = n * row_h + 2 * pad + axis_h
 
     parts = [
         f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg" '
         f'font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">'
     ]
-    for i in range(target_world):
-        y = pad + i * row_h
-        parts.append(
-            f'<text x="4" y="{y + 16}" fill="#3c4043">slot{i}</text>'
-            f'<rect x="{label_w}" y="{y + 4}" width="{width - label_w - 8}" '
-            f'height="{row_h - 8}" fill="#f1f3f4" rx="3"/>'
-        )
-        for seg in sorted(by_slot.get(i, []), key=lambda s: s["t_start"]):
-            x0 = label_w + seg["t_start"] * px_per_s
-            w = max(2.0, (seg["t_end"] - seg["t_start"]) * px_per_s)
-            color, _ = _STATE_COLORS.get(seg.get("state", "train"), _STATE_COLORS["train"])
-            parts.append(
-                f'<rect x="{x0:.1f}" y="{y + 4}" width="{w:.1f}" height="{row_h - 8}" '
-                f'fill="{color}" rx="2"><title>{seg.get("instance", "")} · '
-                f"{seg.get('state', 'train')} · "
-                f"{seg['t_start']:.0f}-{seg['t_end']:.0f}s"
-                f"</title></rect>"
-            )
-    # hour gridlines + legend
-    base_y = target_world * row_h + pad
-    for hour in range(1, int(now_s // 3600) + 1):
-        x = label_w + hour * 3600 * px_per_s
+    base_y = n * row_h + pad
+
+    # time gridlines first so bars draw over them
+    span = max(now_s, 1.0)
+    tick = 3600 if span > 7200 else (600 if span > 1200 else 120)
+    t = tick
+    while t <= span:
+        x = label_w + t * px_per_s
+        lbl = f"{t / 3600:g}h" if tick == 3600 else f"{t / 60:g}m"
         parts.append(
             f'<line x1="{x:.1f}" y1="{pad}" x2="{x:.1f}" y2="{base_y}" '
-            f'stroke="#c8ccd0" stroke-dasharray="2,3"/>'
-            f'<text x="{x + 3:.1f}" y="{base_y + 14}" fill="#5f6368">{hour}h</text>'
+            f'stroke="#dadce0" stroke-dasharray="2,3"/>'
+            f'<text x="{x + 3:.1f}" y="{base_y + 15}" fill="#5f6368">{lbl}</text>'
         )
+        t += tick
+
+    for i, seg in enumerate(rows):
+        y = pad + i * row_h
+        gen = int(seg.get("generation", 0))
+        name = seg.get("instance") or f"node{seg['slot']}"
+        parts.append(
+            f'<text x="4" y="{y + 14}" fill="#3c4043">{name}</text>'
+            f'<rect x="{label_w}" y="{y + 3}" width="{width - label_w - 12}" '
+            f'height="{row_h - 6}" fill="#f6f7f8" rx="3"/>'
+        )
+        x0 = label_w + seg["t_start"] * px_per_s
+        w = max(2.0, (seg["t_end"] - seg["t_start"]) * px_per_s)
+        color, _ = _STATE_COLORS.get(seg.get("state", "train"), _STATE_COLORS["train"])
+        dur = seg["t_end"] - seg["t_start"]
+        parts.append(
+            f'<rect x="{x0:.1f}" y="{y + 3}" width="{w:.1f}" height="{row_h - 6}" '
+            f'fill="{color}" rx="2"><title>{name} (gen {gen}) · '
+            f"{dur:.0f}s from {seg['t_start']:.0f}s to {seg['t_end']:.0f}s"
+            f"</title></rect>"
+        )
+        if w > 34:
+            parts.append(f'<text x="{x0 + 4:.1f}" y="{y + 14}" fill="#ffffff">{dur:.0f}s</text>')
+
+    # control-plane markers, drawn on top of every row
+    for ev in events or []:
+        x = label_w + float(ev.get("t", 0.0)) * px_per_s
+        kind = ev.get("kind")
+        if kind == "kill":
+            parts.append(
+                f'<line x1="{x:.1f}" y1="{pad}" x2="{x:.1f}" y2="{base_y}" '
+                f'stroke="#d93025" stroke-width="1.5" opacity="0.85">'
+                f"<title>node lost at {ev.get('t', 0):.0f}s</title></line>"
+            )
+        elif kind == "relaunch":
+            parts.append(
+                f'<line x1="{x:.1f}" y1="{pad}" x2="{x:.1f}" y2="{base_y}" '
+                f'stroke="#f9a825" stroke-width="1" stroke-dasharray="3,2" opacity="0.8">'
+                f"<title>replacement launched at {ev.get('t', 0):.0f}s</title></line>"
+            )
     parts.append("</svg>")
-    legend = " ".join(
-        f'<span style="display:inline-flex;align-items:center;margin-right:14px">'
+
+    swatches = "".join(
+        f'<span style="display:inline-flex;align-items:center;margin-right:16px">'
         f'<span style="width:11px;height:11px;background:{c};border-radius:2px;'
-        f'display:inline-block;margin-right:5px"></span>{label}</span>'
+        f'display:inline-block;margin-right:6px"></span>{label}</span>'
         for c, label in _STATE_COLORS.values()
     )
+    swatches += (
+        '<span style="display:inline-flex;align-items:center;margin-right:16px">'
+        '<span style="width:2px;height:12px;background:#d93025;display:inline-block;'
+        'margin-right:6px"></span>node lost</span>'
+        '<span style="display:inline-flex;align-items:center">'
+        '<span style="width:2px;height:12px;background:#f9a825;display:inline-block;'
+        'margin-right:6px"></span>replacement launched</span>'
+    )
     return (
-        '<div style="font:13px ui-sans-serif,system-ui,sans-serif;color:#3c4043">'
-        f'<div style="margin-bottom:6px">{legend}</div>'
-        f'<div style="overflow-x:auto;border:1px solid #e3e6e8;border-radius:6px">'
-        f'{"".join(parts)}</div>'
-        '<div style="margin-top:5px;color:#5f6368">Scroll horizontally — time scale is '
-        "fixed, so a recovery occupies the same width at any point in the run.</div></div>"
+        '<div style="font:12px ui-sans-serif,system-ui,sans-serif;color:#3c4043">'
+        f'<div style="margin:0 0 8px 2px">{swatches}</div>'
+        '<div style="overflow:auto;max-height:560px;border:1px solid #e3e6e8;'
+        f'border-radius:6px;background:#fff">{"".join(parts)}</div>'
+        '<div style="margin-top:6px;color:#5f6368">'
+        f"{n} instances across {target_world} slots · scroll horizontally for time, "
+        "vertically for instances — the time scale is fixed, so a recovery is the "
+        "same width anywhere in the run.</div></div>"
     )
 
 
