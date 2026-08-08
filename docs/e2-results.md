@@ -10,11 +10,11 @@ Control: `multinode-preempt-1786118730` · E2: `multinode-preempt-1786167468`
 
 **E2 (after the fix):**
 
-![E2 timeline](img/e2-timeline.png)
+![E2 timeline](img/e2-recovery-after.png)
 
 **Control (before):**
 
-![control timeline](img/e2-control-timeline.png)
+![control timeline](img/e2-recovery-before.png)
 
 Read the survivor rows (node0–node2). Two diamonds — "realized world change" —
 sit almost on top of each other with a **sliver of green** between them, then a
