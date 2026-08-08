@@ -85,8 +85,13 @@ def loaders(monkeypatch):
     """Replace both loaders with sentinels that record how they were called."""
     calls = {}
 
-    def fake_pretrained(model_type, *, device, dtype):
-        calls["pretrained"] = {"model_type": model_type, "device": device, "dtype": dtype}
+    def fake_pretrained(model_type, *, device, dtype, engine="hf"):
+        calls["pretrained"] = {
+            "model_type": model_type,
+            "device": device,
+            "dtype": dtype,
+            "engine": engine,
+        }
         return "PRETRAINED"
 
     def fake_checkpoint(cfg, *, device, dtype):
@@ -109,6 +114,7 @@ def test_pretrained_env_selects_the_pretrained_loader(monkeypatch, loaders):
         "model_type": "gpt2-xl",
         "device": "cpu",
         "dtype": torch.float16,
+        "engine": "hf",  # KV-cached engine is the default for stock weights
     }
 
 

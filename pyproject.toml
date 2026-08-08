@@ -32,6 +32,10 @@ fleet = [
     # PRETRAINED_MODEL=gpt2-xl only: nanoGPT's from_pretrained pulls OpenAI's
     # weights through transformers. Not needed to serve a trained checkpoint.
     "transformers",
+    # Lets transformers load shard-by-shard (low_cpu_mem_usage), keeping peak
+    # host RAM near the model size instead of 2x it. Optional: backends.py
+    # falls back to a plain load if it is missing.
+    "accelerate",
     # Router /metrics endpoint. The router degrades gracefully without it, so
     # this stays an extra rather than a core dep.
     "prometheus-client",
