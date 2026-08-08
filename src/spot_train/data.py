@@ -47,25 +47,13 @@ class LoaderState:
     epoch: int = 0
 
 
-class PositionedLoader:
-    """Yields (x, y) batches while tracking a restorable position."""
+class _DatasetFetcher:
+    """Pulls the corpus onto this box. Split out of ``PositionedLoader`` so it
+    can also run BEFORE the trainer exists — see :func:`ensure_dataset`."""
 
-    def __init__(
-        self,
-        data_local_dir: str,
-        batch_size: int,
-        block_size: int,
-        device: str,
-        data_uri: str = "",
-    ):
+    def __init__(self, data_local_dir: str, data_uri: str):
         self.data_local_dir = data_local_dir
-        self.batch_size = batch_size
-        self.block_size = block_size
-        self.device = device
         self.data_uri = data_uri
-        self.state = LoaderState()
-        self._ensure_data()
-        self.vocab_size = self._read_vocab_size()
 
     # -- data provisioning -------------------------------------------------- #
     def _ensure_data(self) -> None:
@@ -131,6 +119,51 @@ class PositionedLoader:
             f"waited {timeout:.0f}s for {names} in {self.data_local_dir!r} "
             "(is the downloading rank 0 on this box stalled?)"
         )
+
+
+def ensure_dataset(data_local_dir: str, data_uri: str) -> None:
+    """Make the corpus present locally. Idempotent — returns immediately when
+    the files are already there.
+
+    Called from TWO places, and the second is the point:
+
+      * the trainer, via ``PositionedLoader`` (the historical caller), and
+      * the **sidecar, BEFORE it registers this box as available**.
+
+    Registration used to mean "this instance exists". The box then pulled a
+    17 GB corpus *after* being admitted to the world, so survivors tore down
+    their collective and idled ~150s waiting for a node that was still
+    downloading. Pulling first makes registration mean "I can train". Total
+    work is unchanged — the same download, moved before the announcement.
+
+    The sidecar runs before torchrun (no ``LOCAL_RANK``), so it takes the
+    rank-0 download path; the trainer's later call then early-returns."""
+    _DatasetFetcher(data_local_dir, data_uri)._ensure_data()
+
+
+class PositionedLoader:
+    """Yields (x, y) batches while tracking a restorable position."""
+
+    def __init__(
+        self,
+        data_local_dir: str,
+        batch_size: int,
+        block_size: int,
+        device: str,
+        data_uri: str = "",
+    ):
+        self.data_local_dir = data_local_dir
+        self.batch_size = batch_size
+        self.block_size = block_size
+        self.device = device
+        self.data_uri = data_uri
+        self.state = LoaderState()
+        self._ensure_data()
+        self.vocab_size = self._read_vocab_size()
+
+    # -- data provisioning -------------------------------------------------- #
+    def _ensure_data(self) -> None:
+        _DatasetFetcher(self.data_local_dir, self.data_uri)._ensure_data()
 
     def _read_vocab_size(self) -> int | None:
         meta = os.path.join(self.data_local_dir, "meta.pkl")

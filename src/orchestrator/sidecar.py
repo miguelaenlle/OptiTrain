@@ -324,11 +324,42 @@ def run(
             kill_tree(proc)
 
 
+def prewarm_dataset(node_index: int) -> None:
+    """Pull the corpus BEFORE announcing this box, so registration means
+    "I can train" rather than "this instance exists".
+
+    Measured on a 4-node preemption: the supervisor admitted a replacement the
+    moment it appeared, at t+448s, but that box could not take a step until
+    t+662s because it was still pulling a 17 GB train.bin — the survivors tore
+    down their world-3 collective and idled 214s (3 x 214 = 642 node-seconds)
+    waiting for it. Doing the pull first costs nothing extra: it is the same
+    download, moved ahead of the announcement instead of behind it.
+
+    Best-effort. A failure here must NOT stop the box: the trainer calls the
+    same idempotent function and will retry, and a node that registers slightly
+    early is the behaviour we already had."""
+    data_uri = os.environ.get("DATA_URI", "")
+    data_dir = os.environ.get("DATA_LOCAL_DIR", "")
+    if not data_uri or not data_dir:
+        return
+    started = time.monotonic()
+    try:
+        from spot_train.data import ensure_dataset
+
+        ensure_dataset(data_dir, data_uri)
+        _log(
+            f"node {node_index}: dataset ready in {time.monotonic() - started:.1f}s (pre-register)"
+        )
+    except Exception as exc:  # noqa: BLE001 — the trainer retries; never block boot
+        _log(f"node {node_index}: dataset prewarm failed ({exc}) — trainer will retry")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="orchestrator.sidecar")
     ap.add_argument("--run-uri", required=True, help="s3://bucket/runs/<run_id> (or a local dir)")
     ap.add_argument("--node-index", type=int, required=True)
     args = ap.parse_args()
+    prewarm_dataset(args.node_index)
     register(args.run_uri, args.node_index)
     sys.exit(run(args.run_uri, args.node_index))
 

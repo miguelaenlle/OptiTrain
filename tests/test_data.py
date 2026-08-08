@@ -70,8 +70,11 @@ def test_nonzero_local_rank_waits_instead_of_downloading(tmp_path, monkeypatch):
     # Files absent and rank 0 never delivers: bounded wait, then a clear error.
     for name in data_mod._FILES:
         os.unlink(os.path.join(loader.data_local_dir, name))
+    # The wait now lives on _DatasetFetcher (shared with the sidecar's
+    # pre-registration pull); the behaviour it guards is unchanged.
+    fetcher = data_mod._DatasetFetcher(loader.data_local_dir, loader.data_uri)
     with pytest.raises(TimeoutError, match="rank 0"):
-        loader._wait_for_files(list(data_mod._FILES), timeout=0.1)
+        fetcher._wait_for_files(list(data_mod._FILES), timeout=0.1)
 
 
 def test_single_process_still_downloads_without_local_rank(tmp_path, monkeypatch):

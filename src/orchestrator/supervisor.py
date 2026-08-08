@@ -589,6 +589,15 @@ class Supervisor:
         self.st.marks.discard("full_world")
         aws.terminate(iid)
         self._terminated_iids.add(iid)
+        # Forget the box's identity IMMEDIATELY. `_healthy` requires a
+        # registration, and st.ips is keyed by node INDEX, so a slot kept its
+        # dead occupant's IP after the kill. Combined with EC2 briefly still
+        # reporting `running` and a log only ~26s old (under the 90s heartbeat
+        # timeout), a node we had just terminated still read as healthy — so the
+        # reducer regrew the world onto a corpse and then waited for the
+        # replacement that eventually filled the slot. Clearing the IP makes the
+        # slot unregistered until its REPLACEMENT announces itself.
+        self.st.ips.pop(node, None)
         self.profile.instance_stopped(iid)
         self.profile.mark("kill")
         self._event(f"terminated node {node} ({iid})")

@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
+
+import pytest
 
 from orchestrator import sidecar
 from spot_train import events, s3_store
@@ -251,3 +254,50 @@ def test_epoch_change_forgives_earlier_crashes(tmp_path, monkeypatch):
     assert h.launches[3].epoch == 2
     s3_store.put_bytes(b"{}", sidecar._join(run_uri, "metrics.json"))
     t.join(timeout=3)
+
+
+def test_dataset_is_pulled_before_the_box_registers(tmp_path, monkeypatch):
+    """Registration must mean "I can train", not "this instance exists".
+
+    Measured on a 4-node preemption: the supervisor admitted a replacement at
+    t+448s, but it could not take a step until t+662s because it was still
+    pulling a 17 GB train.bin. The survivors tore down their world-3 collective
+    and idled 214s (642 node-seconds) waiting for it.
+    """
+    order = []
+    monkeypatch.setenv("DATA_URI", "s3://bucket/data/x")
+    monkeypatch.setenv("DATA_LOCAL_DIR", str(tmp_path / "d"))
+
+    import spot_train.data as data_mod
+
+    monkeypatch.setattr(data_mod, "ensure_dataset", lambda d, u: order.append("dataset"))
+    monkeypatch.setattr(sidecar, "register", lambda *a, **k: order.append("register"))
+    monkeypatch.setattr(sidecar, "run", lambda *a, **k: order.append("run") or 0)
+
+    monkeypatch.setattr(sys, "argv", ["sidecar", "--run-uri", str(tmp_path), "--node-index", "3"])
+    with pytest.raises(SystemExit):
+        sidecar.main()
+    assert order == ["dataset", "register", "run"], f"wrong order: {order}"
+
+
+def test_prewarm_failure_does_not_block_the_box(tmp_path, monkeypatch):
+    """The trainer calls the same idempotent fetch and will retry. A prewarm
+    failure must never stop a node from joining — that would turn a slow
+    download into a lost node."""
+    monkeypatch.setenv("DATA_URI", "s3://bucket/data/x")
+    monkeypatch.setenv("DATA_LOCAL_DIR", str(tmp_path / "d"))
+
+    import spot_train.data as data_mod
+
+    def boom(d, u):
+        raise RuntimeError("s3 down")
+
+    monkeypatch.setattr(data_mod, "ensure_dataset", boom)
+    sidecar.prewarm_dataset(3)  # must not raise
+
+
+def test_prewarm_is_a_noop_without_dataset_env(monkeypatch):
+    # Local/CPU paths have no DATA_URI; prewarm must simply do nothing.
+    monkeypatch.delenv("DATA_URI", raising=False)
+    monkeypatch.delenv("DATA_LOCAL_DIR", raising=False)
+    sidecar.prewarm_dataset(0)

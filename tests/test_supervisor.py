@@ -754,3 +754,36 @@ def test_two_normal_preemptions_do_not_exhaust_the_restart_budget():
     (act,) = decide(stuck, p)
     assert isinstance(act, WholeGroupRestart)
     assert "epochs published with no checkpoint" in act.reason
+
+
+def test_terminated_node_stops_looking_healthy_immediately():
+    """The exact race that wasted 642 node-seconds per failure.
+
+    A node terminated ~26s earlier still passed every check in `_healthy`: its
+    cached IP kept `registered` true (st.ips is keyed by node INDEX, so the slot
+    kept its dead occupant's address), EC2 briefly still reported `running`, and
+    its log age was under the 90s heartbeat timeout. So the reducer regrew the
+    world onto a corpse at t+448s and then idled until the replacement could
+    actually train at t+662s.
+    """
+    # A corpse that still looks alive on every axis EXCEPT registration.
+    corpse = _node(1, state="running", registered=False, log_age=26.0)
+    obs = _obs([_node(0), corpse], epoch=1, members=[0, 1], node_count=2)
+    acts = decide(obs, PREEMPT)
+    # Shrinks onto the survivor and asks for a replacement — it must NOT keep
+    # node 1 in the membership just because AWS and the log still look fine.
+    assert PublishEpoch(2, (0,)) in acts
+    assert LaunchReplacement(1) in acts
+
+
+def test_regrow_waits_for_the_replacement_to_announce_itself():
+    # World shrunk to {0}; node 1's replacement is booting but has not
+    # registered (it is still pulling the corpus). No regrow yet.
+    booting = _node(1, state="running", registered=False)
+    assert decide(_obs([_node(0), booting], epoch=2, members=[0], node_count=2), PREEMPT) == []
+    # Once it registers — which now happens only AFTER its dataset is local —
+    # the world grows back.
+    ready = _node(1, state="running", registered=True)
+    assert decide(_obs([_node(0), ready], epoch=2, members=[0], node_count=2), PREEMPT) == [
+        PublishEpoch(3, (0, 1))
+    ]
