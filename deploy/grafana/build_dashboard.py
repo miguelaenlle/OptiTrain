@@ -44,6 +44,13 @@ SUM_URL = "http://data/summary.json"
 GREEN, BLUE, AMBER, RED, GREY = "green", "blue", "orange", "red", "text"
 
 _y = 0  # running grid cursor
+_ids = [0]
+
+
+def _next_id() -> int:
+    """Stable panel ids so a single panel can be deep-linked or PNG-rendered."""
+    _ids[0] += 1
+    return _ids[0]
 
 
 def _pos(h: int, w: int = 24, x: int = 0) -> dict:
@@ -136,6 +143,7 @@ def timeseries(title: str, cols: list[tuple[str, str]], h: int, **opts) -> dict:
         field["decimals"] = opts["decimals"]
     return {
         "type": "timeseries",
+        "id": _next_id(),
         "title": title,
         "datasource": DS,
         "gridPos": _pos(h),
@@ -177,6 +185,7 @@ def stat(title: str, selector: str, h: int, w: int, x: int, **opts) -> dict:
         ]
     return {
         "type": "stat",
+        "id": _next_id(),
         "title": title,
         "datasource": DS,
         "gridPos": _pos(h, w, x),
@@ -206,6 +215,7 @@ def state_timeline(title: str, h: int) -> dict:
     and 36h costs no more rows than 36 minutes."""
     return {
         "type": "state-timeline",
+        "id": _next_id(),
         "title": title,
         "datasource": DS,
         "gridPos": _pos(h),
@@ -270,6 +280,7 @@ def state_timeline(title: str, h: int) -> dict:
 def row(title: str) -> dict:
     return {
         "type": "row",
+        "id": _next_id(),
         "title": title,
         "collapsed": False,
         "gridPos": _pos(1),
@@ -398,6 +409,21 @@ def build() -> dict:
 
     panels.append(row("2 · Fleet"))
     panels.append(state_timeline("Slot occupancy — which instance held each slot", 10))
+    # World size repeated directly under the Gantt: the two are read together,
+    # and scrolling between them to correlate a dip with a slot going down is
+    # exactly the friction stacking is supposed to remove.
+    panels.append(
+        timeseries(
+            "World size",
+            [("nodes_training", "nodes training")],
+            4,
+            src="world.csv",
+            interp="stepAfter",
+            fill=15,
+            unit_label="nodes",
+            min=0,
+        )
+    )
     panels.append(
         timeseries(
             "Nodes lost and replacements launched (cumulative)",

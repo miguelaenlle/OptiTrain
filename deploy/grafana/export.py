@@ -47,8 +47,10 @@ TS_COLUMNS = [
     "nodes_lost",
     "replacements",
     "below_full_world",
+    "degraded_band",
     "goodput",
     "ms_per_step",
+    "ms_per_step_typical",
     "whole_group_restarts",
     "usd",
     "usd_per_1k",
@@ -143,11 +145,24 @@ def write_timeseries(steps, st_ts, st_vals, prof, met, path: Path) -> int:
             if t > i["started_at"]
         )
 
+    # Rolling MEDIAN, not mean: checkpoint steps run ~10x the steady step, and a
+    # mean would drag the line toward them -- which is the spike problem, not a
+    # fix for it. A median of 15 rejects them outright while still tracking the
+    # real shift when the world shrinks. The raw series is kept alongside it, so
+    # the spikes remain visible rather than being hidden.
+    WIN = 15
+    ms_all = [r["ms"] for r in steps]
+
+    def typical(i: int) -> int:
+        lo, hi = max(0, i - WIN // 2), min(len(ms_all), i + WIN // 2 + 1)
+        w = sorted(ms_all[lo:hi])
+        return w[len(w) // 2]
+
     furthest = 0
     with path.open("w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(TS_COLUMNS)
-        for r in steps:
+        for i, r in enumerate(steps):
             furthest = max(furthest, r["step"])
             t, elapsed = r["t"], r["t"] - t0
             j = bisect_right(st_ts, t) - 1
@@ -166,10 +181,15 @@ def write_timeseries(steps, st_ts, st_vals, prof, met, path: Path) -> int:
                     bisect_right(kills, t),
                     bisect_right(rel, t),
                     1 if (r["ws"] or world) < TARGET_WORLD else 0,
+                    # Shades the degraded x-ranges INSIDE the progress panel by
+                    # riding its own y-axis; a second axis would be worse than
+                    # no shading at all.
+                    furthest if (r["ws"] or world) < TARGET_WORLD else "",
                     round(min(elapsed, met["trained_seconds_total"]) / elapsed, 4)
                     if elapsed > 0
                     else "",
                     r["ms"],
+                    typical(i),
                     0,
                     round(usd, 4),
                     round(usd / r["step"] * 1000, 4) if r["step"] else "",

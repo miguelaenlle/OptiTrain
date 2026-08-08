@@ -58,6 +58,7 @@
  "panels": [
   {
    "type": "row",
+   "id": 1,
    "title": "Headline",
    "collapsed": false,
    "gridPos": {
@@ -70,6 +71,7 @@
   },
   {
    "type": "stat",
+   "id": 2,
    "title": "Goodput",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -120,6 +122,7 @@
   },
   {
    "type": "stat",
+   "id": 3,
    "title": "Nodes lost",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -170,6 +173,7 @@
   },
   {
    "type": "stat",
+   "id": 4,
    "title": "Replacements",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -220,6 +224,7 @@
   },
   {
    "type": "stat",
+   "id": 5,
    "title": "Whole-group restarts",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -270,6 +275,7 @@
   },
   {
    "type": "stat",
+   "id": 6,
    "title": "Steps",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -320,6 +326,7 @@
   },
   {
    "type": "stat",
+   "id": 7,
    "title": "Cost (USD)",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -370,6 +377,7 @@
   },
   {
    "type": "row",
+   "id": 8,
    "title": "1 \u00b7 The run",
    "collapsed": false,
    "gridPos": {
@@ -382,6 +390,7 @@
   },
   {
    "type": "timeseries",
+   "id": 9,
    "title": "Durable progress vs. current frontier",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -435,6 +444,7 @@
   },
   {
    "type": "timeseries",
+   "id": 10,
    "title": "World size",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -489,6 +499,7 @@
   },
   {
    "type": "timeseries",
+   "id": 11,
    "title": "Work at risk \u2014 steps since the last durable checkpoint",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -543,6 +554,7 @@
   },
   {
    "type": "row",
+   "id": 12,
    "title": "2 \u00b7 Fleet",
    "collapsed": false,
    "gridPos": {
@@ -555,6 +567,7 @@
   },
   {
    "type": "state-timeline",
+   "id": 13,
    "title": "Slot occupancy \u2014 which instance held each slot",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -633,6 +646,62 @@
   },
   {
    "type": "timeseries",
+   "id": 14,
+   "title": "World size",
+   "datasource": {
+    "type": "grafana-testdata-datasource",
+    "uid": "testdata-embedded"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 24,
+    "x": 0,
+    "y": 37
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-testdata-datasource",
+      "uid": "testdata-embedded"
+     },
+     "scenarioId": "csv_content",
+     "csvContent": "time,nodes training\n1786207388000,8\n1786207718000,7\n1786207942000,8\n1786208255000,6\n1786208431000,8\n1786208818000,4\n1786208925000,5\n1786208943000,6\n1786208955000,7\n1786208991000,8\n1786209310000,1\n1786209364000,2\n1786209375000,3\n1786209399000,4\n1786209416000,5\n1786209434000,6\n1786209446000,7\n1786209464000,8\n"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 15,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "stepAfter",
+      "axisLabel": "nodes"
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 15,
    "title": "Nodes lost and replacements launched (cumulative)",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -642,7 +711,7 @@
     "h": 6,
     "w": 24,
     "x": 0,
-    "y": 37
+    "y": 41
    },
    "targets": [
     {
@@ -687,18 +756,20 @@
   },
   {
    "type": "row",
+   "id": 16,
    "title": "3 \u00b7 Efficiency",
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 43
+    "y": 47
    },
    "panels": []
   },
   {
    "type": "timeseries",
+   "id": 17,
    "title": "Goodput \u2014 fraction of wall clock spent training",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -708,7 +779,7 @@
     "h": 6,
     "w": 24,
     "x": 0,
-    "y": 44
+    "y": 48
    },
    "targets": [
     {
@@ -755,6 +826,7 @@
   },
   {
    "type": "timeseries",
+   "id": 18,
    "title": "Step time",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -764,7 +836,7 @@
     "h": 6,
     "w": 24,
     "x": 0,
-    "y": 50
+    "y": 54
    },
    "targets": [
     {
@@ -809,18 +881,20 @@
   },
   {
    "type": "row",
+   "id": 19,
    "title": "4 \u00b7 Model quality",
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 56
+    "y": 60
    },
    "panels": []
   },
   {
    "type": "timeseries",
+   "id": 20,
    "title": "Training loss",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -830,7 +904,7 @@
     "h": 6,
     "w": 24,
     "x": 0,
-    "y": 57
+    "y": 61
    },
    "targets": [
     {
@@ -874,6 +948,7 @@
   },
   {
    "type": "timeseries",
+   "id": 21,
    "title": "Tokens processed",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -883,7 +958,7 @@
     "h": 6,
     "w": 24,
     "x": 0,
-    "y": 63
+    "y": 67
    },
    "targets": [
     {
@@ -928,18 +1003,20 @@
   },
   {
    "type": "row",
+   "id": 22,
    "title": "5 \u00b7 Cost",
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 69
+    "y": 73
    },
    "panels": []
   },
   {
    "type": "timeseries",
+   "id": 23,
    "title": "Cumulative spend",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -949,7 +1026,7 @@
     "h": 6,
     "w": 24,
     "x": 0,
-    "y": 70
+    "y": 74
    },
    "targets": [
     {
@@ -995,6 +1072,7 @@
   },
   {
    "type": "timeseries",
+   "id": 24,
    "title": "Unit cost",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -1004,7 +1082,7 @@
     "h": 6,
     "w": 24,
     "x": 0,
-    "y": 76
+    "y": 80
    },
    "targets": [
     {
@@ -1049,18 +1127,20 @@
   },
   {
    "type": "row",
+   "id": 25,
    "title": "6 \u00b7 Sentinels",
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 82
+    "y": 86
    },
    "panels": []
   },
   {
    "type": "timeseries",
+   "id": 26,
    "title": "Whole-group restarts (expected: flat at zero) and degraded intervals",
    "datasource": {
     "type": "grafana-testdata-datasource",
@@ -1070,7 +1150,7 @@
     "h": 5,
     "w": 24,
     "x": 0,
-    "y": 83
+    "y": 87
    },
    "targets": [
     {
