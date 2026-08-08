@@ -436,9 +436,17 @@ def train(cfg: TrainConfig) -> dict:
             if ddp.master:
                 toks = accum * ddp.world_size * cfg.batch_size * cfg.block_size
                 tok_s = toks / per_step if per_step else 0
+                # `t` is a WALL-CLOCK unix timestamp, appended last on purpose.
+                # profile._STEP_RE has no end anchor, so this cannot break
+                # existing parsing. Without it every timeline plot has to
+                # reconstruct step times by anchoring to `training` events and
+                # summing ms/step — E4 produced two wrong plots that way before
+                # producing a right one. One field removes that whole class of
+                # error, and it is the only clock that survives a node being
+                # replaced mid-run.
                 print(
                     f"step {step}: loss {gloss:.4f}, {per_step * 1000:.0f}ms/step, "
-                    f"{tok_s:.0f} tok/s, ws {ddp.world_size}",
+                    f"{tok_s:.0f} tok/s, ws {ddp.world_size}, t {time.time():.3f}",
                     file=sys.stderr,
                     flush=True,
                 )

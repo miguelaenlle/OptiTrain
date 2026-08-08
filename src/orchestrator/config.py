@@ -754,6 +754,16 @@ class OrchestratorConfig:
             )
         return victims
 
+    # Whole-group-restart floor, in EPOCHS with no checkpoint progress. One
+    # preemption publishes two epochs (shrink, then grow), so the default 6 is
+    # three full recoveries. A chaos run with many scheduled rounds needs this
+    # raised or the floor fires on the mechanism working as designed — E4 sat
+    # exactly at 6 with three rounds and survived only because checkpoints
+    # landed between them and reset the counter.
+    max_epochs_without_progress: int = field(
+        default_factory=lambda: _env_int("MAX_EPOCHS_WITHOUT_PROGRESS", 6)
+    )
+
     def require_bucket(self) -> None:
         if not self.bucket:
             raise SystemExit(

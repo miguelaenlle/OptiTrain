@@ -101,10 +101,6 @@ Budget **2100 training-seconds**. 500s spacing: recovery is expected at
 200–300s, leaving ~200s of full-world training between rounds — enough to land
 ≥2 checkpoints and reset the epoch counter.
 
-Budget **2100 training-seconds**. 500s spacing: recovery is expected at
-200–300s, leaving ~200s of full-world training between rounds — enough to land
-≥2 checkpoints and reset the epoch counter.
-
 ## What each failure costs, and where
 
 This is the model E5 is calibrating. **The two costs land in different
@@ -274,21 +270,37 @@ run was real training and not a toy.
 | **MFU** | **~20%** of A10G bf16 peak |
 | node-hours | 303 |
 
-### C. Cost — the money thesis
+### C. Cost — reported, not claimed as a saving
 
-Live `describe-spot-price-history` for `g5.xlarge` in us-east-1 (n=1283):
-**median $0.5627**, min $0.3767, max $0.9821, against $1.006 on-demand.
+**The spot cost story is dropped.** Spotwatch settles it with our own data: over
+788 ticks / 131h, every GPU type we can actually launch scored **0 ticks above
+the threshold**, never two good samples consecutively.
+
+| pool | best | mean | ticks ≥7 | longest good window |
+|---|---|---|---|---|
+| `g5.xlarge`, all 5 AZs | 3 | 1.0–1.1 | **0** | **0 (no 2 in a row)** |
+| `g4dn.xlarge`, all 5 AZs | 3 | 1.6–1.9 | **0** | **0 (no 2 in a row)** |
+| `g6.xlarge`, all 5 AZs | 1 | 1.0 | **0** | **0 (no 2 in a row)** |
+
+Truth probes agree independently: **4 of 22 acquired capacity**. The decision
+query returns **0.0%** for every switch scenario. An 8-node spot world for 36h is
+not obtainable right now, so a savings claim resting on it would be fiction.
+
+The `any`-GPU basket does score well (`us-east-1f` peaked 9/10, 12.5h unbroken),
+but a mixed-type world trains at the speed of its slowest node — converting that
+into a real run needs heterogeneous-world support, which is deferred work, not a
+knob for this run.
+
+So the run is **on-demand**, and cost is *reported* rather than sold:
 
 | metric | value |
 |---|---|
-| on-demand equivalent | **$305** |
-| spot at median | **$170 → 44% saving** |
-| spot in cheapest AZ | $114 → 62% saving |
-| **$ per billion tokens** | **$4.75** |
+| on-demand cost | **~$305** (303 node-hours × $1.006) |
+| **$ per billion tokens** | **$8.53** |
 
-44% is the defensible headline. The 65% figure I used earlier assumed $0.35/h,
-which is near the *floor*, not the median — spot has risen, consistent with the
-current GPU shortage.
+The defensible efficiency claim is **goodput**, not price: failures cost ~5% of
+wall clock rather than the whole run. That is a systems result and it does not
+depend on a spot market that currently has no capacity.
 
 ### D. Quality — proves preemption did not corrupt it
 
@@ -326,23 +338,27 @@ otherwise invites exactly the question that unravels it.
 
 Long form:
 
-> **Fault-tolerant distributed LLM training on spot GPUs** — Built the control
-> plane (Python/AWS, epoch-supervisor architecture) that trains across
-> preemptible multi-node GPU fleets. Sustained a **36-hour, 8-node GPT-2
-> pretraining run through 18 node failures** — including simultaneous loss of
-> half the fleet — with **zero human intervention, zero whole-group restarts,
-> and 95% goodput** at a per-node failure rate ~2,800× that reported for Meta's
-> Llama 3 cluster. **44% cheaper than on-demand.**
+> **Fault-tolerant distributed LLM training** — Built the control plane
+> (Python/AWS, epoch-supervisor architecture) for multi-node GPU training that
+> survives node loss without operator involvement. Sustained a **36-hour, 8-node
+> GPT-2 pretraining run through 18 node failures** — including simultaneous loss
+> of half the fleet — with **zero human intervention, zero whole-group restarts,
+> and 95% goodput**, at a per-node failure rate ~2,800× that reported for Meta's
+> Llama 3 cluster. Cut per-failure recovery cost **3.9×** via async checkpointing
+> and a node-identity fix that keeps survivors training through a replacement's
+> boot.
 
 Tight form:
 
-> Trained GPT-2 for 36h across 8 spot GPU nodes through 18 node failures — 0
-> human interventions, 0 whole-group restarts, 95% goodput, 44% cheaper than
-> on-demand. Built the supervisor, two-tier checkpointing, and recovery path.
+> Trained GPT-2 for 36h across 8 GPU nodes through 18 node failures — 0 human
+> interventions, 0 whole-group restarts, 95% goodput. Built the supervisor,
+> two-tier checkpointing, and the recovery path (3.9× cheaper per failure).
 
-What makes it land is the **pairing**: a survival claim alone reads as "it
-retried"; a cost claim alone reads as "I used spot instances." *Survived 18
-failures* **and** *95% goodput* **and** *44% cheaper* is a systems result,
-because the three are in tension — that is the part an interviewer can probe and
-find real answers behind (budget-in-checkpoint, two-tier checkpoints, the pure
-`decide()` reducer, the measured 3.9× per-failure cost reduction from E1/E2b).
+**Why this survives an interview without the cost claim.** The pairing that
+matters is *survived 18 failures* **and** *95% goodput* — those two are in
+tension, which is what makes it a systems result rather than "it retried."
+Adding *3.9× cheaper per failure* is stronger than a spot-price claim would have
+been, because it is **our own measured engineering delta** (E1/E1b async
+checkpointing + E2b identity fix, 314s → 80s per node lost) rather than an
+artifact of AWS's pricing. Every clause has a mechanism behind it:
+budget-in-checkpoint, two-tier checkpoints, the pure `decide()` reducer.

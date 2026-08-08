@@ -565,6 +565,7 @@ def _run_supervised(
         policy = Policy(
             replace_on_loss=replace_on_loss,
             recovery_timeout_s=cfg.recovery_timeout_seconds,
+            max_epochs_without_progress=cfg.max_epochs_without_progress,
         )
         sup = Supervisor(
             cfg,
