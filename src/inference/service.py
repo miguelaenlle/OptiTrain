@@ -37,7 +37,7 @@ from spot_train import checkpoint, s3_store
 from spot_train.config import TrainConfig
 from spot_train.sampling import _bpe_codec, _char_codec
 
-from .backends import HFBackend, NanoGPTBackend
+from .backends import HFBackend, NanoGPTBackend, VLLMBackend
 from .model_build import build_gpt, load_pretrained_gpt
 
 
@@ -236,10 +236,14 @@ class ModelService:
                 f"serving {model_type} needs the GPT-2 BPE, but tiktoken is not installed"
             )
         encode, decode = codec
-        if engine not in ("hf", "nanogpt"):
-            raise ValueError(f"unknown SERVE_ENGINE {engine!r}; valid options: hf, nanogpt")
+        if engine not in ("hf", "nanogpt", "vllm"):
+            raise ValueError(f"unknown SERVE_ENGINE {engine!r}; valid options: hf, nanogpt, vllm")
         try:
-            if engine == "hf":
+            if engine == "vllm":
+                if not device.startswith("cuda"):
+                    raise ModelNotReady("SERVE_ENGINE=vllm requires a CUDA device")
+                backend = VLLMBackend.load(model_type)
+            elif engine == "hf":
                 backend = HFBackend.load(model_type, device=device, dtype=dtype)
             else:
                 model = load_pretrained_gpt(model_type)
@@ -329,7 +333,13 @@ class ModelService:
         self.stats.enter()
         try:
             start = time.monotonic()
-            with self._gen_lock:
+            # Serialize only for backends that cannot batch. An engine that
+            # schedules sequences itself (vLLM) must be handed every concurrent
+            # request at once -- holding the lock would feed it one at a time
+            # and silently forfeit continuous batching, which is the whole point
+            # of using it. Nothing would error; throughput would simply stay
+            # where it is, which is the hardest kind of bug to notice.
+            if getattr(self.backend, "concurrent", False):
                 completion_ids = self.backend.generate(
                     ids,
                     max_new_tokens=max_new_tokens,
@@ -337,6 +347,15 @@ class ModelService:
                     top_k=top_k or None,
                     seed=seed,
                 )
+            else:
+                with self._gen_lock:
+                    completion_ids = self.backend.generate(
+                        ids,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_k=top_k or None,
+                        seed=seed,
+                    )
             elapsed = time.monotonic() - start
         finally:
             self.stats.leave()
