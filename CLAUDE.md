@@ -221,6 +221,23 @@ tests/                 # checkpoint/resume tests
 The nanoGPT submodule is pinned; contributors run
 `git submodule update --init` after cloning.
 
+## AWS region — training is us-east-1, and only us-east-1
+
+This AWS account is shared with a separate **inference platform that owns
+us-east-2**. Isolation is by region: GPU quota is per-region, so neither project
+can starve the other, and a careless `describe-instances`/`terminate-instances`
+in one region cannot even see the other's boxes.
+
+- `aws.TRAINING_REGION = "us-east-1"`; `aws.set_region()` **raises** on anything
+  else (override: `ALLOW_REGION_OVERRIDE=1`). Every entry point funnels through it.
+- Source `scripts/fleetctl.sh` — never write a bare `aws ec2 describe-instances`
+  in a driver. It scopes by region *and* `tag:project=spot-train`.
+- IAM and S3 are **not** regional: keep the `spot-train-*` name prefix, and never
+  touch resources belonging to the inference project.
+
+Full contract: [docs/region-split.md](./docs/region-split.md). The brief handed
+to the other agent: [docs/prompts/inference-agent-region.md](./docs/prompts/inference-agent-region.md).
+
 ## Conventions
 
 - Python package lives under `src/spot_train` (src layout). Install editable:

@@ -22,7 +22,21 @@ from typing import Any
 
 _DRY_RUN = False
 _clients: dict[str, Any] = {}
-_region = "us-east-1"
+
+# All training infrastructure lives in ONE region, and this is it.
+#
+# We share an AWS account with a separate inference platform, which owns
+# us-east-2. The split is what keeps the two independent: G/VT vCPU quota is
+# PER-REGION, so neither project can starve the other, and an over-broad
+# `describe-instances` in one region cannot even see — let alone terminate —
+# the other project's boxes. See docs/region-split.md.
+#
+# Enforced rather than defaulted: a stray AWS_REGION in the environment would
+# otherwise silently launch GPUs into the inference platform's region and eat
+# their quota. Set ALLOW_REGION_OVERRIDE=1 to deliberately step outside.
+TRAINING_REGION = "us-east-1"
+
+_region = TRAINING_REGION
 
 
 def set_dry_run(flag: bool) -> None:
@@ -35,6 +49,20 @@ def is_dry_run() -> bool:
 
 
 def set_region(region: str) -> None:
+    """Point every AWS client at ``region``, refusing to leave TRAINING_REGION.
+
+    Single choke point: every entry point (orch, setup, spotwatch, prep,
+    experiments) calls this before touching AWS, so the guard covers all of them.
+    """
+    if region != TRAINING_REGION and not os.environ.get("ALLOW_REGION_OVERRIDE"):
+        raise SystemExit(
+            f"Refusing to use region {region!r}: all training infrastructure is "
+            f"pinned to {TRAINING_REGION} (docs/region-split.md). us-east-2 belongs "
+            f"to the inference platform sharing this AWS account — launching there "
+            f"would consume its GPU quota.\n"
+            f"Fix AWS_REGION in your .env, or set ALLOW_REGION_OVERRIDE=1 if you "
+            f"really mean it."
+        )
     global _region
     _region = region
     _clients.clear()
