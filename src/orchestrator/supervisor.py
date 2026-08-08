@@ -473,6 +473,16 @@ class Supervisor:
             )
             aws.put_text(self.cfg.bucket, self.status_key, json.dumps(doc))
             self._last_status = doc
+            # Feed the live dashboard the state only the supervisor has. The
+            # profile parses trainer logs, so without this push `ckpt_step` --
+            # durable progress, the one measure a failure cannot inflate -- is
+            # absent from every live run and present only in replays.
+            self.profile.observe(
+                ckpt_step=self.st.ckpt_step,
+                members=list(doc.get("members") or []),
+                target_world=self.cfg.node_count,
+                whole_group_restarts=getattr(self.st, "whole_group_restarts", 0),
+            )
             if self._orch_dirty:
                 aws.put_text(self.cfg.bucket, self.orch_log_key, "\n".join(self._orch_lines) + "\n")
                 self._orch_dirty = False

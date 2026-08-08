@@ -459,7 +459,12 @@ def train(cfg: TrainConfig) -> dict:
                 print(
                     f"[rank {ddp.rank}] step {step} | loss {gloss:.4f} "
                     f"| local {micro_loss:.4f} | {per_step * 1000:.0f}ms/step "
-                    f"| ws {ddp.world_size}",
+                    # Same wall clock as the rank-0 line. Without it only the
+                    # MASTER's steps are placeable in time, so a slot-occupancy
+                    # Gantt can only show boxes that were master at some point
+                    # (4 of 22 on E5) and every other node's window has to be
+                    # inferred from the master's step->time map.
+                    f"| ws {ddp.world_size} | t {time.time():.3f}",
                     file=sys.stderr,
                     flush=True,
                 )
