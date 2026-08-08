@@ -30,6 +30,39 @@ Two details worth catching:
   rather than waiting for both — so capacity returned sooner than a
   wait-for-all policy would have allowed.
 
+## Durable progress over time
+
+![E4 durable progress](img/e4-progress.png)
+
+`ckpt_step` from the supervisor's own status history — already timestamped, so
+nothing is reconstructed. It is the **furthest step that survives a failure**,
+which is the number that actually matters.
+
+**The curve never goes backwards, and it climbs inside every shaded window.**
+
+| world-2 window | ckpt_step | rate |
+|---|---|---|
+| t+470..648s | 38 → 59 (+21) | 0.118 steps/s |
+| t+771..910s | 59 → 89 (+30) | 0.215 steps/s |
+| t+1068..1223s | 98 → 119 (+21) | 0.135 steps/s |
+| **world 4 reference** | 119 → 195 (+76) | **0.190 steps/s** |
+
+Half the fleet dead costs roughly a third to a half of the step rate, not all of
+it — gradient accumulation holds the global batch at 480, so two nodes do the
+same work per step, just with more micro-batches each. (The middle window's
+0.215 exceeds the world-4 reference because that reference spans checkpoint
+stalls; treat the three world-2 rates as the comparable set.)
+
+Per-step rollback at each membership change is small and bounded by the
+checkpoint interval — node 0's log shows `steps 1..47` then a resume at 38, then
+`39..66` then a resume at 59: **9 and 7 steps**, ~30s of work at ~3s/step.
+
+> A first version of this plot was reconstructed by anchoring step lines to
+> `training` events and cumulatively summing `ms/step`. It showed false plateaus,
+> because node index 0 has training events from both the original box and its
+> replacement and the segments were mis-assigned. `ckpt_step` needs no
+> reconstruction and is what the supervisor actually acts on.
+
 ## The headline: recovery does not degrade
 
 | round | `T_restart` | world-2 window | idle after regrow | **steps banked** |
