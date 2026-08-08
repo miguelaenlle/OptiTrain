@@ -26,7 +26,14 @@ def _inst(iid, role, project, fleet_id):
 
 @pytest.fixture
 def fake_aws(monkeypatch):
-    """Two inference fleets plus a stray box mislabelled as training."""
+    """Two inference fleets plus a stray box mislabelled as training.
+
+    Patches the FUNCTION, not the module. `_discover` does `from . import aws`
+    at call time, which resolves through the package attribute once anything
+    else has imported it — so substituting sys.modules["orchestrator.aws"]
+    works in isolation and silently stops working as soon as another test file
+    imports aws first. Patching the attribute is order-independent.
+    """
     everything = [
         _inst("i-mine-w", "worker", "inference", "fleet-A"),
         _inst("i-mine-r", "router", "inference", "fleet-A"),
@@ -34,13 +41,11 @@ def fake_aws(monkeypatch):
         _inst("i-train-w", "worker", "spot-train", "fleet-T"),
     ]
 
-    class FakeAWS:
-        @staticmethod
-        def instances_by_tag(key, value):
-            return [i for i in everything if i["tags"].get(key) == value]
+    def fake_instances_by_tag(key, value):
+        return [i for i in everything if i["tags"].get(key) == value]
 
-    monkeypatch.setitem(__import__("sys").modules, "orchestrator.aws", FakeAWS)
-    return FakeAWS
+    monkeypatch.setattr("orchestrator.aws.instances_by_tag", fake_instances_by_tag)
+    return everything
 
 
 def test_project_scope_excludes_training_instances(fake_aws):
