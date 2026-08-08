@@ -23,9 +23,9 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 
-from . import registry
+from . import metrics, registry
 
 
 @dataclass
@@ -170,6 +170,7 @@ def _poll_loop(state: RouterState, settings: RouterSettings, stop: threading.Eve
         try:
             docs = registry.list_workers(settings.workers_uri)
             state.set_workers(registry.live_workers(docs, settings.ttl_seconds))
+            metrics.set_live_workers(len(state.workers))
         except Exception as e:
             print(f"[router] registry poll failed: {e}", flush=True)
         stop.wait(settings.poll_seconds)
@@ -197,6 +198,7 @@ def _stats_loop(state: RouterState, settings: RouterSettings, stop: threading.Ev
 
     while not stop.is_set():
         state.set_worker_stats(scrape_worker_stats(list(state.workers), get))
+        metrics.sync_worker_gauges(state.worker_stats)
         stop.wait(settings.stats_poll_seconds)
 
 
@@ -263,18 +265,51 @@ def create_app(settings: RouterSettings | None = None, state: RouterState | None
             "stats_ts": state.stats_ts,
         }
 
+    @app.get("/metrics")
+    def prometheus_metrics():
+        """Prometheus scrape target. Same numbers as /fleet/metrics, in the
+        exposition format a Prometheus+Grafana stack (and later an HPA reading
+        fleet_worker_queue_depth) can consume."""
+        payload, content_type = metrics.render()
+        return Response(content=payload, media_type=content_type)
+
     @app.post("/v1/completions")
     def completions(body: dict):
         workers = list(state.workers)
         start = state.next_start(len(workers)) if workers else 0
+        worker_ids = {w.get("addr", ""): w.get("worker_id", "") for w in workers}
+
+        def _instrumented_post(addr: str, body: dict) -> tuple[int, dict]:
+            """_post + per-attempt metrics. Wrapping the injected call keeps
+            route_completion pure — the policy never sees the metrics module."""
+            worker_id = worker_ids.get(addr) or addr
+            try:
+                status, payload = _post(addr, body)
+            except UpstreamError:
+                metrics.record_attempt(worker_id, "error")
+                raise
+            metrics.record_attempt(worker_id, metrics.attempt_result(status))
+            return status, payload
+
         state.enter()
+        metrics.IN_FLIGHT.inc()
+        started = time.perf_counter()
         try:
             result = route_completion(
-                body, workers, _post, start_index=start, max_attempts=settings.max_attempts
+                body,
+                workers,
+                _instrumented_post,
+                start_index=start,
+                max_attempts=settings.max_attempts,
             )
         finally:
             state.leave()
+            metrics.IN_FLIGHT.dec()
         state.record(result)
+        metrics.record_request(
+            metrics.outcome_for(result.status_code, result.rerouted),
+            time.perf_counter() - started,
+        )
         if result.status_code == 503:
             raise HTTPException(status_code=503, detail=result.detail)
         if result.status_code >= 400:
