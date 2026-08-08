@@ -299,6 +299,128 @@ def gantt_html(
     )
 
 
+GANTT_CHART_NAME = "fleet-gantt"
+# What we pass to wandb.log(). W&B's CustomChartSpec derives the actual media
+# key by appending "_table" to it, so a panel query must reference
+# GANTT_PANEL_TABLE_KEY -- pointing a panel at GANTT_TABLE_KEY silently binds to
+# nothing and renders an empty chart.
+GANTT_TABLE_KEY = f"{FLEET}/gantt_table"
+GANTT_PANEL_TABLE_KEY = f"{GANTT_TABLE_KEY}_table"
+
+
+def gantt_vega_spec() -> dict:
+    """Vega-Lite spec for a NATIVE W&B Gantt — rendered by W&B's own chart infra.
+
+    A Gantt is a `bar` mark with x/x2 (start/end) against a categorical y. No
+    built-in W&B chart supports x2, which is why this has to be a registered
+    custom preset -- but `Api.create_custom_chart` registers it programmatically,
+    so there is still no UI step anywhere in the pipeline.
+
+    Rendering natively rather than as embedded HTML buys W&B's real interaction
+    layer: drag-zoom on the time axis, tooltips, and the same downsampling every
+    other panel gets. That is what makes it usable at 36h, where a fixed-scale
+    static image is either unreadable or enormous.
+    """
+    return {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "description": "Fleet slot occupancy over wall-clock time",
+        "data": {"name": "wandb"},
+        "title": "${string:title}",
+        "mark": {"type": "bar", "cornerRadius": 2, "tooltip": True},
+        "encoding": {
+            "y": {
+                "field": "${field:instance}",
+                "type": "nominal",
+                "title": None,
+                "sort": None,
+                "axis": {"labelFontSize": 10, "labelLimit": 120},
+            },
+            "x": {
+                "field": "${field:t_start}",
+                "type": "quantitative",
+                "title": "wall clock (s)",
+                "scale": {"zero": False},
+            },
+            "x2": {"field": "${field:t_end}"},
+            "color": {
+                "field": "${field:state}",
+                "type": "nominal",
+                "title": "state",
+                "scale": {
+                    # Same lightness-separated ramp as the static figures, so a
+                    # reader moving between the dashboard and docs/e5-results.md
+                    # sees one visual language.
+                    "domain": ["provisioning", "training", "down"],
+                    "range": ["#3b6fd4", "#1b7f4b", "#b9bec4"],
+                },
+            },
+            "tooltip": [
+                {"field": "${field:instance}", "type": "nominal", "title": "instance"},
+                {"field": "${field:state}", "type": "nominal", "title": "state"},
+                {"field": "${field:t_start}", "type": "quantitative", "title": "start (s)"},
+                {"field": "${field:t_end}", "type": "quantitative", "title": "end (s)"},
+            ],
+        },
+    }
+
+
+def ensure_gantt_chart(entity: str) -> str | None:
+    """Register (idempotently) the Gantt preset. Returns "entity/name" or None.
+
+    Safe to call on every run: re-registering an existing preset is a no-op that
+    raises, and a failure here must never take down a training run -- the HTML
+    Gantt remains as a fallback panel.
+    """
+    try:
+        import wandb
+
+        return wandb.Api().create_custom_chart(
+            entity=entity,
+            name=GANTT_CHART_NAME,
+            display_name="Fleet slot occupancy",
+            spec_type="vega2",
+            access="private",
+            spec=gantt_vega_spec(),
+        )
+    except Exception as exc:  # already exists, offline, or server too old
+        print(f"[wandb_dash] gantt preset not registered ({exc})", file=__import__("sys").stderr)
+        return None
+
+
+def gantt_table(occupancy: list[dict]):
+    """wandb.Table feeding the native Gantt: one row per (instance, state) span."""
+    import wandb
+
+    rows = [
+        [
+            o.get("instance") or f"node{o['slot']}",
+            o.get("state", "training"),
+            round(float(o["t_start"]), 1),
+            round(float(o["t_end"]), 1),
+            int(o["slot"]),
+        ]
+        for o in sorted(occupancy, key=lambda x: (int(x["slot"]), int(x.get("generation", 0))))
+    ]
+    return wandb.Table(columns=["instance", "state", "t_start", "t_end", "slot"], data=rows)
+
+
+def gantt_native(occupancy: list[dict], entity: str):
+    """The native custom-chart object to log, or None if the preset is missing."""
+    import wandb
+
+    return wandb.plot_table(
+        vega_spec_name=f"{entity}/{GANTT_CHART_NAME}",
+        data_table=gantt_table(occupancy),
+        fields={
+            "instance": "instance",
+            "state": "state",
+            "t_start": "t_start",
+            "t_end": "t_end",
+        },
+        string_fields={"title": "Fleet slot occupancy over time"},
+    )
+
+
 def header_markdown(cfg: dict, s: RunState, wall_s: float) -> str:
     """The headline panel: what this run is, and the six numbers that judge it."""
     goodput = (s.trained_seconds / wall_s * 100) if wall_s else 0.0

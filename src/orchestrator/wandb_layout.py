@@ -26,7 +26,7 @@ from __future__ import annotations
 from . import wandb_dash as D
 
 
-def _sections():
+def _sections(entity: str = ""):
     """(title, caption, panels) in reading order.
 
     Each section carries a caption in full sentences saying what to look for and
@@ -82,9 +82,25 @@ def _sections():
             "every segment. The cumulative counters must rise in lockstep — one "
             "replacement for every node lost.",
             [
+                # Native Vega-Lite Gantt: W&B renders it, so drag-zoom on the
+                # time axis and tooltips come from the same engine as every
+                # other panel. The HTML version below is a fallback for
+                # environments where the custom-chart preset is unavailable.
+                wr.CustomChart(
+                    query={"summaryTable": {"tableKey": D.GANTT_PANEL_TABLE_KEY}},
+                    chart_name=f"{entity}/{D.GANTT_CHART_NAME}",
+                    chart_fields={
+                        "instance": "instance",
+                        "state": "state",
+                        "t_start": "t_start",
+                        "t_end": "t_end",
+                    },
+                    chart_strings={"title": "Fleet slot occupancy over time"},
+                    layout=wr.Layout(w=24, h=14),
+                ),
                 wr.MediaBrowser(
                     media_keys=[D.K_GANTT],
-                    layout=wr.Layout(w=24, h=16),
+                    layout=wr.Layout(w=24, h=14),
                 ),
                 wr.LinePlot(
                     title="Nodes lost and replacements launched (cumulative)",
@@ -212,7 +228,7 @@ def apply(entity: str, project: str = "spot-train", name: str = "Distributed tra
     import wandb_workspaces.workspaces as ws
 
     sections = []
-    for title, _caption, panels in _sections():
+    for title, _caption, panels in _sections(entity):
         # No caption panels. Each consumed a full-width row and read as filler;
         # panel titles and axis labels carry the meaning instead, and the
         # reasoning lives in this module's docstrings and docs/e5-results.md.
