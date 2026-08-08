@@ -1,42 +1,59 @@
 # Grafana dashboard — distributed training
 
-Local, read-only view of a training run. **Port 3001** — the inference
-platform's Grafana owns 3000, and the compose project is namespaced
-`spot-train-grafana` so `docker compose down` in either repo cannot stop the
-other's containers.
+Port **3001** (the inference platform's Grafana owns 3000), compose project
+`spot-train-grafana` so neither stack can stop the other's containers.
 
 ```bash
-python3 export.py <run_id>          # run artifacts -> data/*.csv
-python3 build_dashboard.py          # dashboard JSON (code, not a UI artifact)
-docker compose up -d                # http://localhost:3001
+python3 deploy/grafana/export.py <run_id>      # run -> data/*.csv
+python3 deploy/grafana/build_dashboard.py      # -> dashboards/*.json
+cd deploy/grafana && docker compose up -d      # http://localhost:3001
 ```
 
-Everything is provisioned: datasource, dashboard and time range exist on first
-boot with nothing to click.
+## Pass 1 (now): static, embedded
 
-## Layout
+Panels carry their CSV inline (`scenarioId: csv_content`) against Grafana's
+**built-in** testdata datasource, so the stack needs no plugin.
 
-Every panel is full width and stacked, because Grafana shares one time picker,
-one crosshair and one zoom across a dashboard — so a vertical line reads as a
-single instant across progress, fleet, efficiency and cost at once. Panel
-heights encode hierarchy: the progress hero is tall, its supporting strips short.
+That is not the original design. The intended datasource was the Infinity
+plugin reading CSVs over HTTP, and its backend works — `/api/ds/query` returns
+all 1097 rows. But its browser module fails to load:
 
-## Going live (pass 2)
+```
+404 Not Found, loading react/jsx-runtime from
+.../yesoreyeram-infinity-datasource/module.js?_cache=3.11.2
+```
 
-The schema is already the live schema; only the *writer* changes.
+Grafana's SystemJS import map does not provide `react/jsx-runtime`, on 11.3 or
+on 12.1.0 — even though 12.1.0 satisfies the plugin's own declared dependency
+(`>=11.6`). The failure mode is nasty: the datasource tests green, the backend
+query returns correct data, and every panel silently reads "No data".
 
-| | pass 1 (now) | pass 2 (live) |
-|---|---|---|
-| who writes the CSVs | `export.py`, after the run | the supervisor, each tick |
-| where they live | `./data`, served by nginx | same path on the orchestrator box, or S3 |
-| dashboard time | pinned to the run's span | falls back to `now-6h` automatically |
-| refresh | already `10s` | unchanged |
+`nginx` and the Infinity provisioning are kept in place because pass 2 needs
+them; flip `EMBED = False` in `build_dashboard.py` once the plugin loads.
 
-No dashboard, datasource or panel changes are required.
+## Pass 2 (live)
 
-## Known issue
+The CSV schema is already the shape a live writer appends to, so going live is
+a change of *writer*, not of schema or dashboard:
 
-`grafana-image-renderer` cannot render this Grafana build — its browser 404s on
-`/react/jsx-runtime`, so server-side PNG export returns blank panels. The
-dashboard itself is fine; verify in a real browser. Panel queries were confirmed
-directly against `/api/ds/query` (1097 rows, correct field types).
+1. have the supervisor append to `timeseries.csv` / `occupancy.csv` each tick
+   (or write them to S3 and point the datasource at that URL)
+2. set `"active": true` in `summary.json` — the dashboard's default window then
+   runs start-of-run → `now` instead of pinning to the run's end
+3. resolve the Infinity plugin, or swap to any datasource that reads remote CSV
+
+`refresh: 10s` is already set, and nginx sends `Cache-Control: no-store` so a
+polled CSV is never served stale.
+
+## Why these panels
+
+Full width, stacked, one shared time axis: Grafana syncs the crosshair and zoom
+across every panel, so a vertical line reads as one instant across progress,
+fleet, efficiency and cost at once. Side-by-side would halve time resolution and
+break that reading. Heights encode hierarchy — the progress hero is tall, its
+supporting strips short.
+
+The Gantt is Grafana's native **State Timeline**: rows are SLOTS (fixed at the
+world size, so 30 replacements do not become 30 rows) and each band is labelled
+with the instance that held the slot. It holds a value until it changes, so the
+CSV stores transitions only — 36h costs no more rows than 36 minutes.

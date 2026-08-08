@@ -32,7 +32,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:11.3.0
+    image: grafana/grafana:12.1.0
     ports:
       # host 3001 -> container 3000; inference keeps 3000.
       - "127.0.0.1:3001:3000"
@@ -44,6 +44,10 @@ services:
       GF_AUTH_BASIC_ENABLED: "false"
       GF_SECURITY_ALLOW_EMBEDDING: "true"
       GF_USERS_DEFAULT_THEME: light
+      # Version pair matters: Infinity 3.x needs react/jsx-runtime, which Grafana
+      # 11.3 does not expose via SystemJS -- that combination loads the
+      # datasource backend fine and fails ONLY in the browser, so every panel
+      # reads "No data" while /api/ds/query returns correct rows.
       GF_INSTALL_PLUGINS: yesoreyeram-infinity-datasource
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/distributed-training.json
       GF_RENDERING_SERVER_URL: http://renderer:8081/render

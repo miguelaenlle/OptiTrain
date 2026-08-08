@@ -206,8 +206,16 @@ def main() -> int:
     n1 = write_timeseries(steps, st_ts, st_vals, prof, met, DATA / "timeseries.csv")
     n2 = write_occupancy(spans, DATA / "occupancy.csv")
 
+    t_start_ms = int(steps[0]["t"] * 1000)
+    t_end_ms = int(steps[-1]["t"] * 1000)
     summary = {
         "run_id": run_id,
+        # The dashboard's default window is derived from these. A finished run
+        # pins to its own end so there is no dead trailing space; a live one
+        # runs to "now" so the window follows the fleet.
+        "run_start_ms": t_start_ms,
+        "run_end_ms": t_end_ms,
+        "active": False,
         "goodput": round(met["trained_seconds_total"] / prof["durations"]["total_s"], 4),
         "nodes_lost": sum(1 for e in prof["events"] if e["event"] == "kill"),
         "replacements": sum(1 for e in prof["events"] if e["event"] == "relaunch"),

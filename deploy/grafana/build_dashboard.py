@@ -20,7 +20,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 OUT = Path(__file__).parent / "dashboards" / "distributed-training.json"
-DS = {"type": "yesoreyeram-infinity-datasource", "uid": "rundata"}
+DATA = Path(__file__).parent / "data"
+
+# EMBED mode uses Grafana's BUILT-IN testdata datasource with the CSV inlined in
+# the dashboard, so the stack needs no plugin at all. That matters because the
+# Infinity plugin (3.11.2) fails to load in this environment -- its module.js
+# imports `react/jsx-runtime`, which Grafana's SystemJS import map does not
+# provide, even on 12.1.0 which satisfies the plugin's declared dependency
+# (>=11.6). The backend query works perfectly; only the browser module fails.
+#
+# Embedding is right for a FINISHED run (the data is fixed and small). A live
+# run needs a real datasource -- see README "Going live".
+EMBED = True
+DS_EMBED = {"type": "grafana-testdata-datasource", "uid": "testdata-embedded"}
+DS_INFINITY = {"type": "yesoreyeram-infinity-datasource", "uid": "rundata"}
+DS = DS_EMBED if EMBED else DS_INFINITY
 TS_URL = "http://data/timeseries.csv"
 OCC_URL = "http://data/occupancy.csv"
 SUM_URL = "http://data/summary.json"
@@ -49,7 +63,41 @@ def _cols(names: list[tuple[str, str]]) -> list[dict]:
     return out
 
 
+def _slice_csv(src: Path, wanted: list[tuple[str, str]]) -> str:
+    """time + only the requested columns, renamed to their legend labels.
+
+    Slicing per panel keeps each embedded blob small; inlining all 15 columns in
+    all 11 panels would bloat the dashboard for no benefit.
+    """
+    import csv as _csv
+    import io
+
+    rows = list(_csv.DictReader(src.open()))
+    buf = io.StringIO()
+    w = _csv.writer(buf, lineterminator="\n")
+    w.writerow(["time", *[label for _, label in wanted]])
+    for r in rows:
+        vals = [r.get(sel, "") for sel, _ in wanted]
+        if all(v == "" for v in vals):
+            continue
+        w.writerow([r["time"], *vals])
+    return buf.getvalue()
+
+
+def embed_target(wanted: list[tuple[str, str]], src: str = "timeseries.csv") -> list[dict]:
+    return [
+        {
+            "refId": "A",
+            "datasource": DS_EMBED,
+            "scenarioId": "csv_content",
+            "csvContent": _slice_csv(DATA / src, wanted),
+        }
+    ]
+
+
 def ts_target(cols: list[tuple[str, str]], url: str = TS_URL) -> list[dict]:
+    if EMBED:
+        return embed_target(cols)
     return [
         {
             "refId": "A",
@@ -101,12 +149,18 @@ def timeseries(title: str, cols: list[tuple[str, str]], h: int, **opts) -> dict:
 
 
 def stat(title: str, selector: str, h: int, w: int, x: int, **opts) -> dict:
-    return {
-        "type": "stat",
-        "title": title,
-        "datasource": DS,
-        "gridPos": _pos(h, w, x),
-        "targets": [
+    if EMBED:
+        meta = json.loads((DATA / "summary.json").read_text())
+        targets = [
+            {
+                "refId": "A",
+                "datasource": DS_EMBED,
+                "scenarioId": "csv_content",
+                "csvContent": f"{title}\n{meta.get(selector, '')}\n",
+            }
+        ]
+    else:
+        targets = [
             {
                 "refId": "A",
                 "datasource": DS,
@@ -118,7 +172,13 @@ def stat(title: str, selector: str, h: int, w: int, x: int, **opts) -> dict:
                 "root_selector": "",
                 "columns": [{"selector": selector, "text": title, "type": opts.get("t", "number")}],
             }
-        ],
+        ]
+    return {
+        "type": "stat",
+        "title": title,
+        "datasource": DS,
+        "gridPos": _pos(h, w, x),
+        "targets": targets,
         "fieldConfig": {
             "defaults": {
                 "unit": opts.get("unit", "none"),
@@ -147,7 +207,9 @@ def state_timeline(title: str, h: int) -> dict:
         "title": title,
         "datasource": DS,
         "gridPos": _pos(h),
-        "targets": [
+        "targets": embed_target([(f"slot{i}", f"slot{i}") for i in range(8)], "occupancy.csv")
+        if EMBED
+        else [
             {
                 "refId": "A",
                 "datasource": DS,
@@ -204,22 +266,28 @@ def _iso(ms: int) -> str:
 
 
 def _time_range() -> dict:
-    """Absolute span of the exported run, with 2% padding; rolling if no export.
+    """Default window: START OF RUN -> end of run, or -> now while it is live.
 
-    Must be ISO-8601. Grafana's dashboard JSON accepts relative strings
-    ("now-6h") or ISO timestamps, but NOT epoch milliseconds -- an epoch string
-    renders the picker as "Invalid date" and every panel as "No data", with the
-    datasource itself working perfectly. Cost an entire debug cycle; hence this
-    note.
+    "All time" for this dashboard means the run, not a rolling clock: a fixed
+    `now-6h` hides the beginning of a 36h run, and a rolling window on a
+    FINISHED run drifts until the whole thing scrolls off. So the start is
+    always the first training step, and only the end is conditional.
+
+    Must be ISO-8601 or a relative string. Grafana's dashboard JSON does NOT
+    accept epoch milliseconds -- an epoch string renders the picker as
+    "Invalid date" and every panel as "No data" while the datasource works
+    perfectly. That cost a full debug cycle; hence this note.
     """
-    csv_path = Path(__file__).parent / "data" / "timeseries.csv"
+    summary = Path(__file__).parent / "data" / "summary.json"
     try:
-        lines = csv_path.read_text().splitlines()
-        first = int(lines[1].split(",")[0])
-        last = int(lines[-1].split(",")[0])
-        pad = max(30_000, int((last - first) * 0.02))
-        return {"from": _iso(first - pad), "to": _iso(last + pad)}
+        meta = json.loads(summary.read_text())
+        start = int(meta["run_start_ms"])
+        pad = 30_000
+        if meta.get("active"):
+            return {"from": _iso(start - pad), "to": "now"}
+        return {"from": _iso(start - pad), "to": _iso(int(meta["run_end_ms"]) + pad)}
     except Exception:
+        # No export yet (pass 2 builds before the run starts): follow the clock.
         return {"from": "now-6h", "to": "now"}
 
 
@@ -340,6 +408,11 @@ def build() -> dict:
         # Pass 2 (live): no CSV on disk yet at build time -> falls back to a
         # rolling window, which is what a run in flight wants.
         "time": _time_range(),
+        "timepicker": {
+            "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"],
+            "nowDelay": "",
+            "hidden": False,
+        },
         "refresh": "10s",  # live-ready: pass 2 only changes who writes the CSVs
         "schemaVersion": 39,
         "panels": panels,

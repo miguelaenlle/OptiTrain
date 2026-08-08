@@ -4,7 +4,7 @@ datasources:
     type: yesoreyeram-infinity-datasource
     uid: rundata
     access: proxy
-    isDefault: true
+    isDefault: false
     jsonData:
       # Grafana proxies the fetch, so the browser never needs to reach nginx.
       allowedHosts:
