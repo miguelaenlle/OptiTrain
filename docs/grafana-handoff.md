@@ -97,10 +97,23 @@ a correct backend response. Adding a `time` column does not help. Stat tiles
 therefore run `lastNotNull` over `timeseries.csv` columns. `summary.csv` is still
 written but unused; either wire it properly or delete it.
 
-**5. Panels below the fold do not render in a `fullPage` screenshot.** Grafana
+**5. `export.py` reads SRC but writes to `data/<run_id>/`, and they are chosen
+independently.** Without `--live`, SRC defaults to `.context/e5`. Running
+`export.py <other_run_id>` therefore read E5's logs and filed them under the
+other run's name — an 8-node trace in a 2-node run's directory, looking entirely
+plausible. A guard now refuses a replay with no matching profile, but the shape
+of the bug is worth remembering when adding sources.
+
+**6. `--live` needs the DRIVER's log, not just S3.** Epoch publications
+(`published epoch N: members [...] master=nodeM`) are printed by the supervisor
+to the driver's log, which never reaches S3. Without `--log=` the world-size and
+Gantt panels render **empty while every other panel works** — a partial failure
+that is easy to miss. `run_with_dashboard.sh` passes it automatically.
+
+**7. Panels below the fold do not render in a `fullPage` screenshot.** Grafana
 lazy-renders. Use `?viewPanel=<id>` per panel, or the image-renderer service.
 
-**6. `multinode-preempt` requires NODES ≥ 2.** The guard is not hit by
+**8. `multinode-preempt` requires NODES ≥ 2.** The guard is not hit by
 `--dry-run`, which skips supervision — a 1-node run fails only after launch.
 
 ## Open items

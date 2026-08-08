@@ -427,6 +427,25 @@ def main() -> int:
     met.setdefault("trained_seconds_total", 0.0)
     met.setdefault("steps", 0)
     met.setdefault("val_loss", 0.0)
+
+    # The run_id argument names the OUTPUT directory, while SRC is chosen
+    # independently (--live vs the replay default). A mismatch therefore files
+    # one run's artifacts under another run's name silently -- it happened, and
+    # an 8-node trace landed in a 2-node run's directory looking plausible.
+    src_id = prof.get("run_id")
+    if not src_id and "--live" not in sys.argv:
+        raise SystemExit(
+            f"refusing to export: no profile for {run_id!r} in {SRC}. A replay "
+            f"needs the run's own artifacts; without this check the exporter "
+            f"happily reads whatever run SRC holds and files it under the id you "
+            f"typed (an 8-node trace once landed in a 2-node run's directory)."
+        )
+    if src_id and src_id != run_id:
+        raise SystemExit(
+            f"refusing to export: artifacts in {SRC} belong to {src_id!r}, "
+            f"not {run_id!r}. Use --live for a run in flight, or pass the id "
+            f"whose artifacts SRC actually holds."
+        )
     steps = load_steps(SRC / "logs")
     if not steps:
         # Normal for the first ~3 minutes of a run: boxes are still booting.

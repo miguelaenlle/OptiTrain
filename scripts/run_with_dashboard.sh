@@ -39,7 +39,7 @@ if [ -z "$RUN_ID" ]; then
 fi
 
 echo "[wd] run_id=$RUN_ID"
-python3 deploy/grafana/live.py "$RUN_ID" --interval=10 "--nodes=$NODES" \
+python3 deploy/grafana/live.py "$RUN_ID" --interval=10 "--nodes=$NODES" "--log=$LOG" \
   > deploy/grafana/live.log 2>&1 &
 LIVE_PID=$!
 echo "[wd] dashboard: http://localhost:3001  (Run = $RUN_ID)"

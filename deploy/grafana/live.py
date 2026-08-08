@@ -65,6 +65,20 @@ def sync(bucket: str, run_id: str) -> None:
     )
 
 
+def copy_driver_log(log_path: str | None) -> None:
+    """Epoch publications live in the DRIVER's log, not in S3.
+
+    export.py reads epoch membership + master from SRC/run.log, and without it
+    world.csv and occupancy.csv come out empty -- the Gantt and world-size panels
+    silently render nothing while every other panel works.
+    """
+    if not log_path:
+        return
+    src = Path(log_path)
+    if src.exists():
+        (WORK / "run.log").write_text(src.read_text(errors="replace"))
+
+
 def append_status(run_id: str) -> None:
     """status.json is OVERWRITTEN in place, so its history exists only if we
     keep every poll. Without this the world-size staircase and ckpt_step series
@@ -120,6 +134,7 @@ def main() -> int:
         if a.startswith("--nodes"):
             nodes = int(a.split("=")[-1])
     once = "--once" in sys.argv
+    log_path = next((a.split("=", 1)[-1] for a in sys.argv if a.startswith("--log=")), None)
     bucket = os.environ.get("SPOT_TRAIN_BUCKET")
     if not bucket:
         raise SystemExit("SPOT_TRAIN_BUCKET unset")
@@ -130,6 +145,7 @@ def main() -> int:
     n = 0
     while True:
         sync(bucket, run_id)
+        copy_driver_log(log_path)
         append_status(run_id)
         line = regenerate(run_id, nodes)
         n += 1
