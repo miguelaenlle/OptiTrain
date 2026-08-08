@@ -63,6 +63,30 @@ checkpoint interval — node 0's log shows `steps 1..47` then a resume at 38, th
 > replacement and the segments were mis-assigned. `ckpt_step` needs no
 > reconstruction and is what the supervisor actually acts on.
 
+### Per-step granularity
+
+![E4 true per-step progress](img/e4-true-steps.png)
+
+`ckpt_step` above moves only every ~30s. This is every logged step, placed in wall
+clock by anchoring each log segment to its `training` event — those events carry
+`{node, epoch}`, so original boxes and their replacements are never confused, and
+only one clock is used. All 219 step lines are placed, none dropped, and the final
+step is 195, matching `metrics.json`.
+
+**Progress is essentially continuous.** The thin line is the current step (per
+node) and the thick line the furthest reached. There are exactly **two rollbacks
+of any size — 8 steps and 6 steps** — each bounded by the 30s checkpoint interval
+at ~3s/step. The slope flattens inside the shaded world-2 windows but never
+reaches zero.
+
+Shaded spans here are approximate: they are placed in the training-event clock,
+whereas the epoch boundaries were recorded in the status clock. Slope changes are
+the reliable indicator, not the exact edges.
+
+**For future runs: put a timestamp on the step log line.** Every reconstruction
+above exists only because `step N: loss …, Nms/step` has none, and a first
+attempt at this plot was wrong precisely because of that.
+
 ## The headline: recovery does not degrade
 
 | round | `T_restart` | world-2 window | idle after regrow | **steps banked** |
