@@ -626,7 +626,16 @@ class Supervisor:
             return
         self.st.replacing.add(node)
         self._event(f"launching replacement for node {node}")
-        aws.wait_quota_released(self.node_ids[node])
+        # Do NOT wait for the dead instance to release its quota first. That was
+        # an unconditional serialization — terminate, poll every 5s until AWS
+        # moves it out of shutting-down (tens of seconds), only then launch —
+        # paid on every replacement even when the account has ample headroom.
+        # wait_vcpu_headroom already covers the case it was guarding: it returns
+        # immediately when used+needed fits, and blocks only when it does not,
+        # which is exactly when the dead instance releasing is what makes room.
+        # Measured: 4 nodes + 1 replacement = 20 of a 64 vCPU quota. It never had
+        # to wait. It matters most in the total-loss case, where every
+        # replacement used to queue behind a corpse AND no survivor is training.
         aws.wait_vcpu_headroom(self.cfg.instance_vcpu_count(), self.cfg.vcpu_quota)
         self.st.ips.pop(node, None)  # force re-read of the replacement's fresh registration
         self.node_ids[node] = self._launch_node(node)
@@ -638,9 +647,11 @@ class Supervisor:
         for iid in self.node_ids.values():
             aws.terminate(iid)
             self.profile.instance_stopped(iid)
-        for iid in self.node_ids.values():
-            aws.wait_quota_released(iid)
         self.st = SupervisorState()
+        # Same reasoning as _launch_replacement: no unconditional per-instance
+        # quota wait. Here the whole fleet's worth of vCPUs is needed at once, so
+        # headroom genuinely may be short — and wait_vcpu_headroom blocks exactly
+        # then, and only then, instead of serializing on every corpse in turn.
         aws.wait_vcpu_headroom(
             self.cfg.node_count * self.cfg.instance_vcpu_count(), self.cfg.vcpu_quota
         )

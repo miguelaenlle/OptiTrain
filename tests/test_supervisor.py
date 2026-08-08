@@ -854,3 +854,39 @@ def test_registration_trusted_when_instance_id_is_unavailable(monkeypatch):
         pull_logs=lambda: None,
     )
     assert s._node_ip(0) == "127.0.0.1"
+
+
+def test_replacement_launches_without_waiting_for_the_corpse(monkeypatch):
+    """A replacement must not queue behind the dead instance's quota release.
+
+    _launch_replacement used to call wait_quota_released first: terminate, then
+    poll every 5s until AWS moved the box out of shutting-down (tens of seconds),
+    THEN launch — unconditionally, even with a mostly-idle quota. Measured on a
+    4-node run: 20 of a 64 vCPU quota in use, so it never had to wait at all.
+
+    wait_vcpu_headroom already covers the case it guarded — it returns at once
+    when used+needed fits and blocks only when it does not, which is precisely
+    when the corpse releasing is what creates room.
+    """
+    from orchestrator import supervisor as sup_mod
+    from orchestrator.profile import RunProfile
+
+    calls = []
+    monkeypatch.setattr(sup_mod.aws, "wait_quota_released", lambda i: calls.append(("quota", i)))
+    monkeypatch.setattr(sup_mod.aws, "wait_vcpu_headroom", lambda n, q: calls.append(("head", n)))
+    monkeypatch.setattr(sup_mod.s3_store, "read_bytes", lambda uri: None)
+
+    s = sup_mod.Supervisor(
+        OrchestratorConfig(bucket="b"),
+        RunProfile("r", kind="multinode-preempt", market="spot"),
+        run_id="r",
+        policy=PREEMPT,
+        node_ids={0: "i-0", 1: "i-dead"},
+        logs={0: {"key": "k0", "state": {"printed": 0}}, 1: {"key": "k1", "state": {"printed": 0}}},
+        launch_node=lambda n: "i-new",
+        pull_logs=lambda: None,
+    )
+    s._launch_replacement(1)
+    assert ("quota", "i-dead") not in calls, "must not serialize on the dead instance"
+    assert any(c[0] == "head" for c in calls), "headroom check must still gate the launch"
+    assert s.node_ids[1] == "i-new"
