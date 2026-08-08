@@ -31,13 +31,13 @@ DATA = Path(__file__).parent / "data"
 #
 # Embedding is right for a FINISHED run (the data is fixed and small). A live
 # run needs a real datasource -- see README "Going live".
-EMBED = True
+EMBED = False
 DS_EMBED = {"type": "grafana-testdata-datasource", "uid": "testdata-embedded"}
 DS_INFINITY = {"type": "yesoreyeram-infinity-datasource", "uid": "rundata"}
 DS = DS_EMBED if EMBED else DS_INFINITY
 TS_URL = "http://data/timeseries.csv"
 OCC_URL = "http://data/occupancy.csv"
-SUM_URL = "http://data/summary.json"
+SUM_URL = "http://data/summary.csv"
 
 # Colour-blind-safe pairs, and consistent with the static figures in docs/ so a
 # reader moving between the dashboard and the writeups sees one visual language.
@@ -174,12 +174,11 @@ def stat(title: str, selector: str, h: int, w: int, x: int, **opts) -> dict:
             {
                 "refId": "A",
                 "datasource": DS,
-                "type": "json",
+                "type": "csv",
                 "source": "url",
                 "format": "table",
                 "url": SUM_URL,
                 "parser": "backend",
-                "root_selector": "",
                 "columns": [{"selector": selector, "text": title, "type": opts.get("t", "number")}],
             }
         ]

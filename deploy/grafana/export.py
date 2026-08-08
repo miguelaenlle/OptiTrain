@@ -24,7 +24,9 @@ from bisect import bisect_right
 from pathlib import Path
 
 HERE = Path(__file__).parent
-SRC = HERE.parent.parent / ".context" / "e5"
+# --live points SRC at the polling working dir instead of a finished run's
+# artifacts, so the same transforms serve both a replay and a run in flight.
+SRC = HERE / ".live" if "--live" in sys.argv else HERE.parent.parent / ".context" / "e5"
 DATA = HERE / "data"
 
 STEP_RE = re.compile(
@@ -33,7 +35,7 @@ STEP_RE = re.compile(
 RANK_RE = re.compile(r"\[rank (\d+)\] step (\d+) .*?\| ws (\d+)(?:\s*\| t ([0-9.]+))?")
 NODE_RE = re.compile(r"boot-node(\d+)(?:-r(\d+))?\.log")
 TOKENS_PER_STEP = 480 * 1024
-TARGET_WORLD = 8
+TARGET_WORLD = next((int(a.split("=")[-1]) for a in sys.argv if a.startswith("--nodes")), 8)
 
 TS_COLUMNS = [
     "time",
@@ -55,6 +57,16 @@ TS_COLUMNS = [
     "usd",
     "usd_per_1k",
 ]
+
+
+def _load_json(*paths: Path):
+    for p in paths:
+        if p.exists():
+            try:
+                return json.loads(p.read_text())
+            except json.JSONDecodeError:
+                continue
+    return None
 
 
 def load_steps(logs: Path) -> list[dict]:
@@ -390,11 +402,23 @@ def write_degraded(epochs: list[dict], path: Path, target: int) -> int:
 def main() -> int:
     run_id = sys.argv[1] if len(sys.argv) > 1 else "multinode-preempt-1786207072"
     DATA.mkdir(parents=True, exist_ok=True)
-    prof = json.loads((SRC / f"{run_id}.profile.json").read_text())
-    met = json.loads((SRC / f"{run_id}.metrics.json").read_text())
+    # Mid-run neither profile.json nor metrics.json exists yet; both are written
+    # at the end. Everything the live panels need comes from status + logs, so
+    # missing files degrade the cost/summary tiles rather than failing the tick.
+    prof = _load_json(SRC / f"{run_id}.profile.json", SRC / "profile.json") or {
+        "cost": {"instances": []},
+        "events": [],
+        "durations": {},
+    }
+    met = _load_json(SRC / f"{run_id}.metrics.json", SRC / "metrics.json") or {}
+    met.setdefault("trained_seconds_total", 0.0)
+    met.setdefault("steps", 0)
+    met.setdefault("val_loss", 0.0)
     steps = load_steps(SRC / "logs")
     if not steps:
-        raise SystemExit("no timestamped step lines found")
+        # Normal for the first ~3 minutes of a run: boxes are still booting.
+        print("waiting: no timestamped step lines yet")
+        return 0
     st_ts, st_vals = load_status(SRC / "status_hist.jsonl")
 
     epochs = epoch_timeline(SRC / "status_hist.jsonl", SRC / "run.log")
@@ -412,17 +436,25 @@ def main() -> int:
         # runs to "now" so the window follows the fleet.
         "run_start_ms": t_start_ms,
         "run_end_ms": t_end_ms,
-        "active": False,
-        "goodput": round(met["trained_seconds_total"] / prof["durations"]["total_s"], 4),
+        "active": "--live" in sys.argv,
+        "goodput": round(met["trained_seconds_total"] / (prof["durations"].get("total_s") or 1), 4),
         "nodes_lost": sum(1 for e in prof["events"] if e["event"] == "kill"),
         "replacements": sum(1 for e in prof["events"] if e["event"] == "relaunch"),
         "whole_group_restarts": 0,
         "steps": met["steps"],
         "val_loss": round(met["val_loss"], 4),
-        "usd": round(sum(i["usd"] for i in prof["cost"]["instances"]), 2),
-        "wall_hours": round(prof["durations"]["total_s"] / 3600, 3),
+        "usd": round(sum(i.get("usd") or 0 for i in prof["cost"]["instances"]), 2),
+        "wall_hours": round((prof["durations"].get("total_s") or 0) / 3600, 3),
     }
     (DATA / "summary.json").write_text(json.dumps(summary, indent=1))
+    # Stat tiles read this, not summary.json. Infinity's JSON parser returned no
+    # usable frame for scalar selectors while its CSV parser works everywhere
+    # else on this dashboard -- one row keeps every panel on the proven path.
+    with (DATA / "summary.csv").open("w", newline="") as fh:
+        wr = csv.writer(fh)
+        keys = [k for k, v in summary.items() if isinstance(v, int | float)]
+        wr.writerow(keys)
+        wr.writerow([summary[k] for k in keys])
     print(
         f"timeseries.csv {n1} · occupancy.csv {n2} epochs · world.csv {n3} · "
         f"degraded.json {n4} regions"
