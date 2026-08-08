@@ -119,6 +119,10 @@ class OrchestratorConfig:
     # These are TRAINING's values. The inference platform never reads them —
     # see `for_inference()`, which sources INFERENCE_*-prefixed vars instead.
     bucket: str = field(default_factory=lambda: _env("SPOT_TRAIN_BUCKET", ""))
+    # Stamped on every instance as tag:project. Teardown scripts scope on it, so
+    # the two projects must never share a value — an inference box tagged
+    # spot-train would be invisible to the inference reaper and bill unnoticed.
+    project_tag: str = "spot-train"
     role_name: str = field(default_factory=lambda: _env("IAM_ROLE", "spot-train-role"))
     instance_profile: str = field(default_factory=lambda: _env("IAM_PROFILE", "spot-train-profile"))
     security_group: str = field(default_factory=lambda: _env("SECURITY_GROUP", "spot-train-sg"))
@@ -487,6 +491,7 @@ class OrchestratorConfig:
         cfg = cls()
         cfg.region = _env("INFERENCE_REGION", "us-east-2")
         cfg.bucket = _env("INFERENCE_BUCKET", "")
+        cfg.project_tag = _env("INFERENCE_PROJECT_TAG", "inference")
         cfg.role_name = _env("INFERENCE_IAM_ROLE", "inference-role")
         cfg.instance_profile = _env("INFERENCE_IAM_PROFILE", "inference-profile")
         cfg.security_group = _env("INFERENCE_SECURITY_GROUP", "inference-sg")

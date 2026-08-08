@@ -217,14 +217,37 @@ def down_local() -> None:
 # --------------------------------------------------------------------------- #
 # Cloud mode (EC2 spot workers + on-demand router)
 # --------------------------------------------------------------------------- #
-def _discover(cfg: OrchestratorConfig) -> tuple[list[dict], list[dict]]:
-    """(workers, routers) — all non-terminated fleet instances, by tag."""
+def _discover(
+    cfg: OrchestratorConfig, fleet_id: str = ""
+) -> tuple[list[dict], list[dict]]:
+    """(workers, routers) — non-terminated fleet instances, by tag.
+
+    Scoped twice on purpose. ``fleet_role`` alone matched EVERY fleet in the
+    region, so ``fleet down`` would terminate a colleague's running experiment
+    (or your own earlier one) along with its target. Now:
+
+      * ``tag:project`` must equal this config's project tag, so an inference
+        teardown can never reach a training box even if the tags were ever
+        confused;
+      * ``fleet_id``, when given, narrows to a single fleet.
+
+    Training instances never carry ``fleet_role`` at all, so this is belt and
+    braces rather than the only guard — which is the point.
+    """
     from . import aws
 
-    return (
-        aws.instances_by_tag(ROLE_TAG, "worker"),
-        aws.instances_by_tag(ROLE_TAG, "router"),
-    )
+    def scoped(role: str) -> list[dict]:
+        out = []
+        for inst in aws.instances_by_tag(ROLE_TAG, role):
+            tags = inst.get("tags", {})
+            if tags.get("project") != cfg.project_tag:
+                continue
+            if fleet_id and tags.get(FLEET_TAG) != fleet_id:
+                continue
+            out.append(inst)
+        return out
+
+    return scoped("worker"), scoped("router")
 
 
 def _require_run_with_checkpoints(cfg: OrchestratorConfig, run_id: str) -> None:
@@ -279,7 +302,12 @@ def serve_cloud(cfg: OrchestratorConfig, *, run_id: str) -> None:
         market=cfg.fleet_market,
         run_id=serve_id,
         key_name=cfg.key_name,
-        extra_tags={FLEET_TAG: serve_id, ROLE_TAG: "worker", "worker_id": serve_id},
+        extra_tags={
+            "project": cfg.project_tag,
+            FLEET_TAG: serve_id,
+            ROLE_TAG: "worker",
+            "worker_id": serve_id,
+        },
     )
     aws.wait_running(iid)
     ip = aws.public_ip(iid)
@@ -357,7 +385,7 @@ def up_cloud(cfg: OrchestratorConfig, *, workers: int, run_id: str) -> None:
         market="on-demand",
         run_id=f"{fleet_id}-router",
         key_name=cfg.key_name,
-        extra_tags={FLEET_TAG: fleet_id, ROLE_TAG: "router"},
+        extra_tags={"project": cfg.project_tag, FLEET_TAG: fleet_id, ROLE_TAG: "router"},
     )
     worker_ids = []
     for i in range(workers):
@@ -380,7 +408,12 @@ def up_cloud(cfg: OrchestratorConfig, *, workers: int, run_id: str) -> None:
                 market=cfg.fleet_market,
                 run_id=wid,
                 key_name=cfg.key_name,
-                extra_tags={FLEET_TAG: fleet_id, ROLE_TAG: "worker", "worker_id": wid},
+                extra_tags={
+                    "project": cfg.project_tag,
+                    FLEET_TAG: fleet_id,
+                    ROLE_TAG: "worker",
+                    "worker_id": wid,
+                },
             )
         )
     for iid in [router_id, *worker_ids]:
