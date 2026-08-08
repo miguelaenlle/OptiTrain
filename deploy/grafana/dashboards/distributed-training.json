@@ -1,0 +1,1391 @@
+{
+ "title": "Distributed training \u2014 fault tolerance under node loss",
+ "description": "Model: GPT-2 124M (nanoGPT, Karpathy) \u00b7 Dataset: OpenWebText \u00b7 8 x g5.xlarge \u00b7 global batch 480 sequences x 1024 tokens",
+ "uid": "dist-training",
+ "tags": [
+  "training",
+  "fault-tolerance"
+ ],
+ "timezone": "browser",
+ "editable": true,
+ "graphTooltip": 1,
+ "time": {
+  "from": "2026-08-08T16:42:48.659000Z",
+  "to": "2026-08-08T17:35:30.080000Z"
+ },
+ "refresh": "10s",
+ "schemaVersion": 39,
+ "panels": [
+  {
+   "type": "row",
+   "title": "Headline",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   },
+   "panels": []
+  },
+  {
+   "type": "stat",
+   "title": "Goodput",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "json",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/summary.json",
+     "parser": "backend",
+     "root_selector": "",
+     "columns": [
+      {
+       "selector": "goodput",
+       "text": "Goodput",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "decimals": 1,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "green"
+     },
+     "mappings": []
+    },
+    "overrides": []
+   },
+   "options": {
+    "graphMode": "none",
+    "textMode": "value",
+    "colorMode": "value",
+    "justifyMode": "center",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Nodes lost",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "json",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/summary.json",
+     "parser": "backend",
+     "root_selector": "",
+     "columns": [
+      {
+       "selector": "nodes_lost",
+       "text": "Nodes lost",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "decimals": 0,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "orange"
+     },
+     "mappings": []
+    },
+    "overrides": []
+   },
+   "options": {
+    "graphMode": "none",
+    "textMode": "value",
+    "colorMode": "value",
+    "justifyMode": "center",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Replacements",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "json",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/summary.json",
+     "parser": "backend",
+     "root_selector": "",
+     "columns": [
+      {
+       "selector": "replacements",
+       "text": "Replacements",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "decimals": 0,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "blue"
+     },
+     "mappings": []
+    },
+    "overrides": []
+   },
+   "options": {
+    "graphMode": "none",
+    "textMode": "value",
+    "colorMode": "value",
+    "justifyMode": "center",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Whole-group restarts",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "json",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/summary.json",
+     "parser": "backend",
+     "root_selector": "",
+     "columns": [
+      {
+       "selector": "whole_group_restarts",
+       "text": "Whole-group restarts",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "decimals": 0,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "red"
+     },
+     "mappings": []
+    },
+    "overrides": []
+   },
+   "options": {
+    "graphMode": "none",
+    "textMode": "value",
+    "colorMode": "value",
+    "justifyMode": "center",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Steps",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "json",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/summary.json",
+     "parser": "backend",
+     "root_selector": "",
+     "columns": [
+      {
+       "selector": "steps",
+       "text": "Steps",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "decimals": 0,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "mappings": []
+    },
+    "overrides": []
+   },
+   "options": {
+    "graphMode": "none",
+    "textMode": "value",
+    "colorMode": "value",
+    "justifyMode": "center",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Cost (USD)",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "json",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/summary.json",
+     "parser": "backend",
+     "root_selector": "",
+     "columns": [
+      {
+       "selector": "usd",
+       "text": "Cost (USD)",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "currencyUSD",
+     "decimals": 2,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "mappings": []
+    },
+    "overrides": []
+   },
+   "options": {
+    "graphMode": "none",
+    "textMode": "value",
+    "colorMode": "value",
+    "justifyMode": "center",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "1 \u00b7 The run",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 5
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Durable progress vs. current frontier",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 24,
+    "x": 0,
+    "y": 6
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "durable_step",
+       "text": "durable step (survives failure)",
+       "type": "number"
+      },
+      {
+       "selector": "current_step",
+       "text": "current step",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "linear",
+      "axisLabel": "training step"
+     },
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "World size",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 5,
+    "w": 24,
+    "x": 0,
+    "y": 16
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "nodes_training",
+       "text": "nodes training",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 15,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "stepAfter",
+      "axisLabel": "nodes"
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Work at risk \u2014 steps since the last durable checkpoint",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 5,
+    "w": 24,
+    "x": 0,
+    "y": 21
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "steps_at_risk",
+       "text": "steps at risk",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 20,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "linear",
+      "axisLabel": "steps"
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "2 \u00b7 Fleet",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 26
+   },
+   "panels": []
+  },
+  {
+   "type": "state-timeline",
+   "title": "Slot occupancy \u2014 which instance held each slot",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 24,
+    "x": 0,
+    "y": 27
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/occupancy.csv",
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "slot0",
+       "text": "slot0",
+       "type": "string"
+      },
+      {
+       "selector": "slot1",
+       "text": "slot1",
+       "type": "string"
+      },
+      {
+       "selector": "slot2",
+       "text": "slot2",
+       "type": "string"
+      },
+      {
+       "selector": "slot3",
+       "text": "slot3",
+       "type": "string"
+      },
+      {
+       "selector": "slot4",
+       "text": "slot4",
+       "type": "string"
+      },
+      {
+       "selector": "slot5",
+       "text": "slot5",
+       "type": "string"
+      },
+      {
+       "selector": "slot6",
+       "text": "slot6",
+       "type": "string"
+      },
+      {
+       "selector": "slot7",
+       "text": "slot7",
+       "type": "string"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "lineWidth": 0,
+      "fillOpacity": 90
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "down": {
+         "color": "#b9bec4",
+         "index": 0,
+         "text": "down"
+        }
+       }
+      }
+     ]
+    },
+    "overrides": []
+   },
+   "options": {
+    "mergeValues": true,
+    "showValue": "auto",
+    "alignValue": "left",
+    "rowHeight": 0.9,
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "single"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Nodes lost and replacements launched (cumulative)",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 24,
+    "x": 0,
+    "y": 37
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "nodes_lost",
+       "text": "nodes lost",
+       "type": "number"
+      },
+      {
+       "selector": "replacements",
+       "text": "replacements launched",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "stepAfter",
+      "axisLabel": "count"
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "3 \u00b7 Efficiency",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 43
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Goodput \u2014 fraction of wall clock spent training",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 24,
+    "x": 0,
+    "y": 44
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "goodput",
+       "text": "goodput",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "linear",
+      "axisLabel": ""
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "min": 0,
+     "max": 1,
+     "decimals": 3
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Step time",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 24,
+    "x": 0,
+    "y": 50
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "ms_per_step",
+       "text": "ms per step",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "linear",
+      "axisLabel": "ms"
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "4 \u00b7 Model quality",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 56
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Training loss",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 24,
+    "x": 0,
+    "y": 57
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "train_loss",
+       "text": "train loss",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "linear",
+      "axisLabel": "loss"
+     },
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Tokens processed",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 24,
+    "x": 0,
+    "y": 63
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "tokens_b",
+       "text": "tokens (billions)",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "linear",
+      "axisLabel": ""
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "5 \u00b7 Cost",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 69
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Cumulative spend",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 24,
+    "x": 0,
+    "y": 70
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "usd",
+       "text": "USD",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "linear",
+      "axisLabel": ""
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "min": 0,
+     "decimals": 2
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Unit cost",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 24,
+    "x": 0,
+    "y": 76
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "usd_per_1k",
+       "text": "USD per 1k steps",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "linear",
+      "axisLabel": ""
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "decimals": 2
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "6 \u00b7 Sentinels",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 82
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Whole-group restarts (expected: flat at zero) and degraded intervals",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 5,
+    "w": 24,
+    "x": 0,
+    "y": 83
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "whole_group_restarts",
+       "text": "whole-group restarts",
+       "type": "number"
+      },
+      {
+       "selector": "below_full_world",
+       "text": "below full world",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 15,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "stepAfter",
+      "axisLabel": ""
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  }
+ ]
+}

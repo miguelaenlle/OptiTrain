@@ -57,3 +57,6 @@ reports/
 # Local Gantt timeline exports written by `spot-orchestrate logs` (the `e` key)
 *-timeline.png
 *-events.txt
+
+# Grafana: exported run data is regenerable from S3 artifacts
+deploy/grafana/data/

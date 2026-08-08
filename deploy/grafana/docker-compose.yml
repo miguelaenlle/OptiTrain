@@ -1,0 +1,57 @@
+# Two containers, no database, no Prometheus.
+#
+# PORT / NAMESPACE: this stack is TRAINING-only and deliberately does not use
+# 3000 -- the inference platform's Grafana owns that. Same discipline as the
+# us-east-1 / us-east-2 region split: isolate by a namespace so neither project
+# can disturb the other by accident. `name:` also pins the compose project, so
+# `docker compose down` in one repo cannot stop the other's containers even
+# though both are called "grafana" on disk.
+#
+#   data     nginx serving ./data over HTTP. Serving files rather than reading
+#            them from disk is what makes pass 2 (live) a one-line change: swap
+#            this origin for an S3 URL and nothing else in the stack moves.
+#   grafana  provisioned entirely from ./provisioning + ./dashboards, so the
+#            dashboard exists on first boot with nothing to click.
+name: spot-train-grafana
+
+services:
+  data:
+    image: nginx:alpine
+    volumes:
+      - ./data:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+  # Server-side PNG export. Lets the dashboard be rendered headlessly -- both
+  # for verifying it without a browser and for regenerating README figures from
+  # the same source as the live view, so the two can never drift.
+  renderer:
+    image: grafana/grafana-image-renderer:3.11.6
+    environment:
+      ENABLE_METRICS: "false"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports:
+      # host 3001 -> container 3000; inference keeps 3000.
+      - "127.0.0.1:3001:3000"
+    environment:
+      # Anonymous admin: this is a local, read-only view of an exported run.
+      # Do NOT reuse this block if it is ever exposed beyond localhost.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_USERS_DEFAULT_THEME: light
+      GF_INSTALL_PLUGINS: yesoreyeram-infinity-datasource
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/distributed-training.json
+      GF_RENDERING_SERVER_URL: http://renderer:8081/render
+      GF_RENDERING_CALLBACK_URL: http://grafana:3000/
+    volumes:
+      - ./provisioning:/etc/grafana/provisioning:ro
+      - ./dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - data
+      - renderer
+    restart: unless-stopped
