@@ -116,6 +116,8 @@ class OrchestratorConfig:
     key_name: str = field(default_factory=lambda: _env("SSH_KEY_NAME", ""))
 
     # --- names created by `setup` (you own these) ---------------------------
+    # These are TRAINING's values. The inference platform never reads them —
+    # see `for_inference()`, which sources INFERENCE_*-prefixed vars instead.
     bucket: str = field(default_factory=lambda: _env("SPOT_TRAIN_BUCKET", ""))
     role_name: str = field(default_factory=lambda: _env("IAM_ROLE", "spot-train-role"))
     instance_profile: str = field(default_factory=lambda: _env("IAM_PROFILE", "spot-train-profile"))
@@ -461,9 +463,51 @@ class OrchestratorConfig:
             )
         return victims
 
+    @classmethod
+    def for_inference(cls) -> OrchestratorConfig:
+        """Config for the inference platform — its own region, bucket and names.
+
+        Training and inference share this class *in the same process*, so
+        precedence tricks on the generic vars are not safe: putting
+        ``AWS_REGION=us-east-2`` in a shared ``.env`` to move inference would
+        silently move **training** too, into a region whose GPU quota it does
+        not own.
+
+        So inference reads ``INFERENCE_*``-prefixed vars **only**, with its own
+        defaults, and ignores ``AWS_REGION`` / ``SPOT_TRAIN_BUCKET`` /
+        ``IAM_ROLE`` / ``IAM_PROFILE`` / ``SECURITY_GROUP`` entirely. Those keep
+        their training meaning. The two configurations cannot collide because
+        they never read the same variable.
+
+        The IAM names matter as much as the region: **IAM is global, not
+        regional**, so the us-east-1/us-east-2 split does not protect it. An
+        ``inference-*`` prefix is what keeps us off ``spot-train-role`` and
+        friends.
+        """
+        cfg = cls()
+        cfg.region = _env("INFERENCE_REGION", "us-east-2")
+        cfg.bucket = _env("INFERENCE_BUCKET", "")
+        cfg.role_name = _env("INFERENCE_IAM_ROLE", "inference-role")
+        cfg.instance_profile = _env("INFERENCE_IAM_PROFILE", "inference-profile")
+        cfg.security_group = _env("INFERENCE_SECURITY_GROUP", "inference-sg")
+
+        # Hard guard, not a convention. Training runs 8-node g5.xlarge fleets in
+        # us-east-1 and replaces preempted nodes automatically; landing there
+        # would race it for GPU capacity, and the failures look like AWS
+        # capacity errors rather than contention.
+        if cfg.region == "us-east-1" and _env("INFERENCE_ALLOW_US_EAST_1", "") != "yes":
+            raise SystemExit(
+                "Refusing to run the inference fleet in us-east-1: that region belongs "
+                "to the spot-training project (see docs/prompts/inference-agent-region.md). "
+                "Set INFERENCE_REGION=us-east-2, or INFERENCE_ALLOW_US_EAST_1=yes if you "
+                "genuinely mean it."
+            )
+        return cfg
+
     def require_bucket(self) -> None:
         if not self.bucket:
             raise SystemExit(
-                "No S3 bucket set. Put SPOT_TRAIN_BUCKET=<name> in your .env "
-                "(see .env.example) and run `setup` first."
+                "No S3 bucket set. Put SPOT_TRAIN_BUCKET=<name> in your .env for "
+                "training, or INFERENCE_BUCKET=<name> for the inference fleet "
+                "(see .env.example), and run `setup` first."
             )
