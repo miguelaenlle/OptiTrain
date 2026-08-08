@@ -190,10 +190,18 @@ func (r *S3Registry) getDoc(ctx context.Context, key string) (WorkerDoc, error) 
 	return doc, nil
 }
 
-// NewRegistry picks a backend from the URI: "s3://bucket/prefix" or a local
-// directory. An empty URI yields a directory registry that finds nothing,
-// which is exactly what the Python router does (and it warns at startup).
+// NewRegistry picks a backend from the URI:
+//
+//	dns://fleet-worker:8001    Kubernetes headless Service (in-cluster)
+//	s3://bucket/prefix         heartbeat docs in S3 (EC2, pre-Kubernetes)
+//	/some/dir                  heartbeat docs on disk (fleet up --local)
+//
+// An empty URI yields a directory registry that finds nothing, which is exactly
+// what the Python router does (and it warns at startup).
 func NewRegistry(ctx context.Context, uri string) (Registry, error) {
+	if host, port, ok := parseDNSURI(uri); ok {
+		return DNSRegistry{Host: host, Port: port}, nil
+	}
 	bucket, prefix, ok := parseS3URI(uri)
 	if !ok {
 		return DirRegistry{Dir: uri}, nil
@@ -203,6 +211,20 @@ func NewRegistry(ctx context.Context, uri string) (Registry, error) {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 	return NewS3Registry(s3.NewFromConfig(cfg), bucket, prefix), nil
+}
+
+// parseDNSURI splits "dns://host:port". The port is required: a headless
+// Service's A records carry no port, so the router would have nothing to dial.
+func parseDNSURI(uri string) (host, port string, ok bool) {
+	const scheme = "dns://"
+	if !strings.HasPrefix(uri, scheme) {
+		return "", "", false
+	}
+	host, port, found := strings.Cut(strings.TrimPrefix(uri, scheme), ":")
+	if !found || host == "" || port == "" {
+		return "", "", false
+	}
+	return host, port, true
 }
 
 func parseS3URI(uri string) (bucket, prefix string, ok bool) {

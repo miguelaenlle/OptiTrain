@@ -1,0 +1,95 @@
+# ServiceMonitor — the fleet router's Prometheus endpoint.
+#
+# This is the ONLY Prometheus scrape target the inference fleet has. The router
+# (Python `src/inference/router.py` or Go `router-go/`) serves `/metrics` on the
+# same HTTP port as `/v1/completions`; both implementations export the identical
+# metric set — `src/inference/metrics.py` and `router-go/metrics.go` are held to
+# the same contract on purpose, so one dashboard serves both A/B arms.
+#
+# Workers are NOT scraped — see servicemonitor-workers.yaml for why.
+#
+#   kubectl apply -f deploy/monitoring/servicemonitor-router.yaml
+#
+# ---------------------------------------------------------------------------
+# SELECTOR — matched against the real Service, not an assumed one
+# ---------------------------------------------------------------------------
+# deploy/k8s/base/router.yaml declares:
+#
+#   kind: Service
+#   metadata:
+#     name: fleet-router
+#     labels: { app: fleet-router }        # <- what this selector matches
+#   spec:
+#     selector: { app: fleet-router }
+#     ports:
+#       - name: http                        # <- endpoints[].port matches BY NAME
+#         port: 8000
+#         targetPort: http
+#
+# and deploy/k8s/base/kustomization.yaml adds
+# `app.kubernetes.io/part-of: optitrain-inference` to everything via
+# commonLabels. `app: fleet-router` is the stable, minimal match.
+#
+# Nothing in deploy/k8s/ pins a namespace — the overlays leave it to whatever
+# `kubectl apply -k` targets — so this uses `namespaceSelector: { any: true }`
+# rather than guessing. The ServiceMonitor itself lives in `monitoring`
+# (created by the Helm install); Prometheus adopts it from anywhere because
+# values.yaml sets serviceMonitorSelectorNilUsesHelmValues: false and the
+# chart's serviceMonitorNamespaceSelector defaults to all namespaces.
+#
+# TO RUN THE Go-vs-Python A/B (E3): give the second router's Service a distinct
+# `app` value (e.g. `app: fleet-router-py`) and widen the selector below to
+# matchExpressions In [fleet-router, fleet-router-py]. Because jobLabel is
+# `app`, the two arms then arrive as two separate `job` values and the
+# dashboard's "Router" variable separates them with no further wiring.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fleet-router
+  namespace: monitoring
+  labels:
+    # Redundant with the values.yaml override, kept so this manifest also works
+    # against a stock kube-prometheus-stack install (which only adopts
+    # ServiceMonitors labelled with the Helm release name).
+    release: optitrain
+    app.kubernetes.io/name: fleet-router
+    app.kubernetes.io/part-of: optitrain-inference
+spec:
+  # `job` on every series becomes the value of this label ON THE SERVICE, i.e.
+  # job="fleet-router". The dashboard's $job variable is populated from
+  # label_values(fleet_router_live_workers, job) — deliberately seeded off a
+  # plain Gauge, which both client libraries always export, so the variable
+  # cannot empty out after a router restart (see README, "absent is not zero").
+  jobLabel: app
+  namespaceSelector:
+    any: true
+  selector:
+    matchLabels:
+      app: fleet-router
+  endpoints:
+    - port: http # named port on the Service, not a number
+      path: /metrics
+      scheme: http
+      # 5s, not the 15s global default. The worker heartbeat TTL is 15s, and
+      # in-cluster the router re-reads the headless Service's DNS every 1s
+      # (ROUTER_POLL_SECONDS), so a pod going NotReady leaves the live set in
+      # single-digit seconds. At a 15s scrape that whole event is one sample
+      # and the fleet-membership staircase is a vertical cliff with no shape.
+      # At 5s you get several samples across the drop, which is what makes the
+      # chaos-recovery timeline readable.
+      interval: 5s
+      scrapeTimeout: 4s
+      # The router's exposition is tiny (7 metric families, fleet size O(10))
+      # and BOTH implementations register into a PRIVATE registry — no go_*, no
+      # process_*, no python_gc_*. There is nothing worth dropping, so this
+      # file carries no metricRelabelings by design. If that ever changes, drop
+      # here rather than papering over it in the dashboard.
+      honorLabels: false
+      relabelings:
+        # Keep the pod name for "which router replica" questions. There is
+        # normally exactly one (replicas: 1); this costs one label and saves a
+        # debugging session the day there are two.
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+          action: replace
