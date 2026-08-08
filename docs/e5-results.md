@@ -152,6 +152,26 @@ itself.
 trained at 11.3s/step, *and checkpointed* (`ckpt_step` 421 → 429). The most
 plausible failure mode of the whole ladder simply did not occur.
 
+## A reporting bug this run exposed (fixed)
+
+The first render of the timeline **stopped at 2239s of a 3336s run**, hiding the
+final 1097s of full-world training. The last replacements drew as `prov` plus
+world-change diamonds with no training bar — a healthy fleet rendered as a
+stalled one, which is exactly how it was first read.
+
+Cause: `_render_run_timeline` took `now = max(event ts)`, and events are emitted
+only on **state transitions** (kill, relaunch, epoch change). A run that recovers
+and then trains quietly to the end emits nothing for that stretch, so the chart
+ended at the last epoch publication.
+
+Fixed by giving `_render_run_timeline` an `end_ts` argument and passing the run's
+real completion time (launch + `durations.total_s`). The corrected chart shows
+all eight final replacements training **1064s** each, to the end.
+
+Worth stating plainly because the failure mode is asymmetric: the truncated chart
+did not look broken, it looked like *the system* was broken. Any timeline whose
+extent is derived from event data has this hazard.
+
 ## An observability gap worth fixing
 
 **`status.json` goes stale during recovery.** `updated_at` showed a 24s hole

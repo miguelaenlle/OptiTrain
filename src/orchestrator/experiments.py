@@ -723,14 +723,28 @@ def _fetch_run_events(cfg: OrchestratorConfig, run_id: str) -> list[dict]:
     return logview.parse_run_events(items)
 
 
-def _render_run_timeline(cfg: OrchestratorConfig, run_id: str, out_dir: str) -> dict:
-    """Export the event-sourced Gantt PNG + events.txt for a finished run."""
+def _render_run_timeline(
+    cfg: OrchestratorConfig, run_id: str, out_dir: str, end_ts: float | None = None
+) -> dict:
+    """Export the event-sourced Gantt PNG + events.txt for a finished run.
+
+    ``end_ts`` is where the chart stops. It matters more than it looks: events
+    are emitted on STATE TRANSITIONS only (kill, relaunch, epoch change), so a
+    run that recovers and then trains quietly to the end emits nothing for that
+    final stretch. Defaulting to the last event truncated E5 at 2239s of a
+    3336s run and dropped 1097s of full-world training — the final replacements
+    rendered as `prov` with no training bar, making a healthy fleet look stalled.
+
+    Callers that know when the run actually ended (profile durations, metrics
+    mtime) should pass it. Falls back to the last event, which is correct only
+    when the run ended ON a transition.
+    """
     from .logview import TimelineRecorder, export_gantt
 
     records = _fetch_run_events(cfg, run_id)
     if not records:
         return {"png": None, "events": None}
-    now = max(r["ts"] for r in records)
+    now = max(max(r["ts"] for r in records), end_ts or 0.0)
     rec = TimelineRecorder.from_events(records, now)
     where = export_gantt(rec, run_id, now, out_dir=out_dir, local_only=True, records=records)
     return {"png": where[0], "events": where[1] if len(where) > 1 else None}
