@@ -74,10 +74,9 @@ remaining value, since survivors then train through a replacement's boot and the
 
 ---
 
-## Checkpoint-on-membership-change
+## ~~Checkpoint-on-membership-change~~ — NOT NEEDED (E2b)
 
-If E2 shows survivors training at reduced world but the regrow still resuming
-from the pre-kill step, the reduced-world work is being discarded because the
-degraded window never outlives the checkpoint interval. Fix: write one checkpoint
-before publishing the regrow epoch, so that work always banks regardless of
-window length.
+Closed. E2b widened the degraded window from 24s to 173s, which the normal 30s
+checkpoint interval crosses several times, so reduced-world work banks on its
+own: the regrow resumed from step 68 rather than the pre-kill step 39. Re-open
+only if a future degraded window is shorter than the checkpoint interval.
