@@ -110,11 +110,26 @@ _DATA_SUBDIR = "spot-train-data"
 _DATA_MIN_FREE_KB = 50_000_000
 
 
-def _data_dir_block(cfg: OrchestratorConfig) -> str:
+def _data_dir_block(cfg: OrchestratorConfig, *, local_ckpt: bool = False) -> str:
     """Shell that picks the dataset directory and appends the resolved
     ``DATA_LOCAL_DIR`` export to the env file. The ONE place the path is decided,
     so the download (trainer) and the read (trainer/fleet worker) can never
     disagree. Runs under ``set -e``, hence the `if`/`|| true` discipline."""
+    # Only multi-node runs use the node-local tier (a single box has no peers to
+    # re-form with, so writing 1.5 GB locally every interval would be pure cost).
+    local_ckpt_block = (
+        f"""if [ "$DATA_PARENT" = "{_DATA_PARENT_FALLBACK}" ]; then
+  LOCAL_CHECKPOINT_DIR="/tmp/spot-ckpt"
+else
+  LOCAL_CHECKPOINT_DIR="$DATA_PARENT/spot-ckpt"
+fi
+mkdir -p "$LOCAL_CHECKPOINT_DIR"
+echo "export LOCAL_CHECKPOINT_DIR=\\"$LOCAL_CHECKPOINT_DIR\\"" >> /home/ubuntu/spot-train.env
+echo "[data] LOCAL_CHECKPOINT_DIR=$LOCAL_CHECKPOINT_DIR"
+"""
+        if local_ckpt
+        else ""
+    )
     return f"""
 # --- dataset location: prefer the ephemeral NVMe instance store ------------- #
 # Candidates: the DLAMI's conventional mount first, then ANY non-root filesystem
@@ -152,14 +167,21 @@ done
 DATA_LOCAL_DIR="$DATA_PARENT/{cfg.dataset}"
 mkdir -p "$DATA_LOCAL_DIR"
 echo "export DATA_LOCAL_DIR=\\"$DATA_LOCAL_DIR\\"" >> /home/ubuntu/spot-train.env
-# Log the resolved path AND free space: a future disk-full failure should be
+# The node-local checkpoint tier rides the SAME disk decision. It was pinned to
+# /tmp on the 30 GB gp3 root (~125 MB/s), where a 1.5 GB GPT-2 checkpoint takes
+# ~12s to write; on the instance-store NVMe it is ~1s. Ephemeral is correct for
+# this tier by construction — it only ever serves a survivor restarting IN
+# PLACE, so a box that dies takes its usefulness with it either way, and S3
+# remains the durable tier. Falls back to /tmp when there is no instance store
+# (t3 control plane, c7i fleet), which is exactly the old behaviour.
+{local_ckpt_block}# Log the resolved paths AND free space: a future disk-full failure should be
 # diagnosable straight from this log instead of needing a repro.
 echo "[data] DATA_LOCAL_DIR=$DATA_LOCAL_DIR"
 df -h "$DATA_LOCAL_DIR" || true
 """
 
 
-def _provision_steps(cfg: OrchestratorConfig, exports: str) -> str:
+def _provision_steps(cfg: OrchestratorConfig, exports: str, *, local_ckpt: bool = False) -> str:
     """Setup run as the ubuntu login shell (torch env active): clone the repo,
     populate the nanoGPT submodule, install deps, write a source-able env file,
     and preflight. Shared by both builders."""
@@ -202,7 +224,7 @@ git submodule update --init --depth 1
 cat > /home/ubuntu/spot-train.env <<'ENV'
 {exports}
 ENV
-{_data_dir_block(cfg)}
+{_data_dir_block(cfg, local_ckpt=local_ckpt)}
 # Preflight: fail loudly IN THIS LOG if the torch/boto3 env is wrong.
 "$VENV_PY" - <<'PY'
 import torch, boto3, numpy  # noqa: F401
@@ -957,10 +979,12 @@ def build_user_data(
         # boot/NCCL-stall/teardown are never billed. MAX_SECONDS still gets a
         # value but the trainer overrides it from this once resumed.
         env["TRAIN_BUDGET_SECONDS"] = str(max_seconds)
-        # Node-local checkpoint tier: survivors of an epoch change resume from
-        # their own disk instead of re-downloading from S3.
-        env["LOCAL_CHECKPOINT_DIR"] = "/tmp/spot-ckpt"
-    steps = _provision_steps(cfg, _export_block(env))
+        # NB: LOCAL_CHECKPOINT_DIR is deliberately NOT set here. Like
+        # DATA_LOCAL_DIR it is resolved at boot by _data_dir_block (instance-store
+        # NVMe when the box has one, /tmp otherwise) and appended to the same env
+        # file — one disk decision, one place, so the write path and the resume
+        # path can never disagree.
+    steps = _provision_steps(cfg, _export_block(env), local_ckpt=(nodes > 1))
     bucket = cfg.bucket
     logs_key = logs_key or cfg.run_logs_key(run_id)
     interval = cfg.log_stream_seconds

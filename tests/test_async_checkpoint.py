@@ -9,6 +9,7 @@ rather than fatal.
 
 from __future__ import annotations
 
+import os
 import threading
 
 import torch
@@ -122,3 +123,73 @@ def test_checkpoint_async_env_parse(monkeypatch):
     assert TrainConfig.from_env().checkpoint_async is False
     monkeypatch.setenv("CHECKPOINT_ASYNC", "false")
     assert TrainConfig.from_env().checkpoint_async is False
+
+
+# --------------------------------------------------------------------------- #
+# AsyncLocalSaver — the node-local tier's writer
+# --------------------------------------------------------------------------- #
+def test_local_saver_writes_off_the_critical_path(tmp_path):
+    """The whole point: submit() returns immediately, the file appears later.
+
+    Synchronously, a 1.5 GB torch.save sat on every checkpoint step — measured
+    at 33% of all training time on GPT-2 124M.
+    """
+    import time
+
+    from spot_train import checkpoint as ckpt
+
+    saver = ckpt.AsyncLocalSaver(str(tmp_path))
+    blob = {"version": ckpt.CKPT_VERSION, "step": 7, "payload": torch.zeros(256)}
+    t0 = time.monotonic()
+    assert saver.submit(blob, 7) is True
+    submit_s = time.monotonic() - t0
+    saver.flush()
+    assert submit_s < 0.5, "submit must hand off, not write"
+    files = [f for f in os.listdir(tmp_path) if f.endswith(".pt")]
+    assert files, "the background writer never produced a checkpoint"
+    assert torch.load(os.path.join(tmp_path, files[0]), weights_only=False)["step"] == 7
+
+
+def test_local_saver_bounds_memory_to_one_inflight(tmp_path, monkeypatch):
+    """One save in flight, like the S3 tier: a second submit is refused rather
+    than queued, so a slow disk cannot pile up 1.5 GB blobs in RAM."""
+    from spot_train import checkpoint as ckpt
+
+    gate = threading.Event()
+    real = ckpt.save_local
+
+    def slow(blob, d, step, keep=2):
+        gate.wait(5)
+        return real(blob, d, step, keep=keep)
+
+    monkeypatch.setattr(ckpt, "save_local", slow)
+    saver = ckpt.AsyncLocalSaver(str(tmp_path))
+    assert saver.submit({"step": 1}, 1) is True
+    assert saver.submit({"step": 2}, 2) is False, "second save must be refused while busy"
+    assert saver.skipped == 1
+    gate.set()
+    saver.flush()
+
+
+def test_local_saver_failure_does_not_kill_training(tmp_path, monkeypatch):
+    """A background write that throws is logged and counted; the trainer keeps
+    going on the previous checkpoint. The S3 tier is unaffected."""
+    from spot_train import checkpoint as ckpt
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ckpt, "save_local", boom)
+    logs: list[str] = []
+    saver = ckpt.AsyncLocalSaver(str(tmp_path), log=logs.append)
+    assert saver.submit({"step": 3}, 3) is True
+    saver.flush()
+    assert saver.failures == 1
+    assert any("ASYNC LOCAL save at step 3 FAILED" in m for m in logs)
+
+
+def test_local_saver_flush_is_safe_when_idle(tmp_path):
+    # flush() is called on shutdown paths that may never have submitted.
+    from spot_train import checkpoint as ckpt
+
+    ckpt.AsyncLocalSaver(str(tmp_path)).flush()

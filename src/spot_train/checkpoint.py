@@ -165,6 +165,76 @@ def save_local(blob: dict[str, Any], local_dir: str, step: int, keep: int = 2) -
     return final
 
 
+class AsyncLocalSaver:
+    """Async writer for the NODE-LOCAL tier — the same two-phase split
+    :class:`AsyncCheckpointer` uses for S3, applied to the local disk write.
+
+    Why this exists: the local tier was fully synchronous, so a 1.5 GB
+    ``torch.save`` sat on the training critical path every checkpoint. Measured
+    at 4 nodes on GPT-2 124M, that was **99s of 301.7 training-seconds — 33% of
+    all training time** (checkpoint steps showed 28.5s vs a 3.0s norm). The S3
+    tier had solved this already; the local tier just never got the same
+    treatment.
+
+    The caller still snapshots synchronously (:func:`snapshot` — a point-in-time
+    CPU copy, which is what makes the write safe while the optimizer keeps
+    mutating the live tensors). Only the serialize + write + prune moves off the
+    critical path.
+
+    One save in flight, like the S3 saver: ``submit`` returns False while busy,
+    so memory stays bounded at one blob and a slow disk cannot queue-pile. The
+    durability trade is the same and is deliberate — worst-case lost work on a
+    hard kill becomes the checkpoint interval plus one local write, and the
+    node-local tier is the FAST-RESTART tier, not the durable one (S3 is
+    durable). A survivor that loses one local checkpoint falls back to S3.
+
+    Preempt and final checkpoints stay synchronous in the trainer; call
+    :meth:`flush` first so the writer never races them.
+    """
+
+    def __init__(self, local_dir: str, *, keep: int = 2, log: Callable[[str], None] | None = None):
+        self._dir = local_dir
+        self._keep = keep
+        self._log = log or (lambda msg: print(msg, file=sys.stderr, flush=True))
+        self._thread: threading.Thread | None = None
+        self.failures = 0
+        self.skipped = 0
+
+    def busy(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def submit(self, blob: dict[str, Any], step: int) -> bool:
+        """Hand an ALREADY-SNAPSHOTTED blob to the writer. False = previous write
+        still in flight (skipped). The caller owns the snapshot because rank 0
+        may reuse the same blob it just handed to the S3 tier."""
+        if self.busy():
+            self.skipped += 1
+            return False
+        self._thread = threading.Thread(
+            target=self._write, args=(blob, step), name="ckpt-local-writer", daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def _write(self, blob: dict[str, Any], step: int) -> None:
+        try:
+            save_local(blob, self._dir, step, keep=self._keep)
+        except Exception as e:  # noqa: BLE001 — background thread: log, count, keep training
+            self.failures += 1
+            self._log(
+                f"[checkpoint] ASYNC LOCAL save at step {step} FAILED: {e!r} — "
+                "training continues; the S3 tier is unaffected"
+            )
+
+    def flush(self, timeout: float = 300.0) -> None:
+        """Wait for the in-flight local write. Called before the synchronous
+        preempt/final checkpoints and at shutdown, so a resume can never read a
+        directory that a background thread is still pruning."""
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout)
+
+
 class AsyncCheckpointer:
     """Two-phase checkpointing: the caller snapshots on its own thread
     (:func:`snapshot`, ~tens of ms), then a daemon thread serializes, uploads

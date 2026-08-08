@@ -137,7 +137,12 @@ def test_multinode_budget_env_and_done_signal():
         ud = _ud(ddp=True, nodes=2, node_index=node_index)
         # Run-level budget rides in the checkpoint; local tier for fast resume.
         assert 'export TRAIN_BUDGET_SECONDS="120"' in ud
-        assert 'export LOCAL_CHECKPOINT_DIR="/tmp/spot-ckpt"' in ud
+        # LOCAL_CHECKPOINT_DIR is resolved AT BOOT alongside DATA_LOCAL_DIR
+        # (instance-store NVMe when present, /tmp otherwise) — one disk decision
+        # in one place, so the write path and the resume path cannot disagree.
+        assert 'LOCAL_CHECKPOINT_DIR="/tmp/spot-ckpt"' in ud  # the no-instance-store fallback
+        assert 'LOCAL_CHECKPOINT_DIR="$DATA_PARENT/spot-ckpt"' in ud  # NVMe when probed
+        assert "export LOCAL_CHECKPOINT_DIR=" in ud
         # NCCL crash is the in-band backstop to the supervisor's epoch bump.
         assert 'export NCCL_TIMEOUT="20"' in ud
         assert 'export TORCH_NCCL_DUMP_ON_TIMEOUT="0"' in ud

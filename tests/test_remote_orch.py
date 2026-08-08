@@ -765,7 +765,11 @@ def test_dataset_dir_is_resolved_identically_for_every_box(tmp_path):
     # that READS it can never disagree (17GB of OpenWebText in the wrong place
     # is a disk-full boot failure on every node at once).
     cfg = _cfg(dataset="openwebtext")
+    # The dataset-resolution shell is identical everywhere; multi-node ADDS the
+    # node-local checkpoint dir on top of the same $DATA_PARENT decision, so
+    # compare against the variant each builder actually uses.
     block = bootstrap._data_dir_block(cfg)
+    mn_block = bootstrap._data_dir_block(cfg, local_ckpt=True)
     for ud in (
         bootstrap.build_user_data(cfg, run_id="r", market="spot", max_seconds=60),
         bootstrap.build_user_data(
@@ -776,9 +780,13 @@ def test_dataset_dir_is_resolved_identically_for_every_box(tmp_path):
             cfg, fleet_id="f", role="worker", worker_id="w0", run_id="r", logs_key="k", port=8001
         ),
     ):
-        assert block in ud
+        assert block in ud or mn_block in ud
         # And never as a build-time constant (it varies by instance type).
         assert 'export DATA_LOCAL_DIR="/home/ubuntu/app' not in ud
+    # The shared prefix — everything up to the DATA_LOCAL_DIR export — must be
+    # byte-identical between the two variants: one resolution point, no drift.
+    shared = block.split('echo "export DATA_LOCAL_DIR')[0]
+    assert shared and mn_block.startswith(shared)
 
 
 def test_dataset_dir_logs_path_and_free_space(tmp_path):
@@ -787,11 +795,24 @@ def test_dataset_dir_logs_path_and_free_space(tmp_path):
     assert 'df -h "$DATA_LOCAL_DIR"' in ud
 
 
-def test_node_local_checkpoints_stay_off_the_ephemeral_disk():
-    # Instance store is wiped on stop/terminate. The dataset is re-pulled from S3
-    # every boot so that's fine for it — but the node-local checkpoint tier is
-    # NOT moved (S3 stays the durable tier; /tmp is the in-place-restart tier).
+def test_node_local_checkpoints_ride_the_fast_disk():
+    # REVISED: the node-local tier now rides the same disk decision as the
+    # dataset, i.e. the instance-store NVMe when the box has one.
+    #
+    # The original reasoning was "instance store is wiped on stop/terminate, so
+    # keep checkpoints on the root volume". But this tier is NOT durable by
+    # design — it exists solely so a survivor can restart IN PLACE, and a box
+    # that dies takes /tmp with it just as surely as it takes the instance
+    # store. S3 remains the durable tier. What the old placement did buy was a
+    # 1.5 GB write at ~125 MB/s (gp3 root) instead of ~1 GB/s (NVMe): ~12s on the
+    # training critical path, every checkpoint.
+    #
+    # Still falls back to /tmp when there is no instance store, and is emitted
+    # ONLY for multi-node runs (a single box has no peers to re-form with).
     ud = bootstrap.build_user_data(
         _cfg(), run_id="r", market="spot", max_seconds=60, ddp=True, nodes=2, node_index=0
     )
-    assert 'export LOCAL_CHECKPOINT_DIR="/tmp/spot-ckpt"' in ud
+    assert 'LOCAL_CHECKPOINT_DIR="$DATA_PARENT/spot-ckpt"' in ud
+    assert 'LOCAL_CHECKPOINT_DIR="/tmp/spot-ckpt"' in ud  # fallback branch present
+    single = bootstrap.build_user_data(_cfg(), run_id="r", market="spot", max_seconds=60)
+    assert "LOCAL_CHECKPOINT_DIR" not in single

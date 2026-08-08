@@ -330,6 +330,14 @@ def train(cfg: TrainConfig) -> dict:
             log=log,
         )
 
+    # Node-local tier writer. EVERY node's local_rank 0 keeps this tier (not just
+    # the master), so it is constructed outside the `ddp.master` block above.
+    # Synchronous, it put a 1.5 GB torch.save on the critical path every
+    # checkpoint — 33% of all training time at GPT-2 124M.
+    async_local = None
+    if cfg.local_checkpoint_dir and cfg.checkpoint_async and ddp.local_rank == 0:
+        async_local = checkpoint.AsyncLocalSaver(cfg.local_checkpoint_dir, log=log)
+
     start_time = time.monotonic()
     # Epoch at loop start: the orchestrator's run profile uses this to split
     # provisioning (launch -> here: boot+clone+pip+dataset) from training (the loop).
@@ -509,18 +517,23 @@ def train(cfg: TrainConfig) -> dict:
         # a second ~tens-of-ms CPU copy.)
         if cfg.local_checkpoint_dir and distributed.broadcast_flag(ddp, submitted):  # noqa: SIM102
             if ddp.local_rank == 0:
-                checkpoint.save_local(
-                    checkpoint.snapshot(
-                        model=raw_model,
-                        optimizer=optimizer,
-                        loader=loader,
-                        step=step,
-                        trained_seconds=trained_now,
-                        scaler=scaler,
-                    ),
-                    cfg.local_checkpoint_dir,
-                    step,
+                # The snapshot (point-in-time CPU copy) stays here — it is what
+                # makes the write safe while the optimizer mutates the live
+                # tensors. Only serialize+write moves off the critical path.
+                blob = checkpoint.snapshot(
+                    model=raw_model,
+                    optimizer=optimizer,
+                    loader=loader,
+                    step=step,
+                    trained_seconds=trained_now,
+                    scaler=scaler,
                 )
+                if async_local is None or not async_local.submit(blob, step):
+                    # No async writer, or one still in flight: fall back to the
+                    # synchronous write rather than silently skipping a
+                    # checkpoint — a survivor's fast-restart tier must not
+                    # develop holes just because the disk was busy.
+                    checkpoint.save_local(blob, cfg.local_checkpoint_dir, step)
 
         # Forward progress marker for the stall watchdog: a full iteration
         # (step + eval + checkpoint) completed, so we were NOT blocked in a
@@ -559,6 +572,10 @@ def train(cfg: TrainConfig) -> dict:
     # orchestrator can treat its appearance as an unambiguous "run done". Only rank
     # 0 writes; no collective follows, so non-master ranks just shut down and exit.
     if reason == "preempt":
+        if async_local is not None:
+            # Every node's local_rank 0 has its own writer; a survivor restarting
+            # in place must not read a dir a daemon thread is still pruning.
+            async_local.flush()
         if async_ckpt is not None:
             async_ckpt.flush()  # never race the writer with the sync save below
         ckpt_count += 1
@@ -574,6 +591,8 @@ def train(cfg: TrainConfig) -> dict:
     # (freeing the CPU for rank-0's eval); torchrun waits for all ranks to finish.
     train_s = round(time.monotonic() - start_time, 2)
     listener.stop()
+    if async_local is not None:
+        async_local.flush()  # applies to every node, incl. the ranks returning below
     if not ddp.master:
         distributed.shutdown(ddp)
         return {"run_id": cfg.run_id, "stop_reason": reason, "steps": step, "resumed": resumed}
