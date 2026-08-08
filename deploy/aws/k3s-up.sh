@@ -30,6 +30,7 @@ done
 
 CLUSTER="k3s-$(date +%Y%m%d-%H%M%S)"
 S3="s3://${BUCKET}/k3s/${CLUSTER}"
+IMAGES_S3="s3://${BUCKET}/images/fleet-images.tar"
 KUBECONFIG_LOCAL=".fleet/kubeconfig-${CLUSTER}"
 
 # Ubuntu 22.04 via SSM so we never pin a stale AMI id.
@@ -50,11 +51,31 @@ SG_ID=$(aws2 ec2 describe-security-groups --filters "Name=group-name,Values=$SG_
 # control plane talks to its agents constantly.
 SUBNET="${INFERENCE_SUBNET:-}"
 if [ -z "$SUBNET" ]; then
-  SUBNET=$(aws2 ec2 describe-subnets \
-    --filters Name=map-public-ip-on-launch,Values=true Name=state,Values=available \
-    --query 'Subnets|sort_by(@,&AvailabilityZone)[0].SubnetId' --output text)
+  # Public + routable is NOT sufficient. Network ACLs are STATELESS, so a
+  # subnet can accept inbound SSH while every outbound connection hangs: the
+  # SYN leaves, and the reply — which arrives on an ephemeral port — is dropped
+  # by the ingress rules. That failure looks like a broken mirror or a dead
+  # internet gateway, and it cost us a cluster: apt, the AWS CLI download, SSM
+  # and the k3s installer all timed out on a subnet whose NACL allowed only
+  # tcp/22, tcp/5000 and tcp/8080 inbound.
+  #
+  # So require an ingress rule that allows all protocols from anywhere, and
+  # skip subnets that do not have one rather than editing someone else's ACL.
+  for cand in $(aws2 ec2 describe-subnets \
+        --filters Name=map-public-ip-on-launch,Values=true Name=state,Values=available \
+        --query 'Subnets[].SubnetId' --output text); do
+    nacl=$(aws2 ec2 describe-network-acls \
+             --filters "Name=association.subnet-id,Values=$cand" \
+             --query 'NetworkAcls[0].NetworkAclId' --output text)
+    permissive=$(aws2 ec2 describe-network-acls --network-acl-ids "$nacl" \
+      --query "NetworkAcls[0].Entries[?Egress==\`false\` && RuleAction=='allow' && Protocol=='-1' && CidrBlock=='0.0.0.0/0'].RuleNumber" \
+      --output text)
+    if [ -n "$permissive" ]; then SUBNET="$cand"; break; fi
+    note "skipping $cand — NACL $nacl blocks ephemeral inbound (outbound would hang)"
+  done
 fi
-[ -n "$SUBNET" ] && [ "$SUBNET" != "None" ] || die "no public subnet found; set INFERENCE_SUBNET"
+[ -n "$SUBNET" ] && [ "$SUBNET" != "None" ] || \
+  die "no public subnet with a permissive NACL; set INFERENCE_SUBNET explicitly"
 SUBNET_AZ=$(aws2 ec2 describe-subnets --subnet-ids "$SUBNET" \
   --query 'Subnets[0].AvailabilityZone' --output text)
 
@@ -89,6 +110,14 @@ unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install
 
 PRIVATE_IP=\$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
 PUBLIC_IP=\$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
+# Preload our images. No ECR access on this IAM user, and the nodes cannot
+# reach a private registry, so images ride in via S3: k3s imports any tarball
+# found in /var/lib/rancher/k3s/agent/images/ at startup. This must happen
+# BEFORE the k3s install, and it is the right pattern anyway -- nodes
+# self-provision instead of depending on an operator to push to them.
+mkdir -p /var/lib/rancher/k3s/agent/images
+aws s3 cp ${IMAGES_S3} /var/lib/rancher/k3s/agent/images/fleet-images.tar --region ${INF_REGION} || true
 
 # --tls-san lets kubectl connect from outside using the public IP; without it
 # the served cert only covers the private address and every call fails on name
@@ -142,6 +171,14 @@ curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awsc
 unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install
 
 until aws s3 cp ${S3}/node-token /tmp/node-token --region ${INF_REGION}; do sleep 5; done
+# Preload our images. No ECR access on this IAM user, and the nodes cannot
+# reach a private registry, so images ride in via S3: k3s imports any tarball
+# found in /var/lib/rancher/k3s/agent/images/ at startup. This must happen
+# BEFORE the k3s install, and it is the right pattern anyway -- nodes
+# self-provision instead of depending on an operator to push to them.
+mkdir -p /var/lib/rancher/k3s/agent/images
+aws s3 cp ${IMAGES_S3} /var/lib/rancher/k3s/agent/images/fleet-images.tar --region ${INF_REGION} || true
+
 PUBLIC_IP=\$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
 curl -sfL https://get.k3s.io | K3S_URL=https://${SERVER_PRIVATE}:6443 \
   K3S_TOKEN=\$(cat /tmp/node-token) \
