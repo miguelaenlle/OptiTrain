@@ -138,7 +138,14 @@ load_def() {
       EXTRA=(--env LOG_INTERVAL_STEPS=1 --env EVAL_INTERVAL_STEPS=25
              --env CHECKPOINT_INTERVAL_SECONDS=120 --env SAMPLE_INTERVAL_STEPS=200
              --env MAX_EPOCHS_WITHOUT_PROGRESS=30
-             --env "PREEMPT_SCHEDULE=480:3;960:L;1440:1,4;2400:0,1,2,3,4,5;3000:7") ;;
+             # Mass loss is the FINALE, deliberately. An earlier version fired one more
+             # kill at t+3000, only 600s after it -- but six replacements launch
+             # serially (each blocking in wait_running) and then each pays boot plus
+             # the 118s dataset pull, so a full 2->8 regrow takes 5-8 min. That kill
+             # landed mid-staircase and took out a survivor, turning the headline
+             # event into a sawtooth. Now it gets a ~21 min tail: full regrow, then
+             # sustained training back at world 8.
+             --env "PREEMPT_SCHEDULE=480:3;960:L;1440:1,4;2400:0,1,2,3,4,5") ;;
     final24h)
       KIND=multinode-preempt; NODES=8; BUDGET=82800
       EXTRA=(--env LOG_INTERVAL_STEPS=10 --env EVAL_INTERVAL_STEPS=300
