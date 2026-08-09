@@ -48,6 +48,11 @@ _TRAINER_PASSTHROUGH = (
     "MIN_LR",
     "GRAD_CLIP",
     "CHECKPOINT_ASYNC",
+    # Without this the durable-tier prune depth is stuck at TrainConfig's default
+    # on the box: pruning still happens, but the recipe cannot tune it and
+    # CHECKPOINT_KEEP=0 cannot turn it off. A knob that silently does nothing is
+    # worse than no knob.
+    "CHECKPOINT_KEEP",
     "LOG_INTERVAL_STEPS",
     "EVAL_INTERVAL_STEPS",
     "SAMPLE_INTERVAL_STEPS",

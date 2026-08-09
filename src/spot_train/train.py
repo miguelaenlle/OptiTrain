@@ -307,6 +307,7 @@ def train(cfg: TrainConfig) -> dict:
             uri=cfg.checkpoint_uri,
             trained_seconds=trained_seconds,
             scaler=scaler,
+            keep=cfg.checkpoint_keep,
         )
         # Every Nth checkpoint, prove the written artifact reconstructs a model.
         if cfg.smoke_test_every and ckpt_count % cfg.smoke_test_every == 0:
@@ -328,6 +329,7 @@ def train(cfg: TrainConfig) -> dict:
             build_model=make_model,
             sample_batch=(smoke_x.cpu(), smoke_y.cpu()),
             log=log,
+            keep=cfg.checkpoint_keep,
         )
 
     # Node-local tier writer. EVERY node's local_rank 0 keeps this tier (not just

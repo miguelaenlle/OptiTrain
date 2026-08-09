@@ -99,6 +99,14 @@ class TrainConfig:
     # this interval regardless of how fast a step is. Some spot kills give no
     # warning, so we checkpoint on a clock, not on a signal.
     checkpoint_interval_seconds: float = 30.0
+    # How many checkpoints to keep on the DURABLE (S3) tier. The node-local tier
+    # keeps 2 -- one interval of skew, so load_group_latest's group-MIN agreement
+    # can still find a step every survivor holds. The durable tier's job is
+    # different: it must survive losing every box, and it is what a replacement
+    # restores from, so it keeps more. 10 is ~20 min of history at a 120s
+    # interval (~15 GB) -- cheap insurance against the newest checkpoint being a
+    # bad one. 0 disables pruning (the pre-guardrail behaviour).
+    checkpoint_keep: int = 10
     # Node-local checkpoint tier (elastic multi-node): every node's LOCAL_RANK-0
     # keeps the latest snapshots on its own disk (DDP state is replicated, so
     # this needs no network), letting survivors of an elastic restart resume in
@@ -204,6 +212,7 @@ class TrainConfig:
             max_seconds=_env_float("MAX_SECONDS", None),
             train_budget_seconds=_env_float("TRAIN_BUDGET_SECONDS", None),
             checkpoint_interval_seconds=_env_float("CHECKPOINT_INTERVAL_SECONDS", 30.0),
+            checkpoint_keep=_env_int("CHECKPOINT_KEEP", 10),
             local_checkpoint_dir=_env_str("LOCAL_CHECKPOINT_DIR", ""),
             smoke_test_every=_env_int("SMOKE_TEST_EVERY", 1),
             checkpoint_async=_env_str("CHECKPOINT_ASYNC", "1").lower() not in ("0", "false"),

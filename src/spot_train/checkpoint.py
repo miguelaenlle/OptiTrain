@@ -62,8 +62,34 @@ def _step_of(ref: str | None) -> int:
     return int(base[len(s3_store.CHECKPOINT_PREFIX) : -len(".pt")])
 
 
+def _prune_durable(uri: str, keep: int, log=None) -> None:
+    """Trim the durable tier after a successful write.
+
+    A prune failure must NEVER end the run: the worst case of skipping it is
+    today's behaviour (an unpruned prefix), which is a cost and latency problem,
+    not a correctness one. Same discipline AsyncCheckpointer._write already
+    applies to its own exceptions.
+    """
+    try:
+        n = s3_store.prune_checkpoints(uri, keep)
+    except Exception as e:  # noqa: BLE001 — housekeeping must not kill training
+        if log:
+            log(f"[checkpoint] prune failed (non-fatal, continuing): {e!r}")
+        return
+    if n and log:
+        log(f"[checkpoint] pruned {n} old checkpoint(s), keeping {keep}")
+
+
 def save(
-    *, model, optimizer, loader, step: int, uri: str, trained_seconds: float = 0.0, scaler=None
+    *,
+    model,
+    optimizer,
+    loader,
+    step: int,
+    uri: str,
+    trained_seconds: float = 0.0,
+    scaler=None,
+    keep: int = 0,
 ) -> str:
     """Atomically persist full training state. Returns the final checkpoint ref."""
     blob: dict[str, Any] = {
@@ -81,7 +107,12 @@ def save(
     try:
         torch.save(blob, tmp_path)
         _warn_if_low_disk(os.path.getsize(tmp_path))
-        return s3_store.save_atomic(tmp_path, uri, _ckpt_name(step))
+        ref = s3_store.save_atomic(tmp_path, uri, _ckpt_name(step))
+        # AFTER the write, never before: the new checkpoint must be durable
+        # before anything old is deleted, or a crash mid-prune leaves the run
+        # with fewer checkpoints than it thinks.
+        _prune_durable(uri, keep)
+        return ref
     finally:
         # The local backend renames tmp_path away; the S3 backend uploads a
         # copy and leaves it — without this, every save leaks a checkpoint
@@ -333,8 +364,10 @@ class AsyncCheckpointer:
         build_model: Callable[[], Any] | None = None,
         sample_batch: tuple | None = None,
         log: Callable[[str], None] | None = None,
+        keep: int = 0,
     ):
         self._uri = uri
+        self._keep = keep
         self._verify_every = verify_every
         self._build_model = build_model
         self._sample_batch = sample_batch  # CPU tensors (see trainer: RNG-free eval batch)
@@ -396,6 +429,9 @@ class AsyncCheckpointer:
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
+            # Rank-0-only on the durable tier (docs/checkpoint-tiers.md), so
+            # there is no concurrent-pruner race by construction.
+            _prune_durable(self._uri, self._keep, self._log)
             if self._verify_every and count % self._verify_every == 0:
                 good = verify(ref, map_location="cpu")
                 if self._build_model is not None and self._sample_batch is not None:

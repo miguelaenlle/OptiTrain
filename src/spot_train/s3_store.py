@@ -103,6 +103,44 @@ def _s3_latest(uri: str) -> str | None:
     return f"s3://{bucket}/{best}" if best else None
 
 
+def _is_checkpoint(base: str) -> bool:
+    """A prunable checkpoint object. An in-flight atomic save carries _TMP_SUFFIX
+    and must NEVER be a prune candidate -- deleting one races the copy in
+    _s3_save and would corrupt the write we are in the middle of."""
+    return base.startswith(CHECKPOINT_PREFIX) and not base.endswith(_TMP_SUFFIX)
+
+
+def _s3_prune(uri: str, keep: int) -> int:
+    bucket, prefix = _split(uri)
+    c = _client()
+    keys: list[str] = []
+    paginator = c.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if _is_checkpoint(obj["Key"].rsplit("/", 1)[-1]):
+                keys.append(obj["Key"])
+    # _ckpt_name zero-pads the step to 12 digits, so lexicographic order IS
+    # numeric order -- the same assumption latest() already relies on.
+    doomed = sorted(keys)[:-keep]
+    for i in range(0, len(doomed), 1000):  # delete_objects caps at 1000 keys
+        c.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": k} for k in doomed[i : i + 1000]], "Quiet": True},
+        )
+    return len(doomed)
+
+
+def _local_prune(dest_dir: str, keep: int) -> int:
+    if not os.path.isdir(dest_dir):
+        return 0
+    cks = sorted(f for f in os.listdir(dest_dir) if _is_checkpoint(f))
+    doomed = cks[:-keep]
+    for f in doomed:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(dest_dir, f))
+    return len(doomed)
+
+
 # --------------------------------------------------------------------------- #
 # Public interface
 # --------------------------------------------------------------------------- #
@@ -114,6 +152,24 @@ def save_atomic(local_path: str, uri: str, name: str) -> str:
 def latest(uri: str) -> str | None:
     """Return a ref to the newest checkpoint under ``uri``, or None if empty."""
     return _s3_latest(uri) if is_s3(uri) else _local_latest(uri)
+
+
+def prune_checkpoints(uri: str, keep: int) -> int:
+    """Delete all but the ``keep`` newest checkpoints under ``uri``. Returns the
+    number removed. Mirrors save_local's prune on the DURABLE tier.
+
+    The node-local tier has always pruned to 2; S3 pruned nothing, so a long run
+    accumulated every checkpoint it ever wrote -- ~690 objects x 1.5 GB over 24h
+    at a 120s interval. Worse than the storage bill: aws.max_checkpoint_step and
+    _s3_latest both run a full paginated LIST over this prefix (every supervisor
+    tick, and every trainer resume respectively), so an unpruned prefix makes the
+    whole run monotonically slower.
+
+    keep <= 0 disables pruning entirely, for anyone who wants the old behaviour.
+    """
+    if keep <= 0:
+        return 0
+    return _s3_prune(uri, keep) if is_s3(uri) else _local_prune(uri, keep)
 
 
 def ref_for(uri: str, name: str) -> str:
