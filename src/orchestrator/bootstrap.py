@@ -1010,8 +1010,8 @@ def build_user_data(
     # poweroff + InstanceInitiatedShutdownBehavior=terminate => the instance
     # terminates (billing stops). Falls back to `shutdown` if systemd-run is absent.
     autokill = ""
-    if cfg.max_instance_lifetime_seconds > 0:
-        n = cfg.max_instance_lifetime_seconds
+    n = cfg.instance_lifetime_for(max_seconds)
+    if n > 0:
         mins = max(1, -(-n // 60))  # ceil(n/60) for the shutdown fallback (minutes)
         autokill = (
             f'echo "[autokill] self-terminate scheduled in {n}s (dead-man switch)"\n'

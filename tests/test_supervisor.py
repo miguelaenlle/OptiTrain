@@ -235,7 +235,7 @@ def test_publish_epoch_keeps_master_sticky_across_grow_back(monkeypatch):
     cfg = OrchestratorConfig(bucket="b")
     cfg.node_count = 4
     puts: dict[str, str] = {}
-    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t: puts.__setitem__(k, t))
+    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t, **kw: puts.__setitem__(k, t))
 
     s = sup_mod.Supervisor(
         cfg,
@@ -507,7 +507,7 @@ def test_supervisor_writes_status_each_tick_and_survives_failure(monkeypatch):
 
     # Tick 2: healthy write; an _event makes orchestrator.log upload too.
     puts: dict[str, str] = {}
-    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t: puts.__setitem__(k, t))
+    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t, **kw: puts.__setitem__(k, t))
     s._event("terminated node 1 (i-1)")
     s._write_status(s._observe(now=1.0, wall=101.0), 101.0)
     doc = _json.loads(puts[cfg.run_status_key("r")])
@@ -547,7 +547,7 @@ def test_replacement_attempt_is_not_born_dead(monkeypatch):
     }
     monkeypatch.setattr(sup_mod.s3_store, "read_bytes", lambda uri: docs.get(uri))
     puts: dict[str, str] = {}
-    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t: puts.__setitem__(k, t))
+    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t, **kw: puts.__setitem__(k, t))
 
     logs = {
         0: {"key": "k0", "attempt": 0, "state": {"printed": 0}},

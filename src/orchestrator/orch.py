@@ -750,10 +750,40 @@ def _invoke_experiment(cfg: OrchestratorConfig, experiment: str, *, run_id: str,
 
 
 def _reap_orphans(cfg: OrchestratorConfig, run_id: str) -> None:
-    """Terminate training boxes left over from a previous agent attempt. They
-    are polling an epoch.json nobody advances any more, and every one of them
-    holds vCPU quota the replacement fleet needs."""
-    orphans = fleet_of(cfg, run_id)
+    """Terminate training boxes that are NOT in the current epoch's membership.
+
+    This used to terminate the WHOLE fleet on every restarted attempt, on the
+    reasoning that the boxes are polling an epoch.json nobody advances any more.
+    That is true only of boxes outside the published membership. A member keeps
+    TRAINING while the supervisor is gone -- sidecars run static torchrun against
+    the last published epoch doc, and the supervisor's authority lives in S3, not
+    in its memory -- so a supervisor crash is survivable at zero cost, and the
+    old behaviour turned it into a full fleet rebuild: ~4 minutes of 8-node boot
+    plus every step since the last checkpoint, every single restart.
+
+    Since a supervisor exception is the most likely failure on a long run (an
+    unhandled InsufficientInstanceCapacity from a replacement launch is enough),
+    "reboot the control plane" has to be cheap. Now it is: members are re-adopted
+    and only genuine orphans are reaped.
+    """
+    fleet = fleet_of(cfg, run_id)
+    if not fleet:
+        return
+    # The epoch doc is the authority on membership. Its `members` are
+    # [{node, ip, rank}] and carry no instance id, so match on PRIVATE IP --
+    # the same value the box registered and the same one torchrun dials.
+    doc = aws.get_json(cfg.bucket, cfg.run_epoch_key(run_id)) or {}
+    member_ips = {m.get("ip") for m in (doc.get("members") or []) if m.get("ip")}
+    # No epoch published yet => nothing has been adopted, so every box is an
+    # orphan and the old whole-fleet behaviour is exactly right.
+    adopted = [i for i in fleet if i.get("private_ip") and i["private_ip"] in member_ips]
+    orphans = [i for i in fleet if i not in adopted]
+    if adopted:
+        print(
+            f"[agent] re-adopting {len(adopted)} box(es) still in epoch "
+            f"{doc.get('epoch', '?')} — they kept training while the supervisor was gone",
+            flush=True,
+        )
     if not orphans:
         return
     print(f"[agent] reaping {len(orphans)} orphaned box(es) from the previous attempt", flush=True)

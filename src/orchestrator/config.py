@@ -26,6 +26,12 @@ def _env_float(name: str, default: float) -> float:
     return float(v) if v not in (None, "") else default
 
 
+# Sentinel victim meaning "whichever node is master when this kill fires".
+# Resolved by the supervisor at fire time, not at schedule-build time: the
+# master moves (elect_master is sticky to a SURVIVOR), so a hardcoded index
+# would quietly stop testing re-election after the first kill.
+LEADER_VICTIM = -1
+
 # Trainer knobs the orchestrator relays verbatim (only when set in ITS
 # environment): the convergence recipe + periodic eval/sample cadence. The
 # orchestrator never branches on these values, so they stay untyped strings —
@@ -97,6 +103,11 @@ _ORCH_RELAY_ENV = (
     "PREEMPT_AFTER",
     "PREEMPT_CHECKPOINT_SECONDS",
     "PREEMPT_VICTIMS",
+    # Without these the REMOTE control plane silently falls back to the
+    # evenly-spaced single-victim schedule -- i.e. the mass-loss event just
+    # would not happen, and the run would look like it worked.
+    "PREEMPT_SCHEDULE",
+    "INSTANCE_LIFETIME_SLACK_SECONDS",
     "SMOKE_TEST_EVERY",
     "SAMPLE_PROMPTS",
     "DDP_NPROC_PER_NODE",
@@ -179,6 +190,14 @@ class OrchestratorConfig:
     # run ends far sooner, so this only ever catches orphans.
     max_instance_lifetime_seconds: int = field(
         default_factory=lambda: _env_int("MAX_INSTANCE_LIFETIME_SECONDS", 0)
+    )
+    # Slack added to a run's own budget when DERIVING the dead-man timer: boot,
+    # the dataset pull and the post-budget eval/sample tail all happen outside
+    # TRAIN_BUDGET_SECONDS. 1h is generous against a measured ~4min boot + ~2min
+    # dataset, because a timer that fires DURING a healthy run is far worse than
+    # one that fires late.
+    instance_lifetime_slack_seconds: int = field(
+        default_factory=lambda: _env_int("INSTANCE_LIFETIME_SLACK_SECONDS", 3600)
     )
     # Deep Learning AMI. If AMI_ID is set we use it verbatim; otherwise we resolve
     # the newest Amazon-owned image matching this name filter via DescribeImages.
@@ -287,6 +306,10 @@ class OrchestratorConfig:
     # (kill node 1 first, then node 0). Any node is killable — the epoch after a
     # kill just names a new lowest-index master. Empty = always the last node.
     preempt_victims: str = field(default_factory=lambda: _env("PREEMPT_VICTIMS", ""))
+    # Explicit chaos schedule; when set it WINS over preempt_victims/count. See
+    # preempt_schedule() for the grammar. This is what lets a single event kill
+    # several nodes at once.
+    preempt_schedule_spec: str = field(default_factory=lambda: _env("PREEMPT_SCHEDULE", ""))
 
     # --- DDP experiment (spot-orchestrate ddp) ------------------------------
     # Ranks torchrun launches on the box. 0 (default) = auto: one rank per GPU on
@@ -585,6 +608,21 @@ class OrchestratorConfig:
     def run_status_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/status.json"
 
+    def run_status_prefix(self, run_id: str) -> str:
+        """Per-tick status objects — the DURABLE history status.json cannot be.
+
+        status.json is overwritten in place, so fleet history existed only while
+        a laptop was awake to poll it. These are written by the supervisor, so an
+        offline laptop loses nothing: `aws s3 sync` on this prefix rebuilds the
+        whole world-size / occupancy timeline after the fact.
+        """
+        return f"{self.run_prefix}/{run_id}/status/"
+
+    def run_status_tick_key(self, run_id: str, when: float) -> str:
+        # Millisecond, zero-padded: lexicographic order is chronological order,
+        # which is what makes `s3 sync` + a sorted read reconstruct the timeline.
+        return f"{self.run_status_prefix(run_id)}{int(when * 1000):015d}.json"
+
     def run_status_uri(self, run_id: str) -> str:
         return f"s3://{self.bucket}/{self.run_status_key(run_id)}"
 
@@ -758,6 +796,108 @@ class OrchestratorConfig:
                 f"PREEMPT_VICTIMS contains {bad} — node indices must be in [0, {self.node_count})"
             )
         return victims
+
+    def instance_lifetime_for(self, max_seconds: int) -> int:
+        """Seconds after boot at which a training box self-terminates.
+
+        Both dead-man switches shipped defaulting to 0 (OFF), which is the wrong
+        default for a 24h run: if the control plane dies and a node then fails,
+        survivors' torchrun crash-loops, sidecars exhaust MAX_EPOCH_CRASHES and
+        exit "leaving the box up for the watchdog" -- a watchdog that no longer
+        exists. The fleet then idles at full GPU rate until a human notices.
+
+        An explicit MAX_INSTANCE_LIFETIME_SECONDS still wins; otherwise derive
+        from the run's own budget plus slack.
+
+        KNOWN LIMITATION, do not paper over it: the timer starts at THIS box's
+        boot. A replacement launched at hour 20 of a 24h run gets a full-length
+        timer from its own boot, so this is a backstop for the
+        fleet-abandoned-early case, not a tight bound late in a run. The proper
+        fix is a renewable lease in status.json, deliberately out of scope.
+        """
+        if self.max_instance_lifetime_seconds > 0:
+            return self.max_instance_lifetime_seconds
+        if max_seconds <= 0:
+            return 0
+        return max_seconds + self.instance_lifetime_slack_seconds
+
+    def preempt_schedule(self) -> list[tuple[float, int]]:
+        """Explicit chaos schedule: [(seconds_after_train_start, victim), ...].
+
+        PREEMPT_VICTIMS gives ONE victim per round at evenly spaced times, so it
+        cannot express a simultaneous multi-node loss -- which is why
+        scripts/e4_rolling_pairs.py exists as a bespoke driver. The 24h run needs
+        a simultaneous loss of 6 of 8 (E5 survived 7 of 8), so that capability
+        belongs in the main driver, not in a one-off script.
+
+        Format -- semicolon-separated events, each ``<seconds>:<victims>``:
+
+            PREEMPT_SCHEDULE="480:3;960:L;1440:1,4;2400:0,1,2,3,4,5"
+
+        Victims are node indices (stable slots -- a replacement re-takes its
+        index), or ``L`` for whichever node is master WHEN THE KILL FIRES. L
+        matters because the master moves: elect_master is sticky to a survivor,
+        so after any kill the leader may no longer be node 0, and a hardcoded
+        index would quietly stop testing re-election.
+
+        Several victims at the SAME timestamp fire in one supervisor tick -- the
+        supervisor already collects due kills into a set, so simultaneity needs
+        nothing beyond expressing it here.
+
+        Empty => fall back to the PREEMPT_VICTIMS/PREEMPT_COUNT behaviour.
+        """
+        raw = (self.preempt_schedule_spec or "").strip()
+        if not raw:
+            return []
+        out: list[tuple[float, int]] = []
+        for event in raw.split(";"):
+            event = event.strip()
+            if not event:
+                continue
+            if ":" not in event:
+                raise SystemExit(
+                    f"PREEMPT_SCHEDULE event {event!r} — expected '<seconds>:<victims>', "
+                    f"e.g. '1440:1,4' or '960:L'"
+                )
+            when, victims = event.split(":", 1)
+            try:
+                secs = float(when)
+            except ValueError:
+                raise SystemExit(
+                    f"PREEMPT_SCHEDULE event {event!r} — {when!r} is not a number"
+                ) from None
+            for v in victims.split(","):
+                v = v.strip()
+                if v.upper() == "L":
+                    out.append((secs, LEADER_VICTIM))
+                    continue
+                try:
+                    idx = int(v)
+                except ValueError:
+                    raise SystemExit(
+                        f"PREEMPT_SCHEDULE event {event!r} — victim {v!r} must be a "
+                        f"node index or 'L'"
+                    ) from None
+                if not 0 <= idx < self.node_count:
+                    raise SystemExit(
+                        f"PREEMPT_SCHEDULE event {event!r} — node index {idx} outside "
+                        f"[0, {self.node_count})"
+                    )
+                out.append((secs, idx))
+        # A kill group that removes EVERY node is a total loss, not a chaos
+        # event: there is no survivor to keep training and the run becomes a
+        # whole-group restart. Catch it here rather than three minutes into a
+        # billed run.
+        by_time: dict[float, int] = {}
+        for secs, _v in out:
+            by_time[secs] = by_time.get(secs, 0) + 1
+        for secs, n in sorted(by_time.items()):
+            if n >= self.node_count:
+                raise SystemExit(
+                    f"PREEMPT_SCHEDULE kills {n} of {self.node_count} nodes at t+{secs:.0f}s — "
+                    f"that is a total loss with no survivors, not a preemption. Leave at least one."
+                )
+        return sorted(out)
 
     # Whole-group-restart floor, in EPOCHS with no checkpoint progress. One
     # preemption publishes two epochs (shrink, then grow), so the default 6 is

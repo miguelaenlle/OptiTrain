@@ -175,10 +175,39 @@ def test_autokill_scheduled_when_lifetime_set():
     assert ud.index("spot-autokill") < ud.index("sudo -u ubuntu")
 
 
-def test_no_autokill_by_default():
+def test_autokill_is_derived_from_the_budget_by_default():
+    """G2: the dead-man switch used to default to OFF, which is the wrong default
+    for a long run -- if the control plane dies and a node then fails, sidecars
+    give up "leaving the box up for the watchdog" and the fleet idles at full GPU
+    rate until a human notices. Unset now means budget + slack, not none."""
     cfg = OrchestratorConfig(bucket="test-bucket", max_instance_lifetime_seconds=0)
     ud = bootstrap.build_user_data(cfg, run_id="run-1", market="on-demand", max_seconds=120)
+    n = 120 + cfg.instance_lifetime_slack_seconds
+    assert f"systemd-run --on-active={n}s --unit=spot-autokill" in ud
+
+
+def test_explicit_lifetime_beats_the_derivation():
+    cfg = OrchestratorConfig(
+        bucket="test-bucket", max_instance_lifetime_seconds=7200, instance_lifetime_slack_seconds=1
+    )
+    assert cfg.instance_lifetime_for(999_999) == 7200
+
+
+def test_no_autokill_without_a_budget_to_derive_from():
+    """max_seconds<=0 means the caller has no budget to reason about (prep/bake
+    boxes carry their own timer), so emit nothing rather than guess."""
+    cfg = OrchestratorConfig(bucket="test-bucket", max_instance_lifetime_seconds=0)
+    assert cfg.instance_lifetime_for(0) == 0
+    ud = bootstrap.build_user_data(cfg, run_id="run-1", market="on-demand", max_seconds=0)
     assert "autokill" not in ud
+
+
+def test_derived_timer_outlives_the_budget():
+    """A timer that fires DURING a healthy run is far worse than one that fires
+    late: it would reap a fleet that is still training."""
+    cfg = OrchestratorConfig(bucket="test-bucket", max_instance_lifetime_seconds=0)
+    budget = 82_800  # the 24h run
+    assert cfg.instance_lifetime_for(budget) > budget + 600
 
 
 def test_autokill_script_still_parses(tmp_path):

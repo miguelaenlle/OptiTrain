@@ -94,6 +94,17 @@ def main() -> None:
         default=None,
         help="instance market (default: inferred from the run id's kind)",
     )
+    ext_parser = sub.add_parser("extend", parents=[common])
+    ext_parser.add_argument(
+        "run_id", help="completed multi-node run to continue from its checkpoint"
+    )
+    ext_parser.add_argument(
+        "--budget",
+        type=int,
+        required=True,
+        help="new TOTAL training seconds (not an increment) — budget-in-checkpoint "
+        "computes TRAIN_BUDGET_SECONDS minus trained_seconds",
+    )
     cmp_parser = sub.add_parser("compare", parents=[common])
     cmp_parser.add_argument("run_ids", nargs="+", help="run ids to compare (2+ recommended)")
 
@@ -456,6 +467,8 @@ def main() -> None:
         experiments.run_scaling_preempt(cfg)
     elif args.command == "resume":
         experiments.run_resume(cfg, args.run_id, budget=args.budget, market=args.market)
+    elif args.command == "extend":
+        experiments.run_extend(cfg, args.run_id, budget=args.budget)
     elif args.command == "compare":
         from . import compare
 

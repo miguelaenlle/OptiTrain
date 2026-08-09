@@ -10,8 +10,8 @@
  "editable": true,
  "graphTooltip": 1,
  "time": {
-  "from": "2026-08-08T23:24:11Z",
-  "to": "2026-08-08T23:36:40.108000Z"
+  "from": "2026-08-09T01:46:10Z",
+  "to": "now"
  },
  "timepicker": {
   "refresh_intervals": [
@@ -37,20 +37,6 @@
     "hide": true,
     "name": "Annotations & Alerts",
     "type": "dashboard"
-   },
-   {
-    "datasource": {
-     "type": "grafana-testdata-datasource",
-     "uid": "testdata-embedded"
-    },
-    "enable": true,
-    "hide": false,
-    "iconColor": "rgba(255, 96, 96, 0.35)",
-    "name": "degraded world",
-    "target": {
-     "scenarioId": "csv_content",
-     "csvContent": "time,timeEnd,text\n1786231848034,1786232002098,degraded\n"
-    }
    }
   ]
  },
@@ -60,12 +46,17 @@
     "name": "run",
     "label": "Run",
     "type": "custom",
-    "query": "multinode-preempt-1786231481,multinode-preempt-1786227708,multinode-preempt-1786207072",
+    "query": "valfix-1786240000,multinode-preempt-1786231481,multinode-preempt-1786227708,multinode-preempt-1786207072,multinode-1785795454",
     "options": [
+     {
+      "text": "valfix-1786240000",
+      "value": "valfix-1786240000",
+      "selected": true
+     },
      {
       "text": "multinode-preempt-1786231481",
       "value": "multinode-preempt-1786231481",
-      "selected": true
+      "selected": false
      },
      {
       "text": "multinode-preempt-1786227708",
@@ -76,11 +67,16 @@
       "text": "multinode-preempt-1786207072",
       "value": "multinode-preempt-1786207072",
       "selected": false
+     },
+     {
+      "text": "multinode-1785795454",
+      "value": "multinode-1785795454",
+      "selected": false
      }
     ],
     "current": {
-     "text": "multinode-preempt-1786231481",
-     "value": "multinode-preempt-1786231481",
+     "text": "valfix-1786240000",
+     "value": "valfix-1786240000",
      "selected": true
     },
     "includeAll": false,

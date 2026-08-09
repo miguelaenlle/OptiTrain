@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from spot_train import events, s3_store
 
 from . import aws
-from .config import OrchestratorConfig
+from .config import LEADER_VICTIM, OrchestratorConfig
 from .profile import RunProfile
 
 # --------------------------------------------------------------------------- #
@@ -471,7 +471,28 @@ class Supervisor:
                 ckpt_step=self.st.ckpt_step,
                 done=done,
             )
-            aws.put_text(self.cfg.bucket, self.status_key, json.dumps(doc))
+            body = json.dumps(doc)
+            aws.put_text(self.cfg.bucket, self.status_key, body)
+            # HISTORY, not just current state. status.json is overwritten in
+            # place, so the world-size staircase and the Gantt exist only if
+            # something captured every tick -- and today that something is
+            # live.py polling from a LAPTOP. Close the lid for an hour and that
+            # hour of fleet history is unrecoverable: it was never written down.
+            # Step/loss/cost survive (node logs are append-only in S3); world
+            # size and slot occupancy do not.
+            #
+            # The supervisor IS the writer, so it publishes each tick as its own
+            # immutable object and `aws s3 sync` on the prefix reconstructs the
+            # full history from anywhere. One object per tick rather than one
+            # growing jsonl: rewriting a 13 MB file every 10s would be ~78 GB of
+            # PUTs over a 24h run.
+            if doc.get("updated_at") != (self._last_status or {}).get("updated_at"):
+                aws.put_text(
+                    self.cfg.bucket,
+                    self.cfg.run_status_tick_key(self.run_id, wall),
+                    body,
+                    quiet=True,
+                )
             self._last_status = doc
             # Feed the live dashboard the state only the supervisor has. The
             # profile parses trainer logs, so without this push `ckpt_step` --
@@ -547,6 +568,16 @@ class Supervisor:
             elapsed = now - self._train_start
             for i, (secs, victim) in enumerate(self.kill_schedule):
                 if elapsed >= secs and i not in self._fired_kills:
+                    # LEADER_VICTIM resolves HERE, not when the schedule was
+                    # built: elect_master is sticky to a survivor, so after any
+                    # kill the master may no longer be node 0 and a fixed index
+                    # would stop exercising re-election. If there is no master
+                    # yet, leave the entry unfired so it lands on a later tick
+                    # rather than being silently dropped.
+                    if victim == LEADER_VICTIM:
+                        if self.st.master is None:
+                            continue
+                        victim = self.st.master
                     due.add(victim)
                     self._fired_kills.add(i)  # fire this entry exactly once
 

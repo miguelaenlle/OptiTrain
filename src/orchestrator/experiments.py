@@ -612,6 +612,84 @@ def run_multinode(cfg: OrchestratorConfig, **kw) -> dict | None:
     )
 
 
+SUPERVISED_KINDS = ("multinode", "multinode-shrink", "multinode-preempt")
+
+
+def run_extend(cfg: OrchestratorConfig, run_id: str, *, budget: int, **kw) -> dict | None:
+    """Continue a COMPLETED supervised run from its last checkpoint.
+
+    Two uses, and the first is why this exists: if a 24h run dies at hour 18 from
+    a small bug, patch and continue instead of writing off the run. The second is
+    buying a longer result later if credits allow.
+
+    ``spot-orchestrate resume`` cannot do this. It derives
+    ``kind = run_id.split("-", 1)[0]``, which maps ``multinode-preempt-…`` to
+    ``"multinode"`` and then raises "resume handles single-box runs" — it is a
+    single-box salvage tool. We take the kind off the RIGHT instead, and hand the
+    existing run_id to ``_run_supervised``, which already accepts one.
+
+    ``budget`` is the new TOTAL, not an increment. Budget-in-checkpoint computes
+    ``TRAIN_BUDGET_SECONDS - trained_seconds``, so extending 24h->36h means
+    passing 125000, not 42200. Passing an increment would silently stop the run
+    almost immediately, so it is asserted rather than trusted.
+    """
+    kind = run_id.rsplit("-", 1)[0]
+    if kind not in SUPERVISED_KINDS:
+        raise SystemExit(
+            f"extend handles supervised multi-node runs ({', '.join(SUPERVISED_KINDS)}); "
+            f"{run_id!r} looks like kind {kind!r}"
+        )
+    ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
+    metrics_key = cfg.run_metrics_key(run_id)
+    profile_key = cfg.run_profile_key(run_id)
+
+    trained = 0.0
+    if not aws.is_dry_run():
+        if not aws.any_object_under(cfg.bucket, ckpt_prefix):
+            raise SystemExit(
+                f"no checkpoints under s3://{cfg.bucket}/{ckpt_prefix} — nothing to extend from"
+            )
+        met = aws.get_json(cfg.bucket, metrics_key) or {}
+        trained = float(met.get("trained_seconds_total") or 0.0)
+        if trained and budget <= trained:
+            raise SystemExit(
+                f"--budget {budget}s is not more than the {trained:.0f}s already trained. "
+                f"It is the new TOTAL, not an increment: to add 10h to a 23h run pass "
+                f"{int(trained) + 36000}, not 36000."
+            )
+        # Archive BEFORE re-entering. A completed run has both documents, the new
+        # segment overwrites both, and that destroys the result already paid for.
+        # It is also what unblocks re-entry: orch.run_agent treats an existing
+        # metrics.json as "nothing to do".
+        seg = 1
+        while aws.object_exists(cfg.bucket, f"{metrics_key[:-5]}-seg{seg}.json"):
+            seg += 1
+        for key in (metrics_key, profile_key):
+            doc = aws.get_json(cfg.bucket, key)
+            if doc is None:
+                continue
+            archived = f"{key[:-5]}-seg{seg}.json"
+            aws.put_text(cfg.bucket, archived, json.dumps(doc, indent=2))
+            aws.delete_object(cfg.bucket, key)
+            print(f"[extend] archived {key} -> {archived}", file=sys.stderr)
+        print(
+            f"[extend] {run_id}: {trained:.0f}s trained, new total {budget}s "
+            f"(+{budget - trained:.0f}s) — segment {seg + 1}",
+            file=sys.stderr,
+        )
+
+    replace = kind != "multinode-shrink"
+    return _run_supervised(
+        cfg,
+        kind=kind,
+        budget=budget,
+        replace_on_loss=replace,
+        kill_schedule=cfg.preempt_schedule() if kind == "multinode-preempt" else [],
+        run_id=run_id,
+        **kw,
+    )
+
+
 def run_multinode_shrink(cfg: OrchestratorConfig, **kw) -> dict | None:
     """The minimal elastic validation: ONE kill, NO replacement. The supervisor
     publishes a shrink epoch; survivors must re-form at N-1 and finish the run on
@@ -637,12 +715,18 @@ def run_multinode_preempt(cfg: OrchestratorConfig, **kw) -> dict | None:
     each followed by a replacement that rejoins at the next epoch. Same profile
     marks as before (kill -> shrink_resume -> relaunch -> full_world), so the W&B
     world-size staircase, degraded phase, and goodput carry over unchanged."""
-    victims = cfg.preempt_victim_schedule()
     total = cfg.train_total_seconds
-    interval = cfg.preempt_after_seconds or math.ceil(total / (cfg.preempt_count + 1))
-    # Kill i fires `interval` seconds after the PREVIOUS one resumed; the
-    # supervisor clock is seconds-since-train-start, so space them by interval.
-    schedule = [((k + 1) * interval, victims[k]) for k in range(cfg.preempt_count)]
+    # An explicit PREEMPT_SCHEDULE wins: it is the only form that can express a
+    # SIMULTANEOUS multi-node loss (several victims sharing one timestamp), which
+    # the evenly-spaced victim list cannot. Without it, a mass-loss event needs a
+    # bespoke driver -- which is exactly what scripts/e4_rolling_pairs.py is.
+    schedule = cfg.preempt_schedule()
+    if not schedule:
+        victims = cfg.preempt_victim_schedule()
+        interval = cfg.preempt_after_seconds or math.ceil(total / (cfg.preempt_count + 1))
+        # Kill i fires `interval` seconds after the PREVIOUS one resumed; the
+        # supervisor clock is seconds-since-train-start, so space them by interval.
+        schedule = [((k + 1) * interval, victims[k]) for k in range(cfg.preempt_count)]
     return _run_supervised(
         cfg,
         kind="multinode-preempt",

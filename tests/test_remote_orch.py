@@ -816,3 +816,78 @@ def test_node_local_checkpoints_ride_the_fast_disk():
     assert 'LOCAL_CHECKPOINT_DIR="/tmp/spot-ckpt"' in ud  # fallback branch present
     single = bootstrap.build_user_data(_cfg(), run_id="r", market="spot", max_seconds=60)
     assert "LOCAL_CHECKPOINT_DIR" not in single
+
+
+# --------------------------------------------------------------------------- #
+# G4-lite: a supervisor restart must RE-ADOPT a healthy fleet, not rebuild it
+# --------------------------------------------------------------------------- #
+def _member_node(iid, run_id, ip):
+    n = _node(iid, run_id)
+    n["private_ip"] = ip
+    return n
+
+
+def _epoch_doc(*ips):
+    """What supervisor.epoch_doc actually writes: members are dicts carrying an
+    ip, NOT node indices, and there is no instance id anywhere in the document."""
+    return {
+        "epoch": 4,
+        "members": [{"node": i, "ip": ip, "rank": i} for i, ip in enumerate(ips)],
+        "node_count": len(ips),
+        "master_addr": ips[0],
+        "master_port": 29404,
+    }
+
+
+def test_reap_readopts_boxes_still_in_the_published_epoch(monkeypatch):
+    """The fleet keeps TRAINING while the supervisor is gone -- sidecars run
+    static torchrun against the last published epoch doc. Terminating members on
+    restart threw away a healthy 8-node fleet plus every step since the last
+    checkpoint, on the most likely failure a long run has."""
+    cfg = _cfg()
+    run_id = "multinode-preempt-7"
+    fake = FakeAws(
+        instances={
+            ("Name", f"spot-train-{run_id}"): [
+                _member_node("i-a", run_id, "10.0.0.1"),
+                _member_node("i-b", run_id, "10.0.0.2"),
+            ]
+        },
+        docs={cfg.run_epoch_key(run_id): _epoch_doc("10.0.0.1", "10.0.0.2")},
+    )
+    monkeypatch.setattr(orch, "aws", fake)
+    orch._reap_orphans(cfg, run_id)
+    assert fake.terminated == [], "re-adoptable members were terminated"
+
+
+def test_reap_still_kills_boxes_outside_the_epoch(monkeypatch):
+    """A box that is genuinely orphaned polls an epoch nobody advances and holds
+    vCPU quota the replacement fleet needs. Those must still go."""
+    cfg = _cfg()
+    run_id = "multinode-preempt-7"
+    fake = FakeAws(
+        instances={
+            ("Name", f"spot-train-{run_id}"): [
+                _member_node("i-member", run_id, "10.0.0.1"),
+                _member_node("i-orphan", run_id, "10.0.9.9"),
+            ]
+        },
+        docs={cfg.run_epoch_key(run_id): _epoch_doc("10.0.0.1")},
+    )
+    monkeypatch.setattr(orch, "aws", fake)
+    orch._reap_orphans(cfg, run_id)
+    assert fake.terminated == ["i-orphan"]
+
+
+def test_reap_takes_everything_when_no_epoch_was_ever_published(monkeypatch):
+    """Nothing was adopted, so the old whole-fleet behaviour is exactly right --
+    failing toward reaping keeps an un-placeable box from holding quota."""
+    cfg = _cfg()
+    run_id = "multinode-preempt-7"
+    fake = FakeAws(
+        instances={("Name", f"spot-train-{run_id}"): [_member_node("i-a", run_id, "10.0.0.1")]},
+        docs={},
+    )
+    monkeypatch.setattr(orch, "aws", fake)
+    orch._reap_orphans(cfg, run_id)
+    assert fake.terminated == ["i-a"]
