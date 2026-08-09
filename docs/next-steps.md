@@ -37,6 +37,27 @@ stopped at the supervisor-kill cascade before reaching them.
 
 ---
 
+## Step 0 — pre-flight, before ANY further cloud run (~5 min, $0)
+
+These were originally filed after the rehearsal. Wrong order: they apply to every
+paid run from here, and getting them wrong would confound the tests that follow.
+
+**Set `ORCH_INSTANCE_TYPE=t3.medium`** in `.env`. 4 GB instead of 1. Over 24h the
+supervisor accumulates a RunProfile (events, loss/val samples) and pulls all 8
+node logs every tick; OOM on `t3.micro` is a real risk, and every restart it
+causes replays the chaos schedule until Step 1 lands. +$0.75 over 24h.
+
+Two items that were on this list are **already satisfied** — verified by reading
+before scheduling work against them:
+
+- **A8 archives the prior segment.** `run_extend` walks
+  `metrics-seg1.json`, `-seg2`, … to the first free slot before re-entering, and
+  refuses when `budget <= trained`. Extending cannot clobber a paid-for segment.
+- **G2's derived lifetime is safe.** `instance_lifetime_slack_seconds = 3600`, so
+  a 20-minute test box gets an 80-minute timer. It cannot fire mid-test. Still
+  worth eyeballing `systemctl list-timers` once during Step 3 — reading is not
+  running.
+
 ## Step 1 — persist the kill schedule (~30 min, $0)
 
 **The last known correctness gap, and it must land before any further chaos run.**
@@ -191,15 +212,16 @@ All ten go/no-go gates from the run plan apply.
 
 ---
 
-## Step 6 — small things before the 24h run
+## Step 6 — operator items before the 24h run
 
-| | Item | Effort |
+Config and code pre-flight moved to **Step 0**; what remains genuinely belongs
+last, because both need a live box or are the operator's to do.
+
+| | Item | When |
 |---|---|---|
-| a | `ORCH_INSTANCE_TYPE=t3.medium` — 4 GB removes OOM as a restart cause on a 24h profile+log buffer | 1 line, +$1 |
-| b | Confirm **A8 archives** `metrics.json`/`profile.json` before re-entering, or extending overwrites the segment already paid for | ~10 min |
-| c | Confirm the **G2 default** actually arms on a real box (`systemctl list-timers`) — it was verified by reading, not running | in Step 3 |
-| d | AWS Budgets ceiling + deny-EC2 action | operator, 15 min |
-| e | Execute each kill switch once from a clean shell | in Step 3 |
+| a | **AWS Budgets ceiling + deny-EC2 action.** The only guardrail that survives our code being wrong in a way we did not imagine | operator, before the 24h run |
+| b | Execute each kill switch once from a clean shell — `reap_ours`, `orch status`, `orch down`. One never run is not a kill switch | during Step 3 |
+| c | Eyeball `systemctl list-timers` for `spot-autokill` — G2's value is verified by reading, not by running | during Step 3 |
 
 ---
 
@@ -221,15 +243,23 @@ All ten go/no-go gates from the run plan apply.
 
 | Step | Effort | Cost |
 |---|---|---|
+| 0 — pre-flight config | 5m | $0 |
 | 1 — persist kill schedule | 30m | $0 |
 | 2 — `orch up --run-id` | 20m | $0 |
 | 3 — box failure → resume | 35m | ~$3 |
 | 4 — laptop disconnect | 30m | ~$3 |
 | 5 — re-run 1h rehearsal | 1.5h | ~$10 |
-| 6 — small things | 30m | ~$1 |
-| **To the 24h start line** | **~4h** | **~$17** |
-| 24h run | — | ~$195 |
+| 6 — operator items | 20m | $0 |
+| **To the 24h start line** | **~3.5h** | **~$16** |
+| 24h run | — | ~$196 |
 
-Steps 3 and 4 are both 2-node and independent; if time is short they can run
-back to back off one build. Step 1 must precede Step 5. Step 2 must precede
-Step 3.
+**Ordering constraints, and only these:**
+
+- Step 0 before **any** paid run — it is config for all of them.
+- Step 2 before Step 3 — without `--run-id` there is no way to resume a dead
+  control plane, which is the entire point of that test.
+- Step 1 before Step 5 — a restart during the rehearsal would otherwise replay
+  the whole chaos schedule and make the run uninterpretable.
+
+Steps 3 and 4 are both clean 2-node runs and independent of each other; if time
+is short they can go back to back off one build.
