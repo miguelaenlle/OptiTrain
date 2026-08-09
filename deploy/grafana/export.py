@@ -72,6 +72,9 @@ TARGET_WORLD = int(_flag("nodes") or 8)
 # aws_state values AWS bills for. "shutting-down" and "terminated" are free, so
 # a node stops accruing the moment the supervisor kills it.
 BILLABLE_STATES = {"pending", "running"}
+# Shortest status-tick gap that counts as a control-plane OUTAGE rather than a
+# supervisor blocking on AWS. See control_plane_gaps for the measurements.
+MIN_OUTAGE_S = 90.0
 
 TS_COLUMNS = [
     "time",
@@ -92,6 +95,7 @@ TS_COLUMNS = [
     "whole_group_restarts",
     "usd",
     "usd_per_1k",
+    "supervisor_up",
 ]
 
 
@@ -272,6 +276,82 @@ def load_hist(path: Path) -> list[tuple[float, dict]]:
     return out
 
 
+def control_plane_gaps(
+    hist: list[tuple[float, dict]], factor: float = 3.0
+) -> list[tuple[float, float]]:
+    """Windows in which NOBODY was writing status ticks: [(start, end), ...].
+
+    A control-plane outage makes world size and the Gantt stop changing, which is
+    pixel-identical to "the fleet was stable" -- and that is the more dangerous
+    reading of the two. The gap has to be stated, not merely left blank.
+
+    Detected on the SUPERVISOR's own clock, not on when live.py polled, because
+    that is what separates the two outages that look the same on a stale
+    dashboard:
+
+      supervisor/box down -> objects were never written; the gap is permanent
+      laptop/live.py down -> objects were written all along and sync backfills
+                             them, so after a reconnect there is no gap at all
+
+    Same detector, opposite answers -- which is what lets the box-failure test
+    and the laptop-disconnect test check each other.
+
+    THE FLOOR IS THE WHOLE DESIGN. A LIVE supervisor still goes quiet for tens of
+    seconds -- it blocks inside `aws.terminate` + `wait_quota_released` while a
+    kill is carried out. Measured on the 8-node rehearsal: median tick 4.1s, p90
+    4.4s, but three gaps of 21s, 21s and 38s, every one of them a kill rather than
+    an outage.
+
+    A threshold scaled off the median would therefore shade "control plane down"
+    across the MASS-LOSS event, which terminates six boxes at once and blocks
+    longest of all. That is worse than saying nothing: it would report the
+    headline result as a control-plane failure.
+
+    So the floor is 90s -- well above any observed blocking pause, and well below
+    the minutes a dead BOX takes to be noticed and replaced. The deliberate cost
+    is that a fast PROCESS restart (RestartSec=30 plus boot, ~40-70s) goes
+    unflagged. That is the right trade: at that duration it is genuinely
+    indistinguishable from a busy supervisor, and the fleet is unaffected either
+    way because systemd has already brought it back.
+    """
+    times = sorted(t for t, _ in hist)
+    if len(times) < 3:
+        return []
+    deltas = sorted(b - a for a, b in zip(times, times[1:], strict=False))
+    median = deltas[len(deltas) // 2] or 10.0
+    threshold = max(median * factor, MIN_OUTAGE_S)
+    return [(a, b) for a, b in zip(times, times[1:], strict=False) if b - a > threshold]
+
+
+def _in_gap(t: float, gaps: list[tuple[float, float]]) -> bool:
+    return any(a < t < b for a, b in gaps)
+
+
+def write_control_plane_down(gaps: list[tuple[float, float]], path: Path) -> int:
+    """Outage windows as Grafana region annotations, shaded on every panel.
+
+    Deliberately a SEPARATE region set from degraded.json and drawn in a
+    different colour: "the world is short a node" and "nobody is steering" are
+    different failures, and conflating them would hide the more serious one.
+    """
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "time": int(a * 1000),
+                    "timeEnd": int(b * 1000),
+                    "title": "control plane down",
+                    "text": f"no supervisor status for {b - a:.0f}s — training continued",
+                    "tags": ["control-plane"],
+                }
+                for a, b in gaps
+            ],
+            indent=1,
+        )
+    )
+    return len(gaps)
+
+
 def status_series(hist: list[tuple[float, dict]]) -> tuple[list[float], list[tuple[int, int]]]:
     ts = [t for t, _ in hist]
     vals = [(len(d.get("members") or []), int(d.get("ckpt_step", -1))) for _, d in hist]
@@ -382,7 +462,9 @@ def write_timeseries(
     t_launch: float,
     now: float,
     live: bool,
+    gaps: list[tuple[float, float]] | None = None,
 ) -> int:
+    gaps = gaps or []
     st_ts, st_vals = status_series(hist)
     inst = prof["cost"]["instances"]
     kills = sorted(e["t_wall"] for e in prof["events"] if e["event"] == "kill")
@@ -435,7 +517,11 @@ def write_timeseries(
         for t, doc in hist:
             if t >= first_step_t:
                 break
-            w.writerow(_fleet_row(t, doc, kills, rel, cost_at, furthest=0))
+            w.writerow(
+                _fleet_row(
+                    t, doc, kills, rel, cost_at, furthest=0, supervisor_down=_in_gap(t, gaps)
+                )
+            )
         for i, r in enumerate(steps):
             furthest = max(furthest, r["step"])
             t, elapsed = r["t"], r["t"] - t0
@@ -474,6 +560,7 @@ def write_timeseries(
                     0,
                     round(usd, 4),
                     round(usd / r["step"] * 1000, 4) if r["step"] else "",
+                    0 if _in_gap(t, gaps) else 1,
                 ]
             )
         if live:
@@ -489,6 +576,7 @@ def write_timeseries(
                     last_step=steps[-1]["step"] if steps else 0,
                     fallback_world=last_world,
                     fallback_ckpt=last_ckpt,
+                    supervisor_down=_in_gap(now, gaps),
                 )
             )
     return len(steps)
@@ -505,6 +593,7 @@ def _fleet_row(
     last_step: int = 0,
     fallback_world: int = 0,
     fallback_ckpt: int = -1,
+    supervisor_down: bool = False,
 ) -> list:
     """A row sourced from a STATUS POLL rather than from a training step.
 
@@ -551,6 +640,7 @@ def _fleet_row(
         0,
         round(usd, 4),
         round(usd / last_step * 1000, 4) if last_step else "",
+        0 if supervisor_down else 1,
     ]
 
 
@@ -942,6 +1032,10 @@ def main() -> int:
     settled = steps[-1]["t"] if steps else (hist[-1][0] if hist else t_launch)
     now = float(frozen) if frozen else (time.time() if live else settled)
 
+    # Windows where the supervisor wrote nothing. Computed once and shared by
+    # the series flag and the shaded band, so the strip and the annotation can
+    # never disagree about when the control plane was down.
+    gaps = control_plane_gaps(hist)
     n1 = write_timeseries(
         steps,
         hist,
@@ -952,7 +1046,9 @@ def main() -> int:
         t_launch=t_launch,
         now=now,
         live=live,
+        gaps=gaps,
     )
+    n6 = write_control_plane_down(gaps, OUT_DIR / "control_plane_down.json")
     n2 = write_occupancy(epochs, hist, prof, OUT_DIR / "occupancy.csv", TARGET_WORLD)
     n3 = write_world(epochs, OUT_DIR / "world.csv", TARGET_WORLD, t_launch=t_launch, end_t=now)
     n4 = write_degraded(epochs, OUT_DIR / "degraded.json", TARGET_WORLD)
@@ -994,7 +1090,8 @@ def main() -> int:
 
     print(
         f"[{run_id}] timeseries.csv {n1} · occupancy.csv {n2} epochs · world.csv {n3} · "
-        f"degraded.json {n4} regions · val.csv {n5} · {meta.get('model') or 'model ?'}"
+        f"degraded.json {n4} regions · val.csv {n5} · cp-down {n6} · "
+        f"{meta.get('model') or 'model ?'}"
     )
     print(json.dumps(summary))
     return 0

@@ -470,23 +470,36 @@ def _annotations() -> list[dict]:
     # silently absent ever since -- a missing file returns `base` and no panel
     # complains.
     runs = _runs()
-    try:
-        regions = json.loads((DATA / runs[0] / "degraded.json").read_text())
-    except Exception:
-        return base
-    csv_rows = "time,timeEnd,text\n" + "".join(
-        f"{r['time']},{r['timeEnd']},degraded\n" for r in regions
-    )
-    base.append(
-        {
-            "datasource": DS_EMBED,
-            "enable": True,
-            "hide": False,
-            "iconColor": "rgba(255, 96, 96, 0.35)",
-            "name": "degraded world",
-            "target": {"scenarioId": "csv_content", "csvContent": csv_rows},
-        }
-    )
+
+    def _regions(name: str) -> list[dict]:
+        try:
+            return json.loads((DATA / runs[0] / name).read_text())
+        except Exception:
+            return []
+
+    for fname, label, colour in (
+        ("degraded.json", "degraded", "rgba(255, 96, 96, 0.35)"),
+        # A DISTINCT colour, deliberately. "the world is short a node" and
+        # "nobody is steering" are different failures, and a shared colour would
+        # hide the more serious one inside the more common one.
+        ("control_plane_down.json", "control plane down", "rgba(140, 90, 220, 0.45)"),
+    ):
+        regions = _regions(fname)
+        if not regions:
+            continue
+        rows = "time,timeEnd,text\n" + "".join(
+            f"{r['time']},{r['timeEnd']},{label}\n" for r in regions
+        )
+        base.append(
+            {
+                "datasource": DS_EMBED,
+                "enable": True,
+                "hide": False,
+                "iconColor": colour,
+                "name": label,
+                "target": {"scenarioId": "csv_content", "csvContent": rows},
+            }
+        )
     return base
 
 
@@ -657,6 +670,23 @@ def build() -> dict:
             fill=15,
             min=0,
             overrides=colors(("whole-group restarts", RED), ("below full world", AMBER)),
+        )
+    )
+    # Control-plane liveness as a HARD series, not only a shaded band. During an
+    # outage the fleet panels merely stop changing, which reads as "the fleet was
+    # stable" -- the opposite of the truth. This drops to 0 and says so, and it
+    # is greppable in the CSV rather than only visible by eye.
+    panels.append(
+        timeseries(
+            "Supervisor up (0 = control plane not writing; training continues regardless)",
+            [("supervisor_up", "supervisor up")],
+            4,
+            interp="stepAfter",
+            fill=25,
+            min=0,
+            max=1,
+            decimals=0,
+            overrides=colors(("supervisor up", "purple")),
         )
     )
 

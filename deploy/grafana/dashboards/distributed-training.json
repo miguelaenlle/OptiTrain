@@ -46,7 +46,7 @@
     "enable": true,
     "hide": false,
     "iconColor": "rgba(255, 96, 96, 0.35)",
-    "name": "degraded world",
+    "name": "degraded",
     "target": {
      "scenarioId": "csv_content",
      "csvContent": "time,timeEnd,text\n1786240354456,1786240510256,degraded\n1786240834507,1786240990984,degraded\n1786241331955,1786241498500,degraded\n"
@@ -2068,6 +2068,97 @@
         "value": {
          "mode": "fixed",
          "fixedColor": "orange"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 31,
+   "title": "Supervisor up (0 = control plane not writing; training continues regardless)",
+   "datasource": {
+    "type": "yesoreyeram-infinity-datasource",
+    "uid": "rundata"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 24,
+    "x": 0,
+    "y": 90
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "yesoreyeram-infinity-datasource",
+      "uid": "rundata"
+     },
+     "type": "csv",
+     "source": "url",
+     "format": "table",
+     "url": "http://data/${run}/timeseries.csv",
+     "url_options": {
+      "method": "GET"
+     },
+     "parser": "backend",
+     "columns": [
+      {
+       "selector": "time",
+       "text": "time",
+       "type": "timestamp_epoch"
+      },
+      {
+       "selector": "supervisor_up",
+       "text": "supervisor up",
+       "type": "number"
+      }
+     ]
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 25,
+      "showPoints": "never",
+      "spanNulls": true,
+      "lineInterpolation": "stepAfter",
+      "axisLabel": ""
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "min": 0,
+     "max": 1,
+     "decimals": 0
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "supervisor up"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "purple"
         }
        }
       ]
