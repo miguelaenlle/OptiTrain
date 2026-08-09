@@ -60,6 +60,8 @@ reports/
 
 # Grafana: exported run data is regenerable from S3 artifacts
 deploy/grafana/data/
+# live-loop scratch: one dir per run, pulled from S3 each tick
+deploy/grafana/.live/
 
 # Grafana export artifacts (regenerate with export.py)
 deploy/grafana/data/

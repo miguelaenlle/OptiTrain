@@ -44,9 +44,7 @@ ROUNDS = [(2, 3), (0, 1), (2, 3)]
 
 def build_schedule() -> list[tuple[float, int]]:
     """(seconds_after_train_start, node) — both members of a pair share a time."""
-    return [
-        (FIRST + r * SPACING, victim) for r, pair in enumerate(ROUNDS) for victim in pair
-    ]
+    return [(FIRST + r * SPACING, victim) for r, pair in enumerate(ROUNDS) for victim in pair]
 
 
 def main() -> int:
@@ -57,9 +55,7 @@ def main() -> int:
     cfg.require_bucket()
     schedule = build_schedule()
 
-    per_round = [
-        f"t+{FIRST + r * SPACING:.0f}s kill {list(pair)}" for r, pair in enumerate(ROUNDS)
-    ]
+    per_round = [f"t+{FIRST + r * SPACING:.0f}s kill {list(pair)}" for r, pair in enumerate(ROUNDS)]
     peak_vcpu = (cfg.node_count + 2) * cfg.instance_vcpu_count()
     print(
         f"\n\033[1m⚠️  BILLABLE: {cfg.node_count}x {cfg.instance_type} ({cfg.spot_market}), "

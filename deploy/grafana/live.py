@@ -31,14 +31,28 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 DATA = HERE / "data"
-WORK = HERE / ".live"
+LIVE_ROOT = HERE / ".live"
+
+
+def work_dir(run_id: str) -> Path:
+    """Per-RUN working dir.
+
+    A single shared .live/ was never cleared between runs, and `aws s3 cp` of an
+    object that does not exist yet leaves the previous file in place. So a new
+    run started life holding the LAST run's profile.json, metrics.json and
+    boot-node logs. Two consequences, both silent: export.py's run-id guard
+    matched the stale profile and refused every tick until the new run's own
+    profile landed at the very end, and the old run's step lines were parsed as
+    if they belonged to the new one.
+    """
+    return LIVE_ROOT / run_id
 
 
 def sh(*args: str) -> str:
     return subprocess.run(args, capture_output=True, text=True).stdout
 
 
-def sync(bucket: str, run_id: str) -> None:
+def sync(bucket: str, run_id: str, WORK: Path) -> None:
     """Pull whatever exists so far. Missing objects are normal mid-run."""
     (WORK / "logs").mkdir(parents=True, exist_ok=True)
     base = f"s3://{bucket}/runs/{run_id}"
@@ -65,7 +79,7 @@ def sync(bucket: str, run_id: str) -> None:
     )
 
 
-def copy_driver_log(log_path: str | None) -> None:
+def copy_driver_log(log_path: str | None, WORK: Path) -> None:
     """Epoch publications live in the DRIVER's log, not in S3.
 
     export.py reads epoch membership + master from SRC/run.log, and without it
@@ -79,7 +93,7 @@ def copy_driver_log(log_path: str | None) -> None:
         (WORK / "run.log").write_text(src.read_text(errors="replace"))
 
 
-def append_status(run_id: str) -> None:
+def append_status(WORK: Path) -> None:
     """status.json is OVERWRITTEN in place, so its history exists only if we
     keep every poll. Without this the world-size staircase and ckpt_step series
     are unrecoverable -- the same gap that had to be patched by hand for E5."""
@@ -104,18 +118,27 @@ def append_status(run_id: str) -> None:
             fh.write(json.dumps({"t": time.time(), "doc": doc}) + "\n")
 
 
-def regenerate(run_id: str, nodes: int) -> str:
-    """Run the existing exporter + builder against the live working dir."""
-    env_src = f"SRC_OVERRIDE={WORK}"
+def regenerate(run_id: str, nodes: int, WORK: Path) -> str:
+    """Run the existing exporter + builder against this run's working dir."""
     r = subprocess.run(
-        [sys.executable, str(HERE / "export.py"), run_id, "--live", f"--nodes={nodes}"],
+        [
+            sys.executable,
+            str(HERE / "export.py"),
+            run_id,
+            "--live",
+            f"--nodes={nodes}",
+            f"--src={WORK}",
+        ],
         capture_output=True,
         text=True,
-        env={**__import__("os").environ, "X": env_src},
     )
     out = (r.stdout or "") + (r.stderr or "")
+    # --run pins the dashboard's default selection to the LIVE run, so replaying
+    # an older run in another shell cannot steal it mid-flight.
     subprocess.run(
-        [sys.executable, str(HERE / "build_dashboard.py")], capture_output=True, text=True
+        [sys.executable, str(HERE / "build_dashboard.py"), f"--run={run_id}"],
+        capture_output=True,
+        text=True,
     )
     return out.strip().splitlines()[-1] if out.strip() else "(no output)"
 
@@ -139,15 +162,21 @@ def main() -> int:
     if not bucket:
         raise SystemExit("SPOT_TRAIN_BUCKET unset")
 
+    WORK = work_dir(run_id)
     WORK.mkdir(parents=True, exist_ok=True)
     DATA.mkdir(parents=True, exist_ok=True)
     print(f"[live] {run_id} every {interval:.0f}s -> {DATA}")
+    # Seed BEFORE the first S3 poll. The run id carries its launch timestamp, so
+    # this is enough to put the run in the selector and open the default window
+    # on it -- the dashboard is live from the moment the fleet is launched
+    # rather than from the first training step ~3 minutes later.
+    regenerate(run_id, nodes, WORK)
     n = 0
     while True:
-        sync(bucket, run_id)
-        copy_driver_log(log_path)
-        append_status(run_id)
-        line = regenerate(run_id, nodes)
+        sync(bucket, run_id, WORK)
+        copy_driver_log(log_path, WORK)
+        append_status(WORK)
+        line = regenerate(run_id, nodes, WORK)
         n += 1
         print(f"[live] tick {n}: {line}", flush=True)
         if once:

@@ -16,6 +16,7 @@ short.
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,12 +62,12 @@ def _pos(h: int, w: int = 24, x: int = 0) -> dict:
     return p
 
 
-def _cols(names: list[tuple[str, str]]) -> list[dict]:
+def _cols(names: list[tuple[str, str]], types: str = "number") -> list[dict]:
     """Infinity column spec. `time` must be typed as epoch ms or Grafana treats
     it as a plain number and the panel silently renders with no time axis."""
     out = [{"selector": "time", "text": "time", "type": "timestamp_epoch"}]
     for sel, text in names:
-        out.append({"selector": sel, "text": text, "type": "number"})
+        out.append({"selector": sel, "text": text, "type": types})
     return out
 
 
@@ -103,14 +104,18 @@ def embed_target(wanted: list[tuple[str, str]], src: str = "timeseries.csv") -> 
 
 
 def ts_target(
-    cols: list[tuple[str, str]], url: str = TS_URL, src: str = "timeseries.csv"
+    cols: list[tuple[str, str]],
+    url: str = TS_URL,
+    src: str = "timeseries.csv",
+    ref: str = "A",
+    types: str = "number",
 ) -> list[dict]:
     if EMBED:
         return embed_target(cols, src)
     url = f"http://data/${{run}}/{src}"
     return [
         {
-            "refId": "A",
+            "refId": ref,
             "datasource": DS,
             "type": "csv",
             "source": "url",
@@ -118,8 +123,27 @@ def ts_target(
             "url": url,
             "url_options": {"method": "GET"},
             "parser": "backend",
-            "columns": _cols(cols),
+            "columns": _cols(cols, types),
         }
+    ]
+
+
+def colors(*pairs: tuple[str, str]) -> list[dict]:
+    """Pin a colour per series by legend label.
+
+    palette-classic assigns by field index, and Infinity does not return fields
+    in the requested order -- so a three-series panel drew "durable" and
+    "current step" in two greens close enough to be one line, and nodes-lost and
+    replacements identically. Naming the colour also lets a series keep the same
+    meaning across panels: replacements are blue in the Gantt, in the headline
+    tile and in the fleet chart.
+    """
+    return [
+        {
+            "matcher": {"id": "byName", "options": label},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": colour}}],
+        }
+        for label, colour in pairs
     ]
 
 
@@ -148,7 +172,16 @@ def timeseries(title: str, cols: list[tuple[str, str]], h: int, **opts) -> dict:
         "title": title,
         "datasource": DS,
         "gridPos": _pos(h),
-        "targets": ts_target(cols, src=opts.get("src", "timeseries.csv")),
+        # `extra` adds a SECOND query against a different file. Series sampled on
+        # different clocks cannot share one CSV without inventing rows for the
+        # sparser one -- val loss is logged every eval_interval_steps, which need
+        # not line up with the step rows at all.
+        "targets": ts_target(cols, src=opts.get("src", "timeseries.csv"))
+        + [
+            t
+            for i, (esrc, ecols) in enumerate(opts.get("extra", []))
+            for t in ts_target(ecols, src=esrc, ref=chr(ord("B") + i))
+        ],
         "fieldConfig": {"defaults": field, "overrides": opts.get("overrides", [])},
         "options": {
             "legend": {"displayMode": "list", "placement": "bottom", "showLegend": True},
@@ -174,7 +207,11 @@ def stat(title: str, selector: str, h: int, w: int, x: int, **opts) -> dict:
         "title": title,
         "datasource": DS,
         "gridPos": _pos(h, w, x),
-        "targets": ts_target([(selector, title)]),
+        "targets": ts_target(
+            [(selector, title)],
+            src=opts.get("src", "timeseries.csv"),
+            types=opts.get("type", "number"),
+        ),
         "fieldConfig": {
             "defaults": {
                 "unit": opts.get("unit", "none"),
@@ -186,31 +223,30 @@ def stat(title: str, selector: str, h: int, w: int, x: int, **opts) -> dict:
         },
         "options": {
             "graphMode": "none",
+            # A string tile needs the smaller font: "GPT-2 · 12L/12H/768d" at the
+            # numeric tile size overflows into an ellipsis.
             "textMode": "value",
             "colorMode": "value",
             "justifyMode": "center",
-            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
+            # `fields: ""` means NUMERIC FIELDS ONLY -- a string column is dropped
+            # and the tile reads "No data" while the backend returns the value.
+            # Naming the field explicitly is what lets a text tile render.
+            "reduceOptions": {
+                "calcs": ["lastNotNull"],
+                "fields": title if opts.get("type") == "string" else "",
+                "values": False,
+            },
         },
     }
 
 
-def _slot_columns() -> list[str]:
-    """Slot columns actually present in the current run's occupancy.csv.
-
-    Hardcoding range(8) meant a 2-node run had six nonexistent columns
-    requested, and the State Timeline rendered NOTHING at all -- not a partial
-    chart, a blank panel. Read the header instead so the Gantt follows the run.
-    """
-    runs = _runs()
-    for r in runs:
-        f = DATA / r / "occupancy.csv"
-        if f.exists():
-            head = f.read_text().splitlines()[:1]
-            if head:
-                cols = [c for c in head[0].split(",") if c.startswith("slot")]
-                if cols:
-                    return cols
-    return [f"slot{i}" for i in range(8)]
+# The Gantt asks for MAX_SLOTS slot columns regardless of the run's node count.
+# Infinity silently drops selectors the CSV does not contain, so a 2-node run
+# renders exactly two rows -- verified against 8 requested columns on a 2-column
+# occupancy.csv. This is what makes the panel node-count agnostic: reading the
+# header at BUILD time coupled the panel to whichever run happened to be newest,
+# so switching $run to a run with a different node count blanked the chart.
+MAX_SLOTS = 16
 
 
 def state_timeline(title: str, h: int) -> dict:
@@ -223,7 +259,9 @@ def state_timeline(title: str, h: int) -> dict:
         "title": title,
         "datasource": DS,
         "gridPos": _pos(h),
-        "targets": embed_target([(c, c) for c in _slot_columns()], "occupancy.csv")
+        "targets": embed_target(
+            [(f"slot{i}", f"slot{i}") for i in range(MAX_SLOTS)], "occupancy.csv"
+        )
         if EMBED
         else [
             {
@@ -233,10 +271,20 @@ def state_timeline(title: str, h: int) -> dict:
                 "source": "url",
                 "format": "table",
                 "url": OCC_URL,
+                # url_options is NOT optional. Without it the BACKEND query still
+                # returns correct rows (/api/ds/query is fine, and so is a
+                # server-side render of any other panel), but the browser's query
+                # yields nothing and the panel reads "No data" with an error
+                # corner. Every timeseries target here carries it; this one did
+                # not, which is the whole reason the Gantt never rendered once.
+                "url_options": {"method": "GET"},
                 "parser": "backend",
                 "columns": [
                     {"selector": "time", "text": "time", "type": "timestamp_epoch"},
-                    *[{"selector": c, "text": c, "type": "string"} for c in _slot_columns()],
+                    *[
+                        {"selector": f"slot{i}", "text": f"slot{i}", "type": "string"}
+                        for i in range(MAX_SLOTS)
+                    ],
                 ],
             }
         ],
@@ -265,6 +313,12 @@ def state_timeline(title: str, h: int) -> dict:
             },
             "overrides": [],
         },
+        # Infinity returns fields as [slot0, slot1, ..., time], with time LAST.
+        # That is fine: State Timeline finds the time field wherever it sits --
+        # confirmed by rendering the panel with and without an `organize`
+        # transformation pinning time to index 0, which changed nothing. Field
+        # order was the wrong suspect for the blank Gantt; url_options above was
+        # the cause.
         "options": {
             "mergeValues": True,
             "showValue": "auto",
@@ -293,6 +347,17 @@ def _iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _launch_ms(run_id: str) -> int | None:
+    """Launch time straight from the run id, which ends in a unix timestamp.
+
+    Knowing this without reading any artifact is what lets the default window
+    open on the run the moment it is launched, rather than after the first
+    training step lands three minutes later.
+    """
+    tail = run_id.rsplit("-", 1)[-1]
+    return int(tail) * 1000 if tail.isdigit() and len(tail) == 10 else None
+
+
 def _runs() -> list[str]:
     """Run ids with exported data, newest first (ids embed a unix timestamp)."""
     if not DATA.exists():
@@ -308,6 +373,17 @@ def _runs() -> list[str]:
     )
 
 
+def _default_run() -> str:
+    """The run the dashboard opens on. --run= pins it to the LIVE run; without
+    it, the newest exported run wins. Replaying an old run mid-flight would
+    otherwise steal the default out from under a run in progress."""
+    runs = _runs()
+    pinned = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--run=")), None)
+    if pinned:
+        return pinned
+    return runs[0] if runs else ""
+
+
 def _run_variable() -> dict:
     """The run selector.
 
@@ -321,7 +397,9 @@ def _run_variable() -> dict:
     second datasource query path.
     """
     runs = _runs()
-    cur = runs[0] if runs else ""
+    cur = _default_run()
+    if cur and cur not in runs:
+        runs = [cur, *runs]
     return {
         "name": "run",
         "label": "Run",
@@ -340,29 +418,34 @@ def _time_range() -> dict:
     "All time" for this dashboard means the run, not a rolling clock: a fixed
     `now-6h` hides the beginning of a 36h run, and a rolling window on a
     FINISHED run drifts until the whole thing scrolls off. So the start is
-    always the first training step, and only the end is conditional.
+    always the run's LAUNCH, and only the end is conditional.
+
+    The launch is read from the run id when summary.json is not there yet, which
+    is the whole first stretch of a run. Falling back to `now-6h` in that window
+    is what made a fresh dashboard open on a rolling tail instead of on the run.
 
     Must be ISO-8601 or a relative string. Grafana's dashboard JSON does NOT
     accept epoch milliseconds -- an epoch string renders the picker as
     "Invalid date" and every panel as "No data" while the datasource works
     perfectly. That cost a full debug cycle; hence this note.
     """
-    # Per-run now; the flat path stopped existing when exports were namespaced,
-    # which silently dropped the window back to a rolling now-6h.
-    runs = _runs()
-    summary = (DATA / runs[0] / "summary.json") if runs else DATA / "summary.json"
-    try:
-        meta = json.loads(summary.read_text())
-        start = int(meta["run_start_ms"])
-        pad = 30_000
-        if meta.get("active"):
-            # A live run must show its whole history, not a rolling tail: the
-            # default landed on a few recent minutes and hid everything before it.
-            return {"from": _iso(start - pad), "to": "now"}
-        return {"from": _iso(start - pad), "to": _iso(int(meta["run_end_ms"]) + pad)}
-    except Exception:
-        # No export yet (pass 2 builds before the run starts): follow the clock.
+    pad = 30_000
+    run = _default_run()
+    meta = {}
+    if run:
+        try:
+            meta = json.loads((DATA / run / "summary.json").read_text())
+        except Exception:
+            meta = {}
+    start = meta.get("run_start_ms") or _launch_ms(run) if run else None
+    if not start:
         return {"from": "now-6h", "to": "now"}
+    # A live run runs to "now" so the window follows the fleet; a finished one
+    # pins to its own end so there is no dead trailing space. Unknown (no
+    # summary yet) means the run was just launched, which is live.
+    if meta.get("active", True):
+        return {"from": _iso(int(start) - pad), "to": "now"}
+    return {"from": _iso(int(start) - pad), "to": _iso(int(meta["run_end_ms"]) + pad)}
 
 
 def _annotations() -> list[dict]:
@@ -382,8 +465,13 @@ def _annotations() -> list[dict]:
             "type": "dashboard",
         }
     ]
+    # Per-run, like every other artifact. This read was left pointing at the
+    # flat path when exports were namespaced, so the degraded shading has been
+    # silently absent ever since -- a missing file returns `base` and no panel
+    # complains.
+    runs = _runs()
     try:
-        regions = json.loads((DATA / "degraded.json").read_text())
+        regions = json.loads((DATA / runs[0] / "degraded.json").read_text())
     except Exception:
         return base
     csv_rows = "time,timeEnd,text\n" + "".join(
@@ -404,6 +492,24 @@ def _annotations() -> list[dict]:
 
 def build() -> dict:
     panels: list[dict] = []
+
+    # What is being trained, as the RUN reported it. This used to be a typed-in
+    # dashboard description that still read "8 x g5.xlarge" while a 2-node run
+    # was on screen -- a caption cannot follow $run, so it drifts silently. These
+    # tiles are per-run queries, so switching runs re-reads the facts.
+    panels.append(row("Model"))
+    for i, (t, sel, kw) in enumerate(
+        [
+            ("Model", "model", {"type": "string"}),
+            ("Parameters", "params_exact", {"unit": "short", "decimals": 2}),
+            ("Dataset", "dataset", {"type": "string"}),
+            ("Context", "ctx", {"unit": "none"}),
+            ("Global batch", "global_batch", {"unit": "none"}),
+        ]
+    ):
+        panels.append(
+            stat(t, sel, 3, 24 // 5 + (1 if i < 24 % 5 else 0), i * 5, src="meta.csv", **kw)
+        )
 
     panels.append(row("Headline"))
     for i, (t, sel, kw) in enumerate(
@@ -428,6 +534,11 @@ def build() -> dict:
             ],
             10,
             unit_label="training step",
+            overrides=colors(
+                ("durable (checkpointed)", GREEN),
+                ("furthest reached", BLUE),
+                ("current step", AMBER),
+            ),
         )
     )
     panels.append(
@@ -478,6 +589,8 @@ def build() -> dict:
             interp="stepAfter",
             unit_label="count",
             min=0,
+            # Same colours as the two headline tiles above.
+            overrides=colors(("nodes lost", AMBER), ("replacements launched", BLUE)),
         )
     )
 
@@ -487,7 +600,42 @@ def build() -> dict:
     )
 
     panels.append(row("4 · Model quality"))
-    panels.append(timeseries("Training loss", [("train_loss", "train loss")], 6, unit_label="loss"))
+    panels.append(
+        timeseries(
+            "Loss — training and validation",
+            [("train_loss", "train loss")],
+            6,
+            unit_label="loss",
+            # Val loss rides the SAME panel: the two are the same quantity in the
+            # same units, and the gap between them is the thing worth reading. It
+            # is a separate query because it is sampled every
+            # eval_interval_steps, not every step -- sparse points joined into a
+            # line, which is exactly how the underlying series behaves.
+            extra=[("val.csv", [("val_loss", "val loss")])],
+            overrides=colors(("train loss", BLUE), ("val loss", AMBER))
+            + [
+                {
+                    "matcher": {"id": "byName", "options": "val loss"},
+                    "properties": [
+                        # Sparse by nature -- every eval_interval_steps, not every
+                        # step. Without markers a 3-point series reads as a
+                        # straight line with no indication of where it was
+                        # actually measured.
+                        {"id": "custom.showPoints", "value": "always"},
+                        {"id": "custom.pointSize", "value": 5},
+                        # Grafana prefixes a series with its query refId once a
+                        # panel has more than one query ("B val loss"). An
+                        # explicit displayName suppresses that.
+                        {"id": "displayName", "value": "val loss"},
+                    ],
+                },
+                {
+                    "matcher": {"id": "byName", "options": "train loss"},
+                    "properties": [{"id": "displayName", "value": "train loss"}],
+                },
+            ],
+        )
+    )
     panels.append(
         timeseries("Tokens processed", [("tokens_b", "tokens (billions)")], 6, fill=10, min=0)
     )
@@ -508,14 +656,18 @@ def build() -> dict:
             interp="stepAfter",
             fill=15,
             min=0,
+            overrides=colors(("whole-group restarts", RED), ("below full world", AMBER)),
         )
     )
 
     return {
         "title": "Distributed training — fault tolerance under node loss",
+        # No model/dataset caption here on purpose. A static string cannot follow
+        # $run, and this one drifted: it claimed "8 x g5.xlarge, GPT-2 124M,
+        # OpenWebText" regardless of what was actually selected. The Model row
+        # carries those facts now, parsed from the run's own logs.
         "description": (
-            "Model: GPT-2 124M (nanoGPT, Karpathy) · Dataset: OpenWebText · "
-            "8 x g5.xlarge · global batch 480 sequences x 1024 tokens"
+            "Fault tolerance under node loss. Model facts are per-run, read from the box's log."
         ),
         "uid": "dist-training",
         "tags": ["training", "fault-tolerance"],
