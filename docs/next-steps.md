@@ -105,6 +105,63 @@ finished run.
 
 ---
 
+## Step 2b — render "control plane down" as a positive signal (~40 min, $0)
+
+**Prerequisite for Step 3 being interpretable.** Today a control-plane outage
+makes the world-size line and the Gantt simply *stop changing* — which is
+pixel-identical to "the fleet was stable". That is the more dangerous reading of
+the two, and a viewer has no way to tell them apart.
+
+### Detect it from the S3 object clock, not the poll clock
+
+Gap1 writes one status object per tick, named `<epoch_ms>.json`. So the gap is
+visible **in the object names themselves**, independent of when `live.py`
+happened to fetch them. A gap > ~3 tick intervals means nobody was writing.
+
+This is what makes the detector correct rather than merely plausible, because it
+distinguishes the two outages that look the same on a stale dashboard:
+
+| | Status objects in S3 | Detector says |
+|---|---|---|
+| **Supervisor / box down** | never written — gap is permanent | **down band** ✅ |
+| **Laptop / `live.py` down** | written all along, just fetched late | after backfill, **no band** ✅ |
+
+Same code, opposite answers, which is exactly right. And it gives Steps 3 and 4
+**opposite expected outcomes** — a strong mutual check. If Step 4 draws a down
+band, the backfill is broken. If Step 3 does not, the detector is.
+
+### Absence must be synthesised into rows
+
+There are no status ticks during the outage, so there are no rows to carry the
+signal — the same problem the trailing "now" row solved. The exporter must
+**emit explicit rows at the gap boundaries** rather than leaving a hole:
+
+- new `supervisor_up` column in `timeseries.csv` (1 normally, **0** inside a gap),
+  with synthesised rows at gap start and gap end;
+- inside a gap, carry cost and the last known world size forward but leave
+  `train_loss` / `ms_per_step` empty — same discipline as `_fleet_row`: only what
+  is still asserted, never invented.
+
+### Render it twice
+
+1. **A thin `supervisor_up` strip** in the Sentinels row — a hard series, greppable
+   in the CSV, obvious when it drops to 0.
+2. **A shaded region across every panel**, reusing the `degraded.json` machinery
+   (`write_degraded` + `_annotations` already do exactly this shape). Write a
+   second region set, `control_plane_down.json`, in a distinct colour from the
+   degraded-world shading so the two are never confused.
+
+The shading is what makes the story legible at a glance: the band sits over a
+**still-advancing loss curve**, which is the whole result — training outlived its
+control plane.
+
+### Verify for $0
+
+Replay it offline. `.live/multinode-preempt-1786239456/status/` holds the
+rehearsal's real per-tick objects; delete a contiguous window into a copy, run the
+exporter, and assert `supervisor_up` goes 0 across exactly that window and 1 either
+side. No cloud needed, and it pins the detector before it is trusted in Step 3.
+
 ## Step 3 — supervisor BOX failure → resume (~35 min, ~$3)
 
 Distinct from the SIGKILL test already passing. systemd resurrects a *process*;
@@ -143,13 +200,19 @@ Two data paths, and they behave **differently** during the outage:
 | supervisor status ticks (world size, Gantt, work-at-risk, fleet counters) | **frozen** — nobody is writing them |
 
 That contrast is the *result*, not a defect: it is a picture of training
-outliving its control plane. It should read that way on the dashboard.
+outliving its control plane. **Step 2b is what makes it say so** — without the
+down band, a frozen world-size line reads as "the fleet was stable", which is
+the opposite of the truth.
 
 Run `live.py` on the laptop for the whole test (it polls S3 and is unaffected by
-the control plane dying). Before starting, confirm the trailing "now" row still
-advances cost and holds the last known world size through the gap, so the fleet
-panels flatline rather than blank out. If they blank, that is a real dashboard
-bug for exactly the scenario the 24h run cares about.
+the control plane dying).
+
+**Dashboard pass criteria, additional to the run's own:**
+
+7. `supervisor_up` drops to **0** for the outage window and returns to 1 on resume.
+8. The **shaded down band** covers the outage on every panel, sitting over a loss
+   curve that is still advancing.
+9. The Gantt and world size flatline through the band rather than blanking out.
 
 **Cost:** 2 × g5.xlarge × ~25 min ≈ $0.85, plus 2 × t3.micro ≈ $0.02. Call it $3
 with slack.
@@ -178,6 +241,10 @@ job — the point is the observer, not the fleet.
 2. **No gap in `world.csv` or the Gantt across the offline window** — this is the
    whole point. The supervisor wrote a status object every tick; sync backfills
    them.
+2b. **`supervisor_up` stays 1 throughout, and NO down band is drawn.** The
+   supervisor never stopped writing, so the Step 2b detector must say so. A band
+   here means the backfill is broken — the inverse of Step 3, and the reason the
+   two tests check each other.
 3. Loss/step panels continuous (node logs are append-only in S3).
 4. Cost curve continuous.
 5. `orch status` reports a healthy run immediately on reconnect.
@@ -246,11 +313,12 @@ last, because both need a live box or are the operator's to do.
 | 0 — pre-flight config | 5m | $0 |
 | 1 — persist kill schedule | 30m | $0 |
 | 2 — `orch up --run-id` | 20m | $0 |
+| 2b — "control plane down" signal | 40m | $0 |
 | 3 — box failure → resume | 35m | ~$3 |
 | 4 — laptop disconnect | 30m | ~$3 |
 | 5 — re-run 1h rehearsal | 1.5h | ~$10 |
 | 6 — operator items | 20m | $0 |
-| **To the 24h start line** | **~3.5h** | **~$16** |
+| **To the 24h start line** | **~4h** | **~$16** |
 | 24h run | — | ~$196 |
 
 **Ordering constraints, and only these:**
@@ -260,6 +328,8 @@ last, because both need a live box or are the operator's to do.
   control plane, which is the entire point of that test.
 - Step 1 before Step 5 — a restart during the rehearsal would otherwise replay
   the whole chaos schedule and make the run uninterpretable.
+- Step 2b before Step 3 — without it a control-plane outage is indistinguishable
+  from a stable fleet, and Step 3 has nothing to show.
 
 Steps 3 and 4 are both clean 2-node runs and independent of each other; if time
 is short they can go back to back off one build.
