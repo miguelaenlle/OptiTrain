@@ -608,6 +608,17 @@ class OrchestratorConfig:
     def run_status_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/status.json"
 
+    def run_schedule_key(self, run_id: str) -> str:
+        """Durable chaos-schedule progress: which entries have fired, and the
+        WALL clock at which training started.
+
+        Both were process memory, so any supervisor restart replayed the whole
+        PREEMPT_SCHEDULE from zero -- at hour 8 of a 24h run that re-fires the
+        mass loss of 6 of 8, with no live knob to stop it because the schedule is
+        baked into user-data.
+        """
+        return f"{self.run_prefix}/{run_id}/schedule.json"
+
     def run_status_prefix(self, run_id: str) -> str:
         """Per-tick status objects — the DURABLE history status.json cannot be.
 

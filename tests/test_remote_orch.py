@@ -891,3 +891,60 @@ def test_reap_takes_everything_when_no_epoch_was_ever_published(monkeypatch):
     monkeypatch.setattr(orch, "aws", fake)
     orch._reap_orphans(cfg, run_id)
     assert fake.terminated == ["i-a"]
+
+
+# --------------------------------------------------------------------------- #
+# `orch up --run-id` — adopting a run whose control-plane BOX died
+# --------------------------------------------------------------------------- #
+# systemd resurrects a supervisor PROCESS; nothing resurrects the box. Without
+# adoption, losing the control-plane instance ends the run outright even though
+# the fleet is still training and every checkpoint is durable in S3.
+def _up_args(**kw):
+    base = dict(experiment="multinode-preempt", no_attach=True, run_id="", force=False)
+    base.update(kw)
+    return base
+
+
+def test_up_seeds_the_run_id_so_the_agent_adopts_instead_of_minting(monkeypatch):
+    """run_agent mints a run_id ONLY when the state doc's field is empty, so
+    seeding it is the entire adoption mechanism."""
+    cfg = _cfg()
+    fake = FakeAws()
+    fake.dry = True
+    monkeypatch.setattr(orch, "aws", fake)
+    orch.up(cfg, **_up_args(run_id="multinode-preempt-123"))
+    state = [json.loads(body) for key, body in fake.puts.items() if "orchestrators/" in key]
+    assert state and state[0]["run_id"] == "multinode-preempt-123"
+
+
+def test_up_without_run_id_still_mints_a_fresh_one(monkeypatch):
+    """Cold start is unchanged: an empty field is what tells the agent to mint."""
+    cfg = _cfg()
+    fake = FakeAws()
+    fake.dry = True
+    monkeypatch.setattr(orch, "aws", fake)
+    orch.up(cfg, **_up_args())
+    state = [json.loads(body) for key, body in fake.puts.items() if "orchestrators/" in key]
+    assert state and state[0]["run_id"] == ""
+
+
+def test_up_rejects_a_run_id_from_a_different_experiment(monkeypatch):
+    """Adopting the wrong run would point a fresh control plane at another run's
+    checkpoints -- silent, and unrecoverable once it resumes from them."""
+    cfg = _cfg()
+    fake = FakeAws()
+    fake.dry = True
+    monkeypatch.setattr(orch, "aws", fake)
+    with pytest.raises(SystemExit, match="does not look like"):
+        orch.up(cfg, **_up_args(experiment="baseline", run_id="multinode-preempt-123"))
+
+
+def test_up_refuses_to_adopt_a_non_resumable_experiment(monkeypatch):
+    """A sweep drives several runs and has no single resume point, so silently
+    redoing GPU hours is the failure mode to prevent."""
+    cfg = _cfg()
+    fake = FakeAws()
+    fake.dry = True
+    monkeypatch.setattr(orch, "aws", fake)
+    with pytest.raises(SystemExit, match="cannot adopt"):
+        orch.up(cfg, **_up_args(experiment="scaling-experiment", run_id="scaling-123"))

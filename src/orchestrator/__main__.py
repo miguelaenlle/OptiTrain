@@ -160,6 +160,17 @@ def main() -> None:
         metavar="K=V",
         help="env override for the run, repeatable (e.g. --env NODES=8)",
     )
+    orch_up.add_argument(
+        "--run-id",
+        default="",
+        help="adopt an EXISTING run instead of minting a new one — the way back "
+        "from a dead control-plane box (the fleet keeps training without it)",
+    )
+    orch_up.add_argument(
+        "--force",
+        action="store_true",
+        help="with --run-id, re-enter even a run that already wrote metrics.json",
+    )
     orch_up.add_argument("--no-attach", action="store_true", help="launch and exit (scripted use)")
     orch_up.add_argument("--node", type=int, default=None, help="dashboard: node tab to open")
     orch_up.add_argument("--interval", type=float, default=None, help="dashboard: poll seconds")
@@ -310,6 +321,8 @@ def main() -> None:
                     node=args.node,
                     interval=args.interval,
                     grid=args.grid,
+                    run_id=args.run_id,
+                    force=args.force,
                 )
             elif args.orch_command == "status":
                 orch.status(cfg, args.orch_id)

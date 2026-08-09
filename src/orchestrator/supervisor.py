@@ -459,6 +459,9 @@ class Supervisor:
         self.ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
         self.metrics_key = cfg.run_metrics_key(run_id)
         self._train_start: float | None = None
+        # Wall-clock twin of _train_start. Persisted, because monotonic resets
+        # with the process and the kill clock must not.
+        self._train_start_wall: float = 0.0
         # Kill scheduling is EDGE-triggered per schedule ENTRY (not per node):
         # once entry i has been issued it never fires again, even after its
         # victim is replaced and re-added to the group. (A level trigger on
@@ -476,6 +479,60 @@ class Supervisor:
         self._orch_lines: list[str] = []
         self._orch_dirty = False
         self._downed: set[tuple[int, str]] = set()  # (node, iid) already emitted down/killed
+
+    # -- durable chaos-schedule progress ------------------------------------ #
+    def _save_schedule(self, wall: float) -> None:
+        """Persist which kill entries have fired, and when training began.
+
+        Housekeeping: a failure here must never end the run. The cost of losing
+        it is a replayed schedule, which is bad but survivable; the cost of
+        raising is a dead control plane.
+        """
+        if self._train_start is None:
+            return
+        with contextlib.suppress(Exception):
+            aws.put_text(
+                self.cfg.bucket,
+                self.cfg.run_schedule_key(self.run_id),
+                json.dumps(
+                    {
+                        "version": 1,
+                        "train_start_wall": self._train_start_wall,
+                        "fired": sorted(self._fired_kills),
+                    }
+                ),
+            )
+
+    def _restore_schedule(self, now: float, wall: float) -> None:
+        """Re-arm the kill clock from S3 instead of from this process's birth.
+
+        `_train_start` is a time.monotonic() reading, and monotonic resets with
+        the process -- which is precisely the bug. So the WALL start is what is
+        persisted, and the monotonic field is reconstructed by offsetting it, so
+        `elapsed` keeps measuring time since training actually began rather than
+        since the supervisor last restarted.
+        """
+        doc = None
+        with contextlib.suppress(Exception):
+            doc = aws.get_json(self.cfg.bucket, self.cfg.run_schedule_key(self.run_id))
+        if not doc:
+            return
+        try:
+            fired = {int(i) for i in doc.get("fired") or []}
+            started = float(doc.get("train_start_wall") or 0.0)
+        except (TypeError, ValueError):
+            return
+        if started <= 0:
+            return
+        self._fired_kills = fired
+        self._train_start_wall = started
+        self._train_start = now - max(0.0, wall - started)
+        remaining = [s for i, (s, _v) in enumerate(self.kill_schedule) if i not in fired]
+        self._event(
+            f"re-armed kill schedule: {len(fired)} of {len(self.kill_schedule)} already "
+            f"fired, {len(remaining)} pending, training began {wall - started:.0f}s ago "
+            f"(not replaying)"
+        )
 
     # -- observability ------------------------------------------------------ #
     def _event(self, msg: str) -> None:
@@ -625,6 +682,7 @@ class Supervisor:
                         victim = self.st.master
                     due.add(victim)
                     self._fired_kills.add(i)  # fire this entry exactly once
+                    self._save_schedule(wall)
 
         return Observation(
             node_count=self.cfg.node_count,
@@ -798,6 +856,11 @@ class Supervisor:
                 f"re-adopted epoch {self.st.epoch}: members {sorted(self.st.members)} "
                 f"master=node{self.st.master} (restarted onto a live world, not re-forming it)"
             )
+        # Re-arm the chaos schedule from S3 too. Without this a restart replays
+        # every kill from zero -- the fleet survives it, but the run's chaos
+        # accounting no longer matches what was scheduled, and it costs real
+        # replacements.
+        self._restore_schedule(time.monotonic(), time.time())
 
         end = time.monotonic() + deadline_s
         while time.monotonic() < end:
@@ -807,6 +870,8 @@ class Supervisor:
             # First checkpoint => training has started; arm the kill schedule clock.
             if self._train_start is None and self.st.ckpt_step >= 0 and self.st.epoch > 0:
                 self._train_start = now
+                self._train_start_wall = wall
+                self._save_schedule(wall)
                 self.profile.mark("train_start")
             # Reclaim detection: a member observed gone that we did NOT terminate
             # is a spot reclaim => emit "down" (stamped now, ~one tick after the

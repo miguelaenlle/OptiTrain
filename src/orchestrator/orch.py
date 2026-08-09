@@ -330,9 +330,22 @@ def up(
     node: int | None = None,
     interval: float | None = None,
     grid: bool = False,
+    run_id: str = "",
+    force: bool = False,
 ) -> str:
     """Launch the control plane and (unless ``no_attach``) watch it boot, then
-    flip straight into the live dashboard. Returns the orch_id."""
+    flip straight into the live dashboard. Returns the orch_id.
+
+    ``run_id`` ADOPTS an existing run instead of minting a new one. systemd
+    resurrects a supervisor process, but nothing resurrects the box it runs on --
+    so without this, losing the control-plane instance ends the run outright,
+    even though the fleet is still training and every checkpoint is in S3.
+
+    The mechanism is already there: ``run_agent`` mints a run_id only when the
+    state doc's field is empty, so seeding it is the whole change. The new box
+    boots, ``adopt_fleet`` finds the boxes that never stopped training, and
+    ``restore_state`` restores the epoch -- a takeover, not a rebuild.
+    """
     from . import bootstrap
 
     if experiment not in _EXPERIMENTS:
@@ -341,6 +354,34 @@ def up(
         )
     cfg.require_bucket()
     aws.set_region(cfg.region)
+
+    if run_id:
+        _kind, resumable = _EXPERIMENTS[experiment]
+        if not resumable:
+            raise SystemExit(
+                f"--run-id cannot adopt {experiment!r}: it drives several runs and has no "
+                f"single resume point, so re-entering it would silently redo GPU hours."
+            )
+        if not run_id.startswith(_kind):
+            raise SystemExit(
+                f"--run-id {run_id!r} does not look like a {experiment!r} run "
+                f"(expected the {_kind!r} prefix). Adopting the wrong run would point a "
+                f"fresh control plane at another run's checkpoints."
+            )
+        if not aws.is_dry_run():
+            if not aws.any_object_under(cfg.bucket, f"{cfg.run_prefix}/{run_id}/checkpoints/"):
+                raise SystemExit(
+                    f"no checkpoints under runs/{run_id}/checkpoints/ — nothing to adopt. "
+                    f"Drop --run-id to start a fresh run."
+                )
+            # A finished run has its metrics.json. Re-entering would overwrite the
+            # result already paid for, so make that an explicit choice.
+            if aws.object_exists(cfg.bucket, cfg.run_metrics_key(run_id)) and not force:
+                raise SystemExit(
+                    f"{run_id} already wrote metrics.json — it finished. Re-entering would "
+                    f"overwrite that result; pass --force if you really mean to extend it."
+                )
+        print(f"[orch] adopting existing run {run_id} (not minting a new one)", file=sys.stderr)
 
     overrides = dict(env_overrides or {})
     # The operator thinks in TRAIN_BUDGET_SECONDS (the trainer's knob). The
@@ -446,7 +487,9 @@ def up(
                 "repo_branch": cfg.repo_branch,
                 "budget_s": _budget_seconds(cfg, experiment, env),
                 "created_at": time.time(),
-                "run_id": "",
+                # Seeding this is the ENTIRE adoption mechanism: run_agent mints
+                # a run_id only when it finds this field empty.
+                "run_id": run_id,
                 "attempts": 0,
                 "env": env,
             },
