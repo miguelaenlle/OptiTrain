@@ -29,15 +29,53 @@ ours_ids() {
 }
 ours_count() { local i; i=$(ours_ids); [ -z "$i" ] && echo 0 || echo "$i" | wc -w | tr -d ' '; }
 others_count() {
-  aws ec2 describe-instances --region "$TRAIN_REGION" --filters "$_LIVE" \
-    --query "length(Reservations[].Instances[?!(Tags[?Key=='project' && Value=='${PROJECT_TAG}'])])" \
-    --output text 2>/dev/null || echo 0
+  # Arithmetic, not a JMESPath negation. The negation form
+  #   length(...Instances[?!(Tags[?Key=='project' && Value=='X'])])
+  # UNDERCOUNTS (verified against a fixture: 3 instances, 1 ours, it answers 1
+  # instead of 2) -- untagged instances and the [] flatten interact badly with
+  # `!`. This line exists to reassure the operator that nothing else was
+  # touched, so it has to be obviously right rather than clever.
+  local total ours
+  total=$(aws ec2 describe-instances --region "$TRAIN_REGION" --filters "$_LIVE" \
+    --query 'length(Reservations[].Instances[])' --output text 2>/dev/null || echo 0)
+  ours=$(ours_count)
+  echo $(( ${total:-0} - ${ours:-0} ))
 }
+
 reap_ours() {
-  local ids; ids=$(ours_ids)
-  if [ -n "$ids" ]; then
-    echo "[reap] terminating ${PROJECT_TAG} in ${TRAIN_REGION}: $ids"
-    aws ec2 terminate-instances --region "$TRAIN_REGION" --instance-ids $ids >/dev/null 2>&1
+  # CLOSED LOOP. The old version printed "terminating ..." BEFORE the call,
+  # discarded stdout+stderr, never checked the exit code and never re-queried --
+  # so it announced success whatever happened. This is the stop button on a
+  # multi-hundred-dollar run; it has to report what is TRUE, not what was
+  # attempted.
+  local ids err rc
+  ids=$(ours_ids)
+  if [ -z "$ids" ]; then
+    echo "[reap] nothing of ours running in ${TRAIN_REGION}"
+    echo "[reap] left untouched (not ours): $(others_count)"
+    return 0
   fi
-  echo "[reap] left untouched (not ours, ${TRAIN_REGION}): $(others_count)"
+  echo "[reap] terminating ${PROJECT_TAG} in ${TRAIN_REGION}: $ids"
+  err=$(aws ec2 terminate-instances --region "$TRAIN_REGION" --instance-ids $ids 2>&1 >/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then
+    echo "[reap] ERROR: terminate-instances failed (rc=$rc): $err" >&2
+  fi
+  # Poll until they leave running/pending -- the point at which billing stops.
+  # Do NOT wait for full 'terminated': shutting-down can linger for minutes.
+  local left
+  for _ in $(seq 1 30); do
+    left=$(ours_count)
+    [ "$left" = "0" ] && break
+    sleep 2
+  done
+  if [ "${left:-1}" = "0" ]; then
+    echo "[reap] VERIFIED: 0 of ours still running in ${TRAIN_REGION}"
+  else
+    echo "[reap] STILL RUNNING after 60s: $(ours_ids)" >&2
+    echo "[reap] terminate them by hand before walking away:" >&2
+    echo "       aws ec2 terminate-instances --region ${TRAIN_REGION} --instance-ids \$(ours_ids)" >&2
+    return 1
+  fi
+  echo "[reap] left untouched (not ours): $(others_count)"
 }

@@ -10,7 +10,7 @@
  "editable": true,
  "graphTooltip": 1,
  "time": {
-  "from": "2026-08-09T01:37:06Z",
+  "from": "2026-08-09T21:36:56Z",
   "to": "now"
  },
  "timepicker": {
@@ -45,11 +45,11 @@
     },
     "enable": true,
     "hide": false,
-    "iconColor": "rgba(255, 96, 96, 0.35)",
-    "name": "degraded",
+    "iconColor": "rgba(140, 90, 220, 0.45)",
+    "name": "control plane down",
     "target": {
      "scenarioId": "csv_content",
-     "csvContent": "time,timeEnd,text\n1786240354456,1786240510256,degraded\n1786240834507,1786240990984,degraded\n1786241331955,1786241498500,degraded\n"
+     "csvContent": "time,timeEnd,text\n1786311833635,1786312109976,control plane down\n"
     }
    }
   ]
@@ -60,12 +60,32 @@
     "name": "run",
     "label": "Run",
     "type": "custom",
-    "query": "multinode-preempt-1786239456,multinode-preempt-1786231481,multinode-preempt-1786227708,multinode-preempt-1786207072,multinode-1785795454",
+    "query": "multinode-1786311446,multinode-1786310488,multinode-1786309731,gapdemo-1786240000,multinode-preempt-1786239456,multinode-preempt-1786231481,multinode-preempt-1786227708,multinode-preempt-1786207072,multinode-1785795454",
     "options": [
+     {
+      "text": "multinode-1786311446",
+      "value": "multinode-1786311446",
+      "selected": true
+     },
+     {
+      "text": "multinode-1786310488",
+      "value": "multinode-1786310488",
+      "selected": false
+     },
+     {
+      "text": "multinode-1786309731",
+      "value": "multinode-1786309731",
+      "selected": false
+     },
+     {
+      "text": "gapdemo-1786240000",
+      "value": "gapdemo-1786240000",
+      "selected": false
+     },
      {
       "text": "multinode-preempt-1786239456",
       "value": "multinode-preempt-1786239456",
-      "selected": true
+      "selected": false
      },
      {
       "text": "multinode-preempt-1786231481",
@@ -89,8 +109,8 @@
      }
     ],
     "current": {
-     "text": "multinode-preempt-1786239456",
-     "value": "multinode-preempt-1786239456",
+     "text": "multinode-1786311446",
+     "value": "multinode-1786311446",
      "selected": true
     },
     "includeAll": false,

@@ -68,7 +68,11 @@ cleanup() {
   fi
   echo; echo "[step3] tearing down"
   for o in "$ORCH2" "$ORCH1"; do
-    [ -n "$o" ] && python3 -m orchestrator orch down --id "$o" --all >/dev/null 2>&1
+    # --yes is MANDATORY here. orch down prompts when stdin is a tty, and this
+    # runs from a terminal -- with output redirected the prompt was invisible,
+    # the answer was never given, and teardown silently no-opped while two GPUs
+    # kept billing. Never swallow the output of a stop button either.
+    [ -n "$o" ] && python3 -m orchestrator orch down --id "$o" --all --yes 2>&1 | grep -vE '^\[aws\]' | tail -3
   done
   reap_ours                          # region + tag scoped; belt and braces
   echo "[step3] done. Artifacts kept: deploy/grafana/.live/$RID/ (replayable)"

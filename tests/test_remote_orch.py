@@ -948,3 +948,52 @@ def test_up_refuses_to_adopt_a_non_resumable_experiment(monkeypatch):
     monkeypatch.setattr(orch, "aws", fake)
     with pytest.raises(SystemExit, match="cannot adopt"):
         orch.up(cfg, **_up_args(experiment="scaling-experiment", run_id="scaling-123"))
+
+
+# --------------------------------------------------------------------------- #
+# `orch down` must VERIFY, not assume
+# --------------------------------------------------------------------------- #
+# It used to print "terminated N instance(s)" straight after issuing the calls,
+# which is a statement of intent. An API error, a throttle or a permission gap
+# all still printed success while the boxes kept billing. This is the operator's
+# stop button on a multi-hundred-dollar run.
+class _StuckAws(FakeAws):
+    """Terminate 'succeeds' but the instance never leaves running."""
+
+    def __init__(self, *a, stuck=(), **kw):
+        super().__init__(*a, **kw)
+        self.stuck = set(stuck)
+        self.waited: list[str] = []
+
+    def wait_quota_released(self, iid):
+        self.waited.append(iid)
+        if iid in self.stuck:
+            raise TimeoutError(f"{iid} still running")
+
+
+def _one_controller():
+    return {(orch.ORCH_ROLE_TAG, orch.CONTROLLER): [_controller()]}
+
+
+def test_down_waits_for_each_victim_to_stop_billing(monkeypatch, capsys):
+    from orchestrator import orch
+
+    fake = _StuckAws(instances=_one_controller())
+    monkeypatch.setattr(orch, "aws", fake)
+    orch.down(_cfg(), orch_id="orch-1", all_=True, yes=True)
+    assert fake.terminated, "nothing was terminated"
+    assert fake.waited == fake.terminated, "down() did not verify each instance stopped"
+    assert "verified" in capsys.readouterr().out
+
+
+def test_down_shouts_when_an_instance_refuses_to_die(monkeypatch, capsys):
+    """Silence about a box that kept billing is the worst possible outcome."""
+    from orchestrator import orch
+
+    stuck_id = _controller()["id"]
+    fake = _StuckAws(instances=_one_controller(), stuck={stuck_id})
+    monkeypatch.setattr(orch, "aws", fake)
+    orch.down(_cfg(), orch_id="orch-1", all_=True, yes=True)
+    err = capsys.readouterr().err
+    assert "did NOT stop" in err and "still" in err
+    assert "terminate-instances" in err, "must hand the operator the exact recovery command"

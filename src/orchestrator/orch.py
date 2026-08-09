@@ -740,7 +740,32 @@ def down(
         return
     for iid in victims:
         aws.terminate(iid)
-    print(f"[orch] terminated {len(victims)} instance(s)")
+    # VERIFY, do not assume. This used to print "terminated N instance(s)"
+    # immediately after issuing the calls, which is a statement of intent, not
+    # of outcome -- an API error, a throttle, or a permission gap would all
+    # still print success while the boxes kept billing. For the operator's stop
+    # button on a multi-hundred-dollar run, silence about a failure is the worst
+    # possible behaviour.
+    #
+    # wait_quota_released is the right check: it blocks until the instance
+    # leaves pending/running, which is exactly when billing stops. Waiting for
+    # full 'terminated' would hang for minutes on a stuck OS shutdown.
+    stuck = []
+    for iid in victims:
+        try:
+            aws.wait_quota_released(iid)
+        except TimeoutError:
+            stuck.append(iid)
+    if stuck:
+        print(
+            f"[orch] WARNING: {len(stuck)} instance(s) did NOT stop and are still "
+            f"billing: {' '.join(stuck)}\n"
+            f"[orch] terminate them by hand before walking away:\n"
+            f"[orch]   aws ec2 terminate-instances --region {cfg.region} "
+            f"--instance-ids {' '.join(stuck)}",
+            file=sys.stderr,
+        )
+    print(f"[orch] terminated {len(victims) - len(stuck)}/{len(victims)} instance(s), verified")
 
 
 # --------------------------------------------------------------------------- #
