@@ -18,6 +18,7 @@ This module splits cleanly into:
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import sys
@@ -235,6 +236,50 @@ def decide(obs: Observation, policy: Policy) -> list[Action]:
 # --------------------------------------------------------------------------- #
 # The imperative shell
 # --------------------------------------------------------------------------- #
+def restore_state(st: SupervisorState, doc: dict | None) -> SupervisorState:
+    """Re-adopt a live world from the durable epoch document.
+
+    SupervisorState is cross-tick memory held in the PROCESS, so a restarted
+    supervisor starts at epoch 0 / members {} -- and ``decide`` reads
+    ``obs.epoch == 0`` as "nothing has ever been published" and republishes
+    EPOCH 1 over a live world. Sidecars kill and relaunch torchrun on an epoch
+    change, so all N boxes churn at once, their heartbeats go quiet, and
+    ``replace_on_loss`` then launches a replacement for every one of them. That
+    is how a supervisor SIGKILL grew an 8-node fleet to 14 in the rehearsal.
+
+    The authority already lives in S3 -- epoch.json is written on every
+    publication. This just reads it back, so a restart is a no-op instead of a
+    fleet rebuild. Which is what makes "if the supervisor throws, reboot it" a
+    cheap strategy rather than a $3-and-four-minutes one.
+
+    Deliberately total: a missing document is a genuine cold start (epoch 0 is
+    then the truth and the startup branch SHOULD run), and a malformed one --
+    truncated, half-written, hand-edited -- degrades to the same, because
+    raising here would turn a recoverable restart into a dead control plane.
+    """
+    if not doc:
+        return st
+    try:
+        epoch = int(doc.get("epoch") or 0)
+        raw = doc.get("members") or []
+        members = {int(m["node"]): m.get("ip") for m in raw if m.get("node") is not None}
+    except (TypeError, ValueError, AttributeError):
+        return st
+    if epoch <= 0 or not members:
+        return st
+    st.epoch = epoch
+    st.members = frozenset(members)
+    st.ips = {n: ip for n, ip in members.items() if ip}
+    # epoch_doc() builds `ordered = [master, *rest]`, so rank 0 IS the master --
+    # the ordering is the authority and there is no separate field to trust.
+    ranked = sorted(
+        (m for m in raw if m.get("node") is not None),
+        key=lambda m: m.get("rank", 0),
+    )
+    st.master = int(ranked[0]["node"]) if ranked else None
+    return st
+
+
 def elect_master(
     members: tuple[int, ...], prev_members: frozenset[int], current_master: int | None
 ) -> int:
@@ -737,6 +782,22 @@ class Supervisor:
         """Drive the run to completion (metrics.json) or the deadline. Returns the
         parsed metrics, or None on timeout."""
         import sys
+
+        # RE-ADOPT before the first tick. run() is what the systemd unit
+        # re-enters after a crash, so this is the one place that sees every
+        # restart. On a cold start there is no epoch document and this is a
+        # no-op; on a restart it is the difference between continuing a live
+        # world and rebuilding one that was training fine.
+        prior = self.st.epoch
+        with contextlib.suppress(Exception):  # a failed read must not block a restart
+            self.st = restore_state(
+                self.st, aws.get_json(self.cfg.bucket, self.cfg.run_epoch_key(self.run_id))
+            )
+        if self.st.epoch > prior:
+            self._event(
+                f"re-adopted epoch {self.st.epoch}: members {sorted(self.st.members)} "
+                f"master=node{self.st.master} (restarted onto a live world, not re-forming it)"
+            )
 
         end = time.monotonic() + deadline_s
         while time.monotonic() < end:

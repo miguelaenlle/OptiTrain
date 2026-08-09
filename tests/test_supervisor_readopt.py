@@ -44,8 +44,6 @@ hour of fleet time.
 
 from __future__ import annotations
 
-import pytest
-
 from orchestrator.supervisor import (
     LaunchReplacement,
     NodeObs,
@@ -54,6 +52,7 @@ from orchestrator.supervisor import (
     PublishEpoch,
     SupervisorState,
     decide,
+    restore_state,
 )
 
 POLICY = Policy(replace_on_loss=True, recovery_timeout_s=600.0)
@@ -94,21 +93,39 @@ def test_a_live_supervisor_at_steady_state_does_nothing():
 
 
 def test_restarted_supervisor_must_not_republish_epoch_1_over_a_live_world():
-    """THE BUG. With state reset to defaults the reducer cannot tell "no epoch
-    has ever been published" from "I forgot which epoch is live", and picks the
-    most destructive reading -- it republishes epoch 1 over a live epoch 8.
+    """THE BUG, stated where it can actually be fixed.
 
-    Passing this test is exactly what state restoration buys: obs.epoch reflects
-    the DURABLE epoch, so the startup branch is not taken at all.
+    An earlier version of this test asserted that ``decide`` itself must not
+    republish when handed ``epoch=0``. That was wrong, and provably so: it fed
+    the reducer exactly the same Observation as
+    ``test_genuine_cold_start_still_publishes_epoch_1`` and demanded the opposite
+    answer. At the reducer's interface "restarted onto a live world" and "cold
+    start" are the SAME observation -- which is precisely why the fix cannot live
+    there.
+
+    So the property is about the SHELL: a supervisor that restarts while
+    epoch.json says a world is live must rebuild its memory from that document
+    BEFORE observing, and then decide nothing. Restoration is what makes the
+    restart invisible; the reducer stays honest and unchanged.
     """
-    restarted = _obs(epoch=0, members=frozenset(), no_progress_s=None)
-    actions = decide(restarted, POLICY)
+    live_doc = {
+        "epoch": 8,
+        "members": [{"node": i, "ip": f"172.31.0.{i}", "rank": i} for i in range(8)],
+    }
+    # A freshly-started process: SupervisorState() is all defaults.
+    st = restore_state(SupervisorState(), live_doc)
+    assert st.epoch == 8, "restart did not re-adopt the live epoch"
+
+    # The first Observation is built from that restored memory.
+    first_tick = _obs(epoch=st.epoch, members=st.members)
+    actions = decide(first_tick, POLICY)
     republished = [a for a in actions if isinstance(a, PublishEpoch)]
     assert not republished, (
         f"restarted supervisor republished {republished} over a live epoch-8 world; "
-        f"sidecars restart torchrun on an epoch change, which is what cascaded the "
-        f"fleet from 8 to 14 boxes in the rehearsal"
+        f"sidecars kill and relaunch torchrun on an epoch change, which is what "
+        f"cascaded the fleet from 8 to 14 boxes in the rehearsal"
     )
+    assert actions == [], f"a restart onto a healthy world must be a no-op, got {actions}"
 
 
 def test_restored_state_makes_the_restart_a_no_op():
@@ -147,14 +164,7 @@ def test_genuine_cold_start_still_publishes_epoch_1():
 # The restore itself
 # --------------------------------------------------------------------------- #
 def _restore():
-    """The function under test, once it exists. Skips (rather than fails) until
-    then, so this file is useful to whoever is mid-fix."""
-    from orchestrator import supervisor
-
-    fn = getattr(supervisor, "restore_state", None)
-    if fn is None:
-        pytest.skip("supervisor.restore_state not implemented yet")
-    return fn
+    return restore_state
 
 
 EPOCH_DOC = {
