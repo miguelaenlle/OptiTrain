@@ -83,9 +83,17 @@ if [ -n "$NEWEST" ]; then
     # Tick filenames are zero-padded to 15 digits, and bash reads a leading-zero
     # number as OCTAL ("value too great for base"). 10# forces base 10.
     AGE=$(( $(date -u +%s) - 10#$LASTTICK/1000 ))
-    [ "$AGE" -gt 120 ] \
-      && ok "newest run ($NEWEST) went quiet ${AGE}s ago — no live supervisor" \
-      || bad "run $NEWEST wrote a status tick ${AGE}s ago — SOMETHING IS STILL RUNNING"
+    # A recent tick only means something is RUNNING if instances are actually
+    # alive. Right after a teardown the last tick is seconds old because the
+    # supervisor wrote it just before dying -- flagging that is a false alarm,
+    # and a stop button that cries wolf gets ignored.
+    if [ -z "$LIVE" ]; then
+      ok "newest run ($NEWEST) last wrote ${AGE}s ago, but nothing is running"
+    elif [ "$AGE" -gt 120 ]; then
+      ok "newest run ($NEWEST) went quiet ${AGE}s ago — no live supervisor"
+    else
+      bad "run $NEWEST wrote a status tick ${AGE}s ago AND instances are up — STILL RUNNING"
+    fi
   else
     ok "newest run ($NEWEST) has no status ticks"
   fi

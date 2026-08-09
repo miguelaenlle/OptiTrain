@@ -1,73 +1,60 @@
 #!/usr/bin/env bash
-# One idempotent entry point for every paid experiment.
+# One entry point for every paid experiment.
 #
-#   experiments/exp.sh <name> up       start, or REJOIN if already running
-#   experiments/exp.sh <name> status   one-shot snapshot
-#   experiments/exp.sh <name> watch    follow until it ends (Ctrl-C is safe)
-#   experiments/exp.sh <name> dash     ensure the Grafana loop + print the URL
-#   experiments/exp.sh <name> verify   PASS/FAIL checks for this experiment
-#   experiments/exp.sh <name> down     verified teardown
-#   experiments/exp.sh list            what exists and what is live
+#   experiments/exp.sh                 what is live, what it costs, what to type next
+#   experiments/exp.sh up <name>       start, or REJOIN if already running
+#   experiments/exp.sh watch           follow: events as they happen (Ctrl-C is safe)
+#   experiments/exp.sh status          one-shot snapshot
+#   experiments/exp.sh verify          PASS/FAIL checks
+#   experiments/exp.sh down            verified teardown  (no name needed)
+#   experiments/exp.sh list            every experiment
 #
-# WHY IT IS SHAPED THIS WAY
+# The experiment NAME is only needed for `up`. Everything else resolves to
+# whichever experiment is live, because when you are worried about a running
+# job you should not have to remember what you called it. `exp.sh <name> <cmd>`
+# still works, for scripts and agents that want to be explicit.
 #
-# The operator and an agent both need to drive the same run, from different
-# shells, at different times, without stepping on each other. So there is NO
-# local state: the pointer lives in S3 at experiments/<name>/current.json, and
-# every subcommand rediscovers from there. A fresh clone, a second terminal, or
-# an agent that has never seen this run can all `status` it immediately.
+# WHY THERE IS NO LOCAL STATE
+#
+# The operator and an agent drive the same run from different shells at
+# different times. The pointer lives in S3 at experiments/<name>/current.json,
+# so a fresh clone, a second terminal, or an agent that has never seen this run
+# can all act on it immediately -- the same S3-is-the-control-plane property the
+# system already runs on.
 #
 # `up` is idempotent because a second launch is the expensive mistake: it would
-# double an 8-node fleet. It reads the pointer, checks whether that control
-# plane is STILL ALIVE in EC2 (the pointer alone is not proof -- the box may
-# have died), and rejoins if so. Only a genuinely dead or absent run launches.
+# double an 8-node fleet. It reads the pointer, then CONFIRMS against EC2 that
+# the control plane is still alive -- a pointer is a claim, not proof, and we
+# have run the experiment where the box it named had died.
 #
-# Ctrl-C anywhere is safe. Nothing here owns the run; the control plane is on
-# AWS and keeps going. That is the same property the whole system is built on.
+# Ctrl-C is safe everywhere. Nothing here owns the run.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-NAME="${1:-}"; CMD="${2:-status}"
-[ -n "$NAME" ] || { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
-
-set -a && . ./.env && set +a
+# The RECIPE is not optional. Sourcing only .env leaves DATASET/N_LAYER/N_EMBD/
+# BLOCK_SIZE/GLOBAL_BATCH_SIZE at their defaults, which are the shakespeare_char
+# toy settings -- step4 ran a 10.67M char model instead of GPT-2 124M on
+# OpenWebText and nothing said so. Silent-wrong-config is the failure mode this
+# repo keeps hitting; `up` now prints the resolved model before spending.
+set -a && . ./.env && . ./recipes/gpt2-owt.env && set +a
 REGION="${TRAIN_REGION:-us-east-1}"
 B="$SPOT_TRAIN_BUCKET"
-PTR="experiments/$NAME/current.json"
+KNOWN="step4 step5 final24h"
 
 # --------------------------------------------------------------------------- #
-# Experiment definitions. Add a case; everything else is generic.
-#
-# BUDGET is passed as TRAIN_BUDGET_SECONDS and NEVER as an experiment's own key:
-# `multinode` reads BASELINE_SECONDS, `multinode-preempt` reads
-# TRAIN_TOTAL_SECONDS, and naming the wrong one is SILENT -- the run takes the
-# 300s default, trains ~200s and finishes before the test starts. orch up
-# translates TRAIN_BUDGET_SECONDS into whichever key applies.
+# Arg parsing: verb-first for humans, noun-first for scripts.
 # --------------------------------------------------------------------------- #
-case "$NAME" in
-  step4)   # laptop disconnect / reconnect. Clean job; the observer is the test.
-    KIND=multinode; NODES=2; BUDGET=2400
-    EXTRA=(--env LOG_INTERVAL_STEPS=1 --env EVAL_INTERVAL_STEPS=25
-           --env CHECKPOINT_INTERVAL_SECONDS=30) ;;
-  step5)   # 1h chaos rehearsal, all event types in order
-    KIND=multinode-preempt; NODES=8; BUDGET=3300
-    EXTRA=(--env LOG_INTERVAL_STEPS=1 --env EVAL_INTERVAL_STEPS=25
-           --env CHECKPOINT_INTERVAL_SECONDS=120 --env SAMPLE_INTERVAL_STEPS=200
-           --env MAX_EPOCHS_WITHOUT_PROGRESS=30
-           --env "PREEMPT_SCHEDULE=480:3;960:L;1440:1,4;2400:0,1,2,3,4,5;3000:7") ;;
-  final24h)
-    KIND=multinode-preempt; NODES=8; BUDGET=82800
-    EXTRA=(--env LOG_INTERVAL_STEPS=10 --env EVAL_INTERVAL_STEPS=300
-           --env CHECKPOINT_INTERVAL_SECONDS=120 --env SAMPLE_INTERVAL_STEPS=1500
-           --env MAX_EPOCHS_WITHOUT_PROGRESS=30) ;;
-  list) : ;;
-  *) echo "unknown experiment '$NAME' (step4 | step5 | final24h)" >&2; exit 2 ;;
+A1="${1:-}"; A2="${2:-}"
+case " $KNOWN " in
+  *" $A1 "*) NAME="$A1"; CMD="${A2:-status}" ;;        # exp.sh step5 up
+  *)         CMD="${A1:-overview}"; NAME="${A2:-}" ;;  # exp.sh up step5 | exp.sh status
 esac
 
-hr()  { printf '%s\n' "--------------------------------------------------------------"; }
-say() { printf '\n\033[1m[%s %s] %s\033[0m\n' "$NAME" "$(date -u +%H:%M:%S)" "$*"; }
+hr()  { printf '%s\n' "----------------------------------------------------------------"; }
+say() { printf '\n\033[1m[%s] %s\033[0m\n' "$(date -u +%H:%M:%S)" "$*"; }
 ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; }
+tip() { printf '\n  \033[36mnext:\033[0m %s\n\n' "$1"; }
 
 s3get() { aws s3 cp "s3://$B/$1" - --region "$REGION" 2>/dev/null; }
 jq_() { python3 -c "import json,sys
@@ -75,190 +62,302 @@ try: d=json.load(sys.stdin)
 except Exception: sys.exit()
 print(d.get('$1','') if isinstance(d,dict) else '')"; }
 
-pointer_orch() { s3get "$PTR" | jq_ orch_id; }
-pointer_run()  { s3get "$PTR" | jq_ run_id; }
-
-# A pointer is a CLAIM, not proof. The box it names may have died -- which is a
-# whole experiment we ran. Always confirm against EC2.
-orch_alive() {
-  [ -n "${1:-}" ] || return 1
-  local n
-  n=$(aws ec2 describe-instances --region "$REGION" \
-    --filters "Name=tag:orch,Values=$1" "Name=instance-state-name,Values=running,pending" \
-    --query 'length(Reservations[].Instances[])' --output text 2>/dev/null || echo 0)
-  [ "${n:-0}" != "0" ]
-}
 fleet_size() {
   aws ec2 describe-instances --region "$REGION" \
     --filters "Name=tag:Name,Values=spot-train-$1" \
               "Name=instance-state-name,Values=running,pending" \
     --query 'length(Reservations[].Instances[])' --output text 2>/dev/null || echo 0
 }
-last_tick_age() {   # seconds since the supervisor last wrote — liveness, not a guess
-  local t
-  t=$(aws s3 ls "s3://$B/runs/$1/status/" --region "$REGION" 2>/dev/null \
+orch_alive() {
+  [ -n "${1:-}" ] || return 1
+  local n; n=$(aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:orch,Values=$1" "Name=instance-state-name,Values=running,pending" \
+    --query 'length(Reservations[].Instances[])' --output text 2>/dev/null || echo 0)
+  [ "${n:-0}" != "0" ]
+}
+last_tick_age() {
+  local t; t=$(aws s3 ls "s3://$B/runs/$1/status/" --region "$REGION" 2>/dev/null \
       | tail -1 | awk '{print $4}' | sed 's/\.json//')
   [ -n "$t" ] || { echo ""; return; }
   echo $(( $(date -u +%s) - 10#$t/1000 ))
 }
-steps_of() { grep -hcE '^step [0-9]+: loss' deploy/grafana/.live/"$1"/logs/boot-node*.log 2>/dev/null | paste -sd+ - | bc 2>/dev/null || echo 0; }
+# Durable step from the SUPERVISOR's own status doc, not from a local log copy.
+# The local copy only advances while live.py is running, so a healthy run with
+# no dashboard loop would otherwise report 0 steps forever -- exactly the
+# confusion that made a working run look dead.
+durable_step() { s3get "runs/$1/status.json" | jq_ ckpt_step; }
+run_done()     { s3get "runs/$1/metrics.json" >/dev/null 2>&1; }
 
-# --------------------------------------------------------------------------- #
-list_all() {
-  hr; printf '  %-10s %-30s %-8s %s\n' EXPERIMENT RUN FLEET "LAST TICK"; hr
-  for n in step4 step5 final24h; do
-    local r f a
-    r=$(s3get "experiments/$n/current.json" | jq_ run_id)
-    [ -n "$r" ] || { printf '  %-10s %-30s\n' "$n" "(never run)"; continue; }
-    f=$(fleet_size "$r"); a=$(last_tick_age "$r")
-    printf '  %-10s %-30s %-8s %s\n' "$n" "$r" "$f" "${a:+${a}s ago}"
-  done; hr
+# Cost so far. export.py derives it from the observed instance ledger in the
+# status ticks, so it is right mid-run, not just at the end.
+cost_of() {
+  local rid="$1" n="${2:-2}"
+  python3 deploy/grafana/export.py "$rid" --live --nodes="$n" \
+    --src="deploy/grafana/.live/$rid" >/dev/null 2>&1
+  python3 -c "
+import csv,sys
+try:
+    rows=[r for r in csv.DictReader(open('deploy/grafana/data/$rid/timeseries.csv')) if r.get('usd')]
+    print(f\"\$%.2f\" % float(rows[-1]['usd']) if rows else '')
+except Exception: print('')" 2>/dev/null
 }
-[ "$NAME" = "list" ] && { list_all; exit 0; }
+
+pointer_of() { s3get "experiments/$1/current.json"; }
+
+# Resolve the experiment when the operator did not name one: prefer a live
+# control plane, then a live fleet, then the most recently started.
+resolve_name() {
+  [ -n "$NAME" ] && return 0
+  local best="" best_t=0
+  for n in $KNOWN; do
+    local p o r t; p=$(pointer_of "$n"); [ -n "$p" ] || continue
+    o=$(echo "$p" | jq_ orch_id); r=$(echo "$p" | jq_ run_id); t=$(echo "$p" | jq_ started_at)
+    if orch_alive "$o" || [ "$(fleet_size "$r")" != "0" ]; then NAME="$n"; return 0; fi
+    [ "${t:-0}" -gt "$best_t" ] 2>/dev/null && { best="$n"; best_t="$t"; }
+  done
+  NAME="$best"
+  [ -n "$NAME" ]
+}
 
 # --------------------------------------------------------------------------- #
+# Experiment definitions. Add a case; everything else is generic.
+#
+# BUDGET is passed as TRAIN_BUDGET_SECONDS and NEVER as an experiment's own key:
+# `multinode` reads BASELINE_SECONDS, `multinode-preempt` reads
+# TRAIN_TOTAL_SECONDS, and naming the wrong one is SILENT -- the run takes the
+# 300s default, trains ~200s and finishes before the test starts. That cost two
+# attempts. orch up translates TRAIN_BUDGET_SECONDS into whichever key applies.
+# --------------------------------------------------------------------------- #
+load_def() {
+  case "$1" in
+    step4)  KIND=multinode; NODES=2; BUDGET=2400
+      EXTRA=(--env LOG_INTERVAL_STEPS=1 --env EVAL_INTERVAL_STEPS=25
+             --env CHECKPOINT_INTERVAL_SECONDS=30) ;;
+    step5)  # compressed replica of the 24h run: every event type, in order, in ~55 min
+      KIND=multinode-preempt; NODES=8; BUDGET=3600
+      EXTRA=(--env LOG_INTERVAL_STEPS=1 --env EVAL_INTERVAL_STEPS=25
+             --env CHECKPOINT_INTERVAL_SECONDS=120 --env SAMPLE_INTERVAL_STEPS=200
+             --env MAX_EPOCHS_WITHOUT_PROGRESS=30
+             --env "PREEMPT_SCHEDULE=480:3;960:L;1440:1,4;2400:0,1,2,3,4,5;3000:7") ;;
+    final24h)
+      KIND=multinode-preempt; NODES=8; BUDGET=82800
+      EXTRA=(--env LOG_INTERVAL_STEPS=10 --env EVAL_INTERVAL_STEPS=300
+             --env CHECKPOINT_INTERVAL_SECONDS=120 --env SAMPLE_INTERVAL_STEPS=1500
+             --env MAX_EPOCHS_WITHOUT_PROGRESS=30) ;;
+    *) echo "unknown experiment '$1' ($KNOWN)" >&2; return 2 ;;
+  esac
+}
+
+# --------------------------------------------------------------------------- #
+ensure_grafana() {
+  curl -sf -o /dev/null --max-time 3 http://localhost:3001/api/health 2>/dev/null && return 0
+  echo "  starting Grafana..."
+  (cd deploy/grafana && docker compose up -d >/dev/null 2>&1) || true
+  for _ in $(seq 1 20); do
+    curl -sf -o /dev/null --max-time 2 http://localhost:3001/api/health 2>/dev/null && return 0
+    sleep 2
+  done
+  echo "  WARNING: Grafana not reachable on :3001 — is Docker running?" >&2
+}
 ensure_dash() {
   local rid="$1"
+  ensure_grafana
   pgrep -f "live.py $rid" >/dev/null 2>&1 || {
     nohup python3 deploy/grafana/live.py "$rid" --interval=10 --nodes="$NODES" \
       "--log=deploy/grafana/.live/$rid/logs/orchestrator.log" \
       > "deploy/grafana/live-$rid.log" 2>&1 &
     sleep 1
   }
-  local from; from=$(( $(s3get "$PTR" | jq_ started_at) * 1000 - 60000 ))
+  local from; from=$(( $(pointer_of "$NAME" | jq_ started_at) * 1000 - 60000 ))
   echo "  http://localhost:3001/d/dist-training/?var-run=$rid&from=$from&to=now&refresh=10s"
 }
 
+# --------------------------------------------------------------------------- #
+do_overview() {
+  hr; printf '  %-9s %-28s %-6s %-9s %s\n' EXPERIMENT RUN FLEET COST "SUPERVISOR"; hr
+  local live_name="" live_run=""
+  for n in $KNOWN; do
+    local p r f a c; p=$(pointer_of "$n")
+    [ -n "$p" ] || { printf '  %-9s %s\n' "$n" "(never run)"; continue; }
+    r=$(echo "$p" | jq_ run_id); f=$(fleet_size "$r"); a=$(last_tick_age "$r")
+    c=$(cost_of "$r" "$(echo "$p" | jq_ nodes)")
+    local ended; ended=$(echo "$p" | jq_ ended_at)
+    printf '  %-9s %-28s %-6s %-9s %s\n' "$n" "$r" "$f" "${c:--}" \
+      "$([ -n "$ended" ] && echo "ended" || echo "${a:+${a}s ago}")"
+    [ "$f" != "0" ] && { live_name="$n"; live_run="$r"; }
+  done
+  hr
+  if [ -n "$live_name" ]; then
+    printf '\n  \033[1m%s is LIVE\033[0m (%s boxes)\n' "$live_name" "$(fleet_size "$live_run")"
+    tip "experiments/exp.sh watch     ·  stop it: experiments/exp.sh down"
+  else
+    tip "experiments/exp.sh up step5     (nothing is running)"
+  fi
+}
+
 do_status() {
-  local o r; o=$(pointer_orch); r=$(pointer_run)
-  [ -n "$r" ] || { echo "[$NAME] never started. Run: experiments/exp.sh $NAME up"; return 1; }
-  local f a s; f=$(fleet_size "$r"); a=$(last_tick_age "$r"); s=$(steps_of "$r")
+  local p; p=$(pointer_of "$NAME")
+  [ -n "$p" ] || { echo "[$NAME] never started."; tip "experiments/exp.sh up $NAME"; return 1; }
+  local o r nodes; o=$(echo "$p" | jq_ orch_id); r=$(echo "$p" | jq_ run_id); nodes=$(echo "$p" | jq_ nodes)
+  local f a d c; f=$(fleet_size "$r"); a=$(last_tick_age "$r"); d=$(durable_step "$r"); c=$(cost_of "$r" "$nodes")
   hr
-  printf '  run          %s\n' "$r"
-  printf '  orch         %s  (%s)\n' "$o" "$(orch_alive "$o" && echo alive || echo DEAD)"
+  printf '  experiment   %s\n'         "$NAME"
+  printf '  run          %s\n'         "$r"
+  printf '  control      %s  (%s)\n'   "$o" "$(orch_alive "$o" && echo alive || echo DEAD)"
   printf '  fleet        %s box(es)\n' "$f"
-  printf '  supervisor   %s\n' "${a:+last tick ${a}s ago}"
-  printf '  steps seen   %s   (local log copy; run `dash` to refresh)\n' "$s"
-  s3get "runs/$r/metrics.json" >/dev/null 2>&1 \
-    && printf '  \033[33mrun COMPLETE (metrics.json written)\033[0m\n'
+  printf '  durable step %s\n'         "${d:--}"
+  printf '  cost so far  %s\n'         "${c:--}"
+  printf '  supervisor   %s\n'         "${a:+last tick ${a}s ago}"
+  run_done "$r" && printf '  \033[33mrun COMPLETE (metrics.json written)\033[0m\n'
   hr
+  if run_done "$r"; then       tip "experiments/exp.sh verify   then   experiments/exp.sh down"
+  elif [ "$f" = "0" ]; then    tip "experiments/exp.sh up $NAME    (fleet is gone)"
+  else                         tip "experiments/exp.sh watch     ·  stop it: experiments/exp.sh down"; fi
 }
 
 do_up() {
-  local o r; o=$(pointer_orch); r=$(pointer_run)
+  [ -n "$NAME" ] || { echo "which experiment? ($KNOWN)" >&2; return 2; }
+  load_def "$NAME" || return $?
+  local p o r; p=$(pointer_of "$NAME"); o=$(echo "$p" | jq_ orch_id); r=$(echo "$p" | jq_ run_id)
   if [ -n "$r" ] && orch_alive "$o"; then
-    say "REJOINING $r (control plane $o is alive) — not launching"
+    say "REJOINING $r — control plane $o is alive, launching nothing"
     do_status; say "dashboard"; ensure_dash "$r"; return 0
   fi
-  if [ -n "$r" ] && [ "$(fleet_size "$r")" != "0" ]; then
-    # Fleet up, control plane gone: this is the box-failure case. Adopt it.
-    say "control plane $o is GONE but $(fleet_size "$r") box(es) still train — adopting $r"
+  if [ -n "$r" ] && [ "$(fleet_size "$r")" != "0" ] && ! run_done "$r"; then
+    say "control plane GONE, $(fleet_size "$r") box(es) still training — adopting $r"
     OUT=$(python3 -m orchestrator orch up --no-attach --experiment "$KIND" --run-id "$r" \
       --env MARKET=on-demand --env "NODES=$NODES" --env "TRAIN_BUDGET_SECONDS=$BUDGET" \
-      --env CHECKPOINT_KEEP=10 --env VCPU_QUOTA=64 "${EXTRA[@]}" 2>&1) || { echo "$OUT" >&2; return 1; }
+      --env CHECKPOINT_KEEP=10 --env VCPU_QUOTA=64 "${EXTRA[@]}" 2>&1) \
+      || { echo "$OUT" >&2; return 1; }
     o=$(echo "$OUT" | grep -oE 'orch-[0-9]{8}-[0-9]{6}' | head -1)
   else
-    say "starting a NEW $KIND run: $NODES nodes, budget ${BUDGET}s"
+    say "starting $NAME: $KIND, $NODES nodes, budget ${BUDGET}s"
+    printf '  model   %sL/%sH/%sd  ctx %s  global batch %s\n' \
+      "${N_LAYER:-?}" "${N_HEAD:-?}" "${N_EMBD:-?}" "${BLOCK_SIZE:-?}" "${GLOBAL_BATCH_SIZE:-?}"
+    printf '  dataset %s\n' "${DATASET:-?}"
+    if [ "${DATASET:-}" != "openwebtext" ]; then
+      echo "  REFUSING: DATASET=${DATASET:-unset}, expected openwebtext." >&2
+      echo "  A paid chaos run on the wrong corpus produces numbers that look" >&2
+      echo "  fine and compare to nothing. Check recipes/gpt2-owt.env." >&2
+      return 1
+    fi
     OUT=$(python3 -m orchestrator orch up --no-attach --experiment "$KIND" \
       --env MARKET=on-demand --env "NODES=$NODES" --env "TRAIN_BUDGET_SECONDS=$BUDGET" \
-      --env CHECKPOINT_KEEP=10 --env VCPU_QUOTA=64 "${EXTRA[@]}" 2>&1) || { echo "$OUT" >&2; return 1; }
+      --env CHECKPOINT_KEEP=10 --env VCPU_QUOTA=64 "${EXTRA[@]}" 2>&1) \
+      || { echo "$OUT" >&2; return 1; }
     o=$(echo "$OUT" | grep -oE 'orch-[0-9]{8}-[0-9]{6}' | head -1)
-    r=""
-    for _ in $(seq 1 40); do
+    r=""; for _ in $(seq 1 40); do
       r=$(s3get "orchestrators/$o/orch.json" | jq_ run_id); [ -n "$r" ] && break; sleep 10
     done
   fi
-  [ -n "$r" ] || { echo "[$NAME] control plane never minted a run id" >&2; return 1; }
-  # Publish the pointer so any other shell -- or agent -- finds this run.
+  [ -n "$r" ] || { echo "control plane never minted a run id" >&2; return 1; }
   printf '{"experiment":"%s","orch_id":"%s","run_id":"%s","started_at":%s,"nodes":%s}' \
     "$NAME" "$o" "$r" "$(date -u +%s)" "$NODES" \
-    | aws s3 cp - "s3://$B/$PTR" --region "$REGION" --only-show-errors
-  say "run=$r orch=$o"; say "dashboard"; ensure_dash "$r"
-  [ "$NAME" = "step4" ] && cat <<'STEP4'
-
-  ┌──────────────────────────────────────────────────────────────┐
-  │  STEP 4 — the operator IS the test.                          │
-  │                                                              │
-  │  1. Wait until `status` shows steps climbing (~6 min).       │
-  │  2. DISCONNECT wifi / close the lid for at least 8 minutes.  │
-  │  3. Reconnect, then run:                                     │
-  │         experiments/exp.sh step4 dash     # backfills        │
-  │         experiments/exp.sh step4 verify                      │
-  │                                                              │
-  │  The run must be untouched, and the dashboard must have NO   │
-  │  hole across the offline window.                             │
-  └──────────────────────────────────────────────────────────────┘
-STEP4
-  return 0
+    | aws s3 cp - "s3://$B/experiments/$NAME/current.json" --region "$REGION" --only-show-errors
+  say "run=$r  orch=$o"; say "dashboard"; ensure_dash "$r"
+  tip "experiments/exp.sh watch     ·  stop it: experiments/exp.sh down"
 }
 
+# Follow: counters on one line, and EVENTS on their own lines as they land, so
+# it reads like a record of what the system decided rather than three numbers.
 do_watch() {
-  local r; r=$(pointer_run); [ -n "$r" ] || { echo "not started"; return 1; }
+  local p r nodes; p=$(pointer_of "$NAME"); r=$(echo "$p" | jq_ run_id)
+  [ -n "$r" ] || { echo "[$NAME] not started"; return 1; }
+  nodes=$(echo "$p" | jq_ nodes)
   echo "[$NAME] watching $r — Ctrl-C detaches, the run keeps going"
+  local seen; seen=$(mktemp); : > "$seen"
   while true; do
-    printf '\r  fleet=%-3s steps=%-6s tick=%-8s' \
-      "$(fleet_size "$r")" "$(steps_of "$r")" "$(last_tick_age "$r")s"
-    s3get "runs/$r/metrics.json" >/dev/null 2>&1 && { echo; echo "  run complete."; return 0; }
+    s3get "runs/$r/logs/orchestrator.log" 2>/dev/null \
+      | grep -oE "published epoch [0-9]+: members \[[^]]*\] master=node[0-9]+|terminated node [0-9]+|re-adopted epoch [0-9]+|adopted [0-9]+ running box|whole-group restart" \
+      | sort -u > /tmp/ev.$$ 2>/dev/null || true
+    if [ -s /tmp/ev.$$ ]; then
+      comm -13 "$seen" /tmp/ev.$$ 2>/dev/null | while read -r line; do
+        [ -n "$line" ] && printf '\r  \033[35m%s  %s\033[0m\n' "$(date -u +%H:%M:%S)" "$line"
+      done
+      mv /tmp/ev.$$ "$seen"
+    fi
+    printf '\r  fleet=%-3s durable=%-7s cost=%-8s tick=%-6s' \
+      "$(fleet_size "$r")" "$(durable_step "$r")" "$(cost_of "$r" "$nodes")" "$(last_tick_age "$r")s"
+    run_done "$r" && { echo; echo "  run complete."; rm -f "$seen"; tip "experiments/exp.sh verify"; return 0; }
     sleep 15
   done
 }
 
 do_verify() {
-  local r; r=$(pointer_run); [ -n "$r" ] || { echo "not started"; return 1; }
-  say "verifying $r"
-  python3 deploy/grafana/export.py "$r" --live --nodes="$NODES" \
+  local p r nodes; p=$(pointer_of "$NAME"); r=$(echo "$p" | jq_ run_id)
+  [ -n "$r" ] || { echo "[$NAME] not started"; return 1; }
+  nodes=$(echo "$p" | jq_ nodes)
+  say "verifying $NAME / $r"
+  python3 deploy/grafana/export.py "$r" --live --nodes="$nodes" \
     --src="deploy/grafana/.live/$r" >/dev/null 2>&1
-  local D="deploy/grafana/data/$r"
-  local pass=0 fail=0
+  local D="deploy/grafana/data/$r" pass=0 fail=0
   chk() { if [ "$1" = 1 ]; then ok "$2"; pass=$((pass+1)); else bad "$2"; fail=$((fail+1)); fi; }
-
-  chk "$([ "$(steps_of "$r")" -gt 0 ] && echo 1 || echo 0)" "training produced steps"
-  chk "$([ -s "$D/world.csv" ] && echo 1 || echo 0)"        "world.csv has rows"
-
-  if [ "$NAME" = "step4" ]; then
-    # THE test. The supervisor wrote a status object every tick throughout; the
-    # laptop simply fetched them late. So after `dash` backfills, there must be
-    # NO gap -- and the control-plane-down detector must agree by drawing
-    # nothing. A band here means backfill is broken; it is the exact inverse of
-    # the box-failure test, which is why the two check each other.
-    local bands; bands=$(python3 -c "
+  local bands; bands=$(python3 -c "
 import json
 try: print(len(json.load(open('$D/control_plane_down.json'))))
 except Exception: print(-1)")
-    chk "$([ "$bands" = "0" ] && echo 1 || echo 0)" \
-        "NO control-plane-down band (supervisor never stopped writing) [got $bands]"
-    local gap; gap=$(python3 -c "
-import csv
-ts=[int(r['time'])/1000 for r in csv.DictReader(open('$D/timeseries.csv'))]
-g=[b-a for a,b in zip(ts,ts[1:]) if b-a>120]
-print(f'{max(g):.0f}' if g else '0')" 2>/dev/null || echo -1)
-    chk "$([ "${gap%%.*}" -lt 120 ] 2>/dev/null && echo 1 || echo 0)" \
-        "no >120s hole in the timeseries across the offline window [max ${gap}s]"
-    chk "$(grep -qc 'supervisor_up' "$D/timeseries.csv" 2>/dev/null && echo 1 || echo 0)" \
-        "supervisor_up column present"
-  fi
+
+  chk "$([ -s "$D/world.csv" ] && echo 1 || echo 0)" "world.csv has rows"
+  chk "$([ "$(durable_step "$r")" -gt 0 ] 2>/dev/null && echo 1 || echo 0)" "checkpoints advanced"
+
+  case "$NAME" in
+    step4)
+      # The INVERSE of the box-failure test: the supervisor never stopped
+      # writing, the laptop just fetched late, so backfill must leave no trace.
+      chk "$([ "$bands" = "0" ] && echo 1 || echo 0)" \
+          "NO control-plane-down band — backfill closed the offline window [got $bands]" ;;
+    step5|final24h)
+      local kills epochs
+      kills=$(s3get "runs/$r/logs/orchestrator.log" | grep -c "terminated node" || echo 0)
+      epochs=$(s3get "runs/$r/logs/orchestrator.log" | grep -c "published epoch" || echo 0)
+      chk "$([ "$kills" -gt 0 ] && echo 1 || echo 0)"  "chaos schedule fired [$kills kills]"
+      chk "$([ "$epochs" -gt 2 ] && echo 1 || echo 0)" "world re-formed after losses [$epochs epochs]"
+      chk "$(s3get "runs/$r/logs/orchestrator.log" | grep -qc "whole-group restart" && echo 0 || echo 1)" \
+          "ZERO whole-group restarts" ;;
+  esac
   echo
-  [ "$fail" = 0 ] && printf '  \033[32mALL %s PASSED\033[0m\n\n' "$pass" \
-                  || printf '  \033[31m%s passed, %s FAILED\033[0m\n\n' "$pass" "$fail"
+  [ "$fail" = 0 ] && printf '  \033[32mALL %s PASSED\033[0m\n' "$pass" \
+                  || printf '  \033[31m%s passed, %s FAILED\033[0m\n' "$pass" "$fail"
+  tip "experiments/exp.sh down"
   [ "$fail" = 0 ]
 }
 
+do_dash() {
+  local p r; p=$(pointer_of "$NAME"); r=$(echo "$p" | jq_ run_id)
+  [ -n "$r" ] || { echo "[$NAME] not started"; return 1; }
+  load_def "$NAME" >/dev/null 2>&1
+  say "dashboard"; ensure_dash "$r"
+}
+
 do_down() {
-  local o r; o=$(pointer_orch); r=$(pointer_run)
-  say "tearing down $r"
-  pkill -f "live.py $r" 2>/dev/null
+  local p o r; p=$(pointer_of "$NAME"); o=$(echo "$p" | jq_ orch_id); r=$(echo "$p" | jq_ run_id)
+  say "tearing down $NAME / ${r:-?}"
+  [ -n "$r" ] && pkill -f "live.py $r" 2>/dev/null
   [ -n "$o" ] && python3 -m orchestrator orch down --id "$o" --all --yes 2>&1 | tail -3
   . scripts/fleetctl.sh && reap_ours
-  aws s3 rm "s3://$B/$PTR" --region "$REGION" --only-show-errors 2>/dev/null
+  # Mark it ended rather than deleting the pointer. Deleting made the run
+  # unfindable the moment it was torn down, so `verify` -- which reads S3 and
+  # .live, both of which survive -- had nothing to resolve. You almost always
+  # want to verify AFTER stopping the spend, not before.
+  if [ -n "$NAME" ] && [ -n "$p" ]; then
+    echo "$p" | python3 -c "
+import json,sys,time
+d=json.load(sys.stdin); d['ended_at']=int(time.time()); print(json.dumps(d))" \
+      | aws s3 cp - "s3://$B/experiments/$NAME/current.json" --region "$REGION" --only-show-errors
+  fi
+  # Independent audit. Deliberately a separate script: its whole value is that
+  # it asks EC2 directly and is unaffected by anything the teardown printed.
   experiments/validate_teardown.sh
 }
 
 case "$CMD" in
-  up)     do_up ;;
-  status) do_status ;;
-  watch)  do_watch ;;
-  dash)   r=$(pointer_run); [ -n "$r" ] && { say "dashboard"; ensure_dash "$r"; } || echo "not started" ;;
-  verify) do_verify ;;
-  down)   do_down ;;
-  *) echo "unknown command '$CMD' (up|status|watch|dash|verify|down)" >&2; exit 2 ;;
+  overview) do_overview ;;
+  list)     do_overview ;;
+  up)       do_up ;;
+  status)   resolve_name && do_status || { echo "nothing has been run yet"; tip "experiments/exp.sh up step5"; } ;;
+  watch)    resolve_name && do_watch  || echo "nothing is running" ;;
+  verify)   resolve_name && do_verify || echo "nothing to verify" ;;
+  dash)     resolve_name && do_dash   || echo "nothing is running" ;;
+  down)     resolve_name && do_down   || { echo "no experiment pointer — sweeping anyway"; . scripts/fleetctl.sh && reap_ours; experiments/validate_teardown.sh; } ;;
+  *) echo "unknown command '$CMD' (up|status|watch|verify|dash|down|list)" >&2; exit 2 ;;
 esac

@@ -10,7 +10,7 @@
  "editable": true,
  "graphTooltip": 1,
  "time": {
-  "from": "2026-08-09T21:36:56Z",
+  "from": "2026-08-09T22:10:01Z",
   "to": "now"
  },
  "timepicker": {
@@ -37,20 +37,6 @@
     "hide": true,
     "name": "Annotations & Alerts",
     "type": "dashboard"
-   },
-   {
-    "datasource": {
-     "type": "grafana-testdata-datasource",
-     "uid": "testdata-embedded"
-    },
-    "enable": true,
-    "hide": false,
-    "iconColor": "rgba(140, 90, 220, 0.45)",
-    "name": "control plane down",
-    "target": {
-     "scenarioId": "csv_content",
-     "csvContent": "time,timeEnd,text\n1786311833635,1786312109976,control plane down\n"
-    }
    }
   ]
  },
@@ -60,12 +46,17 @@
     "name": "run",
     "label": "Run",
     "type": "custom",
-    "query": "multinode-1786311446,multinode-1786310488,multinode-1786309731,gapdemo-1786240000,multinode-preempt-1786239456,multinode-preempt-1786231481,multinode-preempt-1786227708,multinode-preempt-1786207072,multinode-1785795454",
+    "query": "multinode-1786313431,multinode-1786311446,multinode-1786310488,multinode-1786309731,gapdemo-1786240000,multinode-preempt-1786239456,multinode-preempt-1786231481,multinode-preempt-1786227708,multinode-preempt-1786207072,multinode-1785795454",
     "options": [
+     {
+      "text": "multinode-1786313431",
+      "value": "multinode-1786313431",
+      "selected": true
+     },
      {
       "text": "multinode-1786311446",
       "value": "multinode-1786311446",
-      "selected": true
+      "selected": false
      },
      {
       "text": "multinode-1786310488",
@@ -109,8 +100,8 @@
      }
     ],
     "current": {
-     "text": "multinode-1786311446",
-     "value": "multinode-1786311446",
+     "text": "multinode-1786313431",
+     "value": "multinode-1786313431",
      "selected": true
     },
     "includeAll": false,
