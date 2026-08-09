@@ -466,6 +466,48 @@ def _launch_node(
     )
 
 
+def adopt_fleet(cfg, run_id: str, logs: dict[int, dict]) -> dict[int, str]:
+    """Boxes already running this run: ``{node_index: instance_id}``, filling
+    ``logs`` with each one's live log key as a side effect.
+
+    _run_supervised launches ``node_count`` boxes unconditionally, which is right
+    exactly once -- on a cold start. When the control plane is SIGKILLed and
+    systemd restarts it, the fleet is still up and TRAINING (sidecars run static
+    torchrun against the last published epoch), so relaunching doubles it. In the
+    2-node verification this produced 5 boxes: 2 survivors correctly spared by
+    _reap_orphans, 2 needlessly relaunched, 1 replacement for a survivor that
+    looked dead only because the restarted process no longer knew its instance id.
+
+    Both halves are process memory, and both must come back:
+      * ``node_ids`` -- without it ``_observe`` cannot resolve aws_state, so the
+        node is never even observed, drops out of ``healthy``, and gets replaced;
+      * ``logs``     -- ``_observe`` reads ``logs[node]["key"]`` for the
+        heartbeat, so a missing entry is a KeyError on the first tick.
+
+    status.json is the source because it carries node, attempt, instance_id and
+    log_key in one record, already keyed the way both dicts need. Only entries
+    the supervisor last saw ALIVE are adopted: a dead attempt's row is history,
+    and its slot legitimately needs a fresh box.
+    """
+    doc = aws.get_json(cfg.bucket, cfg.run_status_key(run_id)) or {}
+    adopted: dict[int, str] = {}
+    for entry in doc.get("nodes") or []:
+        node, iid = entry.get("node"), entry.get("instance_id")
+        if node is None or not iid or entry.get("state") != "alive":
+            continue
+        # An instance AWS no longer runs is not adoptable however alive the last
+        # status doc believed it to be -- that document can be a tick stale.
+        if aws.instance_state(iid) != "running":
+            continue
+        adopted[int(node)] = iid
+        logs[int(node)] = {
+            "key": entry.get("log_key") or cfg.run_logs_key(run_id, node=int(node)),
+            "attempt": int(entry.get("attempt", 0)),
+            "state": {"printed": 0},
+        }
+    return adopted
+
+
 def _make_launch_node(cfg, ami, sg_id, run_id, market, budget, profile, logs):
     """Return ``launch(node_index) -> instance_id`` for the supervisor: allocate
     a fresh (attempt-suffixed) log key so a replacement never clobbers the dead
@@ -547,8 +589,21 @@ def _run_supervised(
     launch_node = _make_launch_node(cfg, ami, sg_id, run_id, market, budget, profile, logs)
 
     try:
-        aws.wait_vcpu_headroom(cfg.node_count * cfg.instance_vcpu_count(), cfg.vcpu_quota)
-        for i in range(cfg.node_count):
+        # Adopt before launching. On a cold start this finds nothing and the loop
+        # below launches the whole group, exactly as before; after a control-plane
+        # restart it finds the fleet that never stopped training, and only the
+        # genuinely missing slots are launched.
+        node_ids.update(adopt_fleet(cfg, run_id, logs))
+        missing = [i for i in range(cfg.node_count) if i not in node_ids]
+        if node_ids:
+            print(
+                f"[{kind}] adopted {len(node_ids)} running box(es) "
+                f"{sorted(node_ids)}; launching {len(missing)} more",
+                file=sys.stderr,
+            )
+        if missing:
+            aws.wait_vcpu_headroom(len(missing) * cfg.instance_vcpu_count(), cfg.vcpu_quota)
+        for i in missing:
             node_ids[i] = launch_node(i)
         profile.mark("launch")
 

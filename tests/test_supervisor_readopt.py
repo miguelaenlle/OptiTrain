@@ -204,3 +204,89 @@ def test_restore_tolerates_a_malformed_doc_without_crashing_the_run():
     st = _restore()(SupervisorState(), {"epoch": "not-a-number", "members": None})
     assert st.epoch == 0
     assert st.members == frozenset()
+
+
+# --------------------------------------------------------------------------- #
+# Fleet identity — the half the first version of this file missed
+# --------------------------------------------------------------------------- #
+# Restoring epoch/members alone was NOT enough, and the 2-node cloud check is
+# what proved it: the supervisor re-adopted epoch 3 correctly, then published
+# epoch 4 with members [0] and the fleet went 2 -> 5.
+#
+# Two dicts are ALSO process memory, and _observe needs both:
+#   node_ids[node] -> instance id : without it aws_state cannot be resolved, so
+#                                   the node is never observed at all, drops out
+#                                   of `healthy`, and gets replaced;
+#   logs[node]["key"]             : read every tick for the heartbeat, so a
+#                                   missing entry is a KeyError on tick one.
+#
+# And _run_supervised launched node_count boxes unconditionally, which doubles a
+# fleet that never stopped training. These tests pin the adoption that fixes it.
+class _FakeAws:
+    def __init__(self, status_doc, states):
+        self._doc, self._states = status_doc, states
+        self.described = []
+
+    def get_json(self, _bucket, _key):
+        return self._doc
+
+    def instance_state(self, iid):
+        self.described.append(iid)
+        return self._states.get(iid, "terminated")
+
+
+def _status(*rows):
+    return {
+        "nodes": [
+            dict(zip(("node", "instance_id", "state", "attempt"), r, strict=False)) for r in rows
+        ]
+    }
+
+
+def _adopt(monkeypatch, status_doc, states):
+    from orchestrator import experiments
+
+    fake = _FakeAws(status_doc, states)
+    monkeypatch.setattr(experiments, "aws", fake)
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "bucket": "b",
+            "run_status_key": lambda self, r: "k",
+            "run_logs_key": lambda self, r, node=0, attempt=0: f"logs/{node}",
+        },
+    )()
+    logs: dict[int, dict] = {}
+    return experiments.adopt_fleet(cfg, "run-1", logs), logs
+
+
+def test_adopt_returns_live_boxes_so_they_are_not_relaunched(monkeypatch):
+    doc = _status((0, "i-aaa", "alive", 0), (1, "i-bbb", "alive", 0))
+    adopted, logs = _adopt(monkeypatch, doc, {"i-aaa": "running", "i-bbb": "running"})
+    assert adopted == {0: "i-aaa", 1: "i-bbb"}
+    # logs must be populated too, or _observe raises KeyError on the first tick.
+    assert logs[0]["key"] and logs[1]["key"]
+
+
+def test_adopt_skips_dead_attempts(monkeypatch):
+    """A replaced node keeps its dead attempt in status.json. Adopting that row
+    would resurrect a terminated box's id and make the slot look occupied."""
+    doc = _status((0, "i-dead", "dead", 0), (0, "i-live", "alive", 1))
+    adopted, logs = _adopt(monkeypatch, doc, {"i-live": "running", "i-dead": "terminated"})
+    assert adopted == {0: "i-live"}
+    assert logs[0]["attempt"] == 1
+
+
+def test_adopt_rejects_a_box_aws_no_longer_runs(monkeypatch):
+    """status.json can be a tick stale. Believing it over EC2 would adopt a
+    ghost, and the slot would never be refilled."""
+    doc = _status((0, "i-gone", "alive", 0))
+    adopted, _ = _adopt(monkeypatch, doc, {"i-gone": "shutting-down"})
+    assert adopted == {}
+
+
+def test_cold_start_adopts_nothing(monkeypatch):
+    """No status document => nothing to adopt => launch the whole group."""
+    adopted, logs = _adopt(monkeypatch, None, {})
+    assert adopted == {} and logs == {}
