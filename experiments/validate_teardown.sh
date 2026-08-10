@@ -31,10 +31,19 @@ echo; hr; echo "  TEARDOWN CHECK — region $REGION, tag project=$TAG"; hr
 # terminated are free, so a box mid-shutdown is NOT a failure -- an earlier
 # check of mine called that a bug because it re-queried with no delay and raced
 # the transition.
+# A failed query must never read as "clean". This whole script exists because a
+# teardown claimed success it had not verified; inheriting the same blind spot
+# would defeat the point.
 LIVE=$(aws ec2 describe-instances --region "$REGION" \
   --filters "Name=tag:project,Values=$TAG" "Name=instance-state-name,Values=running,pending" \
   --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name,LaunchTime]' \
-  --output text 2>/dev/null)
+  --output text 2>&1); QRC=$?
+if [ $QRC -ne 0 ]; then
+  hr; printf '  \033[31mUNKNOWN — could not query EC2 (rc=%s)\033[0m\n' "$QRC"
+  printf '    %s\n' "$LIVE" | head -3
+  printf '  Treat this as NOT CLEAN. Check the console before walking away.\n\n'
+  exit 2
+fi
 
 SHUTTING=$(aws ec2 describe-instances --region "$REGION" \
   --filters "Name=tag:project,Values=$TAG" "Name=instance-state-name,Values=shutting-down" \

@@ -39,7 +39,7 @@ cd "$(dirname "$0")/.."
 set -a && . ./.env && . ./recipes/gpt2-owt.env && set +a
 REGION="${TRAIN_REGION:-us-east-1}"
 B="$SPOT_TRAIN_BUCKET"
-KNOWN="step4 step5 final24h"
+KNOWN="step4 step5 step6 final24h"
 
 # --------------------------------------------------------------------------- #
 # Arg parsing: verb-first for humans, noun-first for scripts.
@@ -138,6 +138,22 @@ load_def() {
       EXTRA=(--env LOG_INTERVAL_STEPS=1 --env EVAL_INTERVAL_STEPS=25
              --env CHECKPOINT_INTERVAL_SECONDS=120 --env SAMPLE_INTERVAL_STEPS=200
              --env MAX_EPOCHS_WITHOUT_PROGRESS=30
+             # METRICS_OVERHEAD is WALL-CLOCK SLACK, not schedule. The supervisor
+             # waits for metrics.json (the trainer's done-signal) and gives up at
+             # budget + overhead, measured on the WALL clock -- but the budget
+             # counts TRAINING seconds only. Everything else spends wall without
+             # spending budget: boot, the 17GB dataset pull, and every recovery.
+             #
+             # This killed step5. Default overhead is 1200s, so the deadline was
+             # 3600+1200 = 80 min against a run that honestly needed ~2h. It was
+             # terminated at step 984 with 1749s of budget still owed and no
+             # metrics.json. The deadline was shorter than the run.
+             #
+             # Size it as a generous UPPER BOUND, never an estimate. Too small
+             # kills a healthy fleet and loses the whole run; too large only
+             # means noticing a genuinely wedged one later, which config.py's own
+             # comment calls out as the far cheaper mistake.
+             --env METRICS_OVERHEAD=7200
              # Mass loss is the FINALE, deliberately. An earlier version fired one more
              # kill at t+3000, only 600s after it -- but six replacements launch
              # serially (each blocking in wait_running) and then each pays boot plus
@@ -146,11 +162,65 @@ load_def() {
              # event into a sawtooth. Now it gets a ~21 min tail: full regrow, then
              # sustained training back at world 8.
              --env "PREEMPT_SCHEDULE=480:3;960:L;1440:1,4;2400:0,1,2,3,4,5") ;;
+    step6)  # SCHEDULE PERSISTENCE across a control-plane BOX failure.
+      #
+      # _save_schedule / _restore_schedule has 8 unit tests and ZERO cloud runs.
+      # It is what stops a restarted supervisor replaying PREEMPT_SCHEDULE from
+      # zero -- at hour 8 of the 24h run a replay would re-fire the mass loss of
+      # 6 of 8, unscheduled, with no live knob to stop it (the schedule is baked
+      # into user-data).
+      #
+      # Why this needs its own run rather than riding step5: the assertion is
+      # about what happens BETWEEN two kills, so the control plane must die while
+      # entries are still pending. step5 has no supervisor event at all.
+      #
+      # Two kills 8 min apart on 2 nodes. The operator terminates the control
+      # plane between them; `up` then takes the adopt branch. Assertions:
+      #   - the SPENT kill does not re-fire  (exactly one `terminated node 0`)
+      #   - the PENDING kill still fires, on the ORIGINAL train-start clock, not
+      #     restarted from the adoption moment
+      # The second is the one that catches a wrong fix: restoring `fired` while
+      # re-arming the clock from `now` would pass a naive check and still shift
+      # every remaining kill by the outage duration.
+      KIND=multinode-preempt; NODES=2; BUDGET=1800
+      EXTRA=(--env LOG_INTERVAL_STEPS=1 --env EVAL_INTERVAL_STEPS=0
+             --env CHECKPOINT_INTERVAL_SECONDS=30
+             --env MAX_EPOCHS_WITHOUT_PROGRESS=30
+             # The operator deliberately kills the control plane mid-run here, so
+             # wall clock includes a full outage plus a second control-plane boot.
+             # 1h of slack on a 30 min budget.
+             --env METRICS_OVERHEAD=3600
+             --env "PREEMPT_SCHEDULE=300:0;780:1") ;;
     final24h)
+      # 23h of TRAINING time; wall lands ~24-25h once recovery downtime is added.
+      # LR schedule stays at the recipe's 600000 (Karpathy's) -- deliberately NOT
+      # tuned to the horizon, because the achievable step count is uncertain to
+      # within 2x (step5 ran 1958ms/step late-run vs a 4013ms early baseline), and
+      # tuning to a horizon you cannot predict is worse than not tuning. Keeping
+      # it also makes step counts directly comparable to nanoGPT's published OWT
+      # curve, since the 480x1024 global batch already matches exactly.
       KIND=multinode-preempt; NODES=8; BUDGET=82800
       EXTRA=(--env LOG_INTERVAL_STEPS=10 --env EVAL_INTERVAL_STEPS=300
              --env CHECKPOINT_INTERVAL_SECONDS=120 --env SAMPLE_INTERVAL_STEPS=1500
-             --env MAX_EPOCHS_WITHOUT_PROGRESS=30) ;;
+             --env MAX_EPOCHS_WITHOUT_PROGRESS=30
+             # 6h of slack -> a 29h deadline against a ~25-26h expected wall
+             # clock (23h training + ~23 recoveries at ~300s + boot). See the
+             # step5 note above for why this is an upper bound, not an estimate.
+             --env METRICS_OVERHEAD=21600
+             # ~24 kill events over 23h, spaced ~1h. MEASURED in step5: recovery
+             # to full world is ~213-314s and FLAT in the number of nodes lost --
+             # losing 6 recovered in 259s, the same as losing 1, because
+             # replacements boot in parallel. So 3600s spacing is ~12x recovery,
+             # with ample room even if a replacement is slow to get capacity.
+             #
+             # TWO mass losses, deliberately. Hour 2 is the cheap abort point: it
+             # proves 6-of-8 at production duration with only ~$16 sunk, instead
+             # of discovering a problem at hour 16 with ~$130 gone. Hour 16 keeps
+             # the narrative event, with long steady-state history either side.
+             --env "PREEMPT_SCHEDULE=\
+1800:3;5400:L;7200:0,1,2,3,4,5;10800:6;14400:L;18000:2,7;21600:1;25200:4;\
+28800:L;32400:0,3;36000:5;39600:6;43200:L;46800:1,2;50400:7;54000:4;\
+57600:0,1,2,3,4,5;61200:6;64800:L;68400:3,5;72000:2;75600:7;79200:1") ;;
     *) echo "unknown experiment '$1' ($KNOWN)" >&2; return 2 ;;
   esac
 }
@@ -313,6 +383,55 @@ except Exception: print(-1)")
       # writing, the laptop just fetched late, so backfill must leave no trace.
       chk "$([ "$bands" = "0" ] && echo 1 || echo 0)" \
           "NO control-plane-down band — backfill closed the offline window [got $bands]" ;;
+    step6)
+      # Read the supervisor's own log: it records every termination with a
+      # timestamp, and _restore_schedule announces what it re-armed.
+      local LOG kills0 kills1 readopt
+      LOG=$(s3get "runs/$r/logs/orchestrator.log")
+      kills0=$(printf '%s' "$LOG" | grep -c "terminated node 0" || true)
+      kills1=$(printf '%s' "$LOG" | grep -c "terminated node 1" || true)
+      readopt=$(printf '%s' "$LOG" | grep -o "re-armed kill schedule:[^(]*" | head -1)
+
+      chk "$([ "${kills0:-0}" -eq 1 ] 2>/dev/null && echo 1 || echo 0)" \
+          "spent kill did NOT replay — exactly one 'terminated node 0' [got ${kills0:-?}]"
+      chk "$([ "${kills1:-0}" -eq 1 ] 2>/dev/null && echo 1 || echo 0)" \
+          "pending kill still fired after adoption [got ${kills1:-?}]"
+      chk "$([ -n "$readopt" ] && echo 1 || echo 0)" \
+          "supervisor re-armed rather than restarted: ${readopt:-<absent>}"
+
+      # THE assertion that catches a wrong fix. The second kill is scheduled at
+      # t+780s on the ORIGINAL train-start clock. If the restarted supervisor
+      # re-armed its clock from the adoption moment instead of from the persisted
+      # wall start, this kill lands late by roughly the outage duration -- and a
+      # check that only counted kills would call that a pass.
+      python3 - "$r" <<'PYEOF'
+import json, re, subprocess, sys, os
+rid = sys.argv[1]; b = os.environ["SPOT_TRAIN_BUCKET"]
+def s3(k):
+    return subprocess.run(["aws","s3","cp",f"s3://{b}/{k}","-","--region","us-east-1"],
+                          capture_output=True, text=True).stdout
+sched = json.loads(s3(f"runs/{rid}/schedule.json") or "{}")
+ts = float(sched.get("train_start_wall") or 0)
+log = s3(f"runs/{rid}/logs/orchestrator.log")
+m = re.search(r"\[(\d+):(\d+):(\d+)\] \[supervisor\] terminated node 1", log)
+if not (ts and m):
+    print("  \033[31mFAIL\033[0m  cannot time the pending kill (missing schedule.json or log line)")
+    sys.exit()
+h, mi, se = (int(x) for x in m.groups())
+# Log stamps are UTC wall-clock-of-day; fold onto the run's own day.
+import datetime as dt
+d0 = dt.datetime.fromtimestamp(ts, dt.UTC)
+fired = d0.replace(hour=h, minute=mi, second=se)
+if fired < d0: fired += dt.timedelta(days=1)
+offset = (fired - d0).total_seconds()
+drift = offset - 780
+verdict = "\033[32mPASS\033[0m" if abs(drift) <= 90 else "\033[31mFAIL\033[0m"
+print(f"  {verdict}  pending kill fired at t+{offset:.0f}s (scheduled 780s, drift {drift:+.0f}s)")
+if abs(drift) > 90:
+    print("        -> clock was re-armed from the RESTART, not from the persisted")
+    print("           train start; every remaining kill shifts by the outage.")
+PYEOF
+      ;;
     step5|final24h)
       local kills epochs
       kills=$(s3get "runs/$r/logs/orchestrator.log" | grep -c "terminated node" || echo 0)

@@ -23,11 +23,34 @@ TRAIN_REGION="${TRAIN_REGION:-us-east-1}"
 _LIVE="Name=instance-state-name,Values=running,pending"
 
 ours_ids() {
-  aws ec2 describe-instances --region "$TRAIN_REGION" \
+  # FAIL LOUD, NOT EMPTY. This used to swallow stderr and yield "" on any API
+  # error, which is indistinguishable from "nothing is running" -- so one expired
+  # credential or a RequestLimitExceeded produced a fully green teardown report
+  # while GPUs kept billing. `watch` polls describe-instances every 15s for
+  # hours, so throttling is a realistic trigger, not a hypothetical.
+  #
+  # Callers MUST check the exit status: 0 = the list is authoritative (possibly
+  # empty), non-zero = we do not know, assume something is running.
+  local out rc
+  out=$(aws ec2 describe-instances --region "$TRAIN_REGION" \
     --filters "$_LIVE" "Name=tag:project,Values=${PROJECT_TAG}" \
-    --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null | tr '\t' ' '
+    --query 'Reservations[].Instances[].InstanceId' --output text 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "[fleetctl] EC2 QUERY FAILED (rc=$rc): $out" >&2
+    return 1
+  fi
+  printf '%s' "$out" | tr '\t' ' '
 }
-ours_count() { local i; i=$(ours_ids); [ -z "$i" ] && echo 0 || echo "$i" | wc -w | tr -d ' '; }
+ours_count() {
+  # Prints a number and returns 0, or prints nothing and returns 1 when the
+  # query failed. `n=$(ours_count); rc=$?` works -- exit status survives command
+  # substitution -- so callers can tell "zero" from "unknown".
+  local i rc
+  i=$(ours_ids); rc=$?
+  [ $rc -eq 0 ] || return 1
+  [ -z "$i" ] && echo 0 || echo "$i" | wc -w | tr -d ' '
+}
+
 others_count() {
   # Arithmetic, not a JMESPath negation. The negation form
   #   length(...Instances[?!(Tags[?Key=='project' && Value=='X'])])
@@ -49,7 +72,15 @@ reap_ours() {
   # multi-hundred-dollar run; it has to report what is TRUE, not what was
   # attempted.
   local ids err rc
-  ids=$(ours_ids)
+  ids=$(ours_ids); rc=$?
+  if [ $rc -ne 0 ]; then
+    # We could not read EC2. Refusing is the only honest answer: reporting
+    # "nothing running" here is exactly how a teardown looks green while the
+    # fleet bills.
+    echo "[reap] CANNOT VERIFY -- EC2 query failed. Nothing was terminated." >&2
+    echo "[reap] Retry, or terminate by hand in the console before walking away." >&2
+    return 1
+  fi
   if [ -z "$ids" ]; then
     echo "[reap] nothing of ours running in ${TRAIN_REGION}"
     echo "[reap] left untouched (not ours): $(others_count)"
