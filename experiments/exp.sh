@@ -153,7 +153,16 @@ load_def() {
              # kills a healthy fleet and loses the whole run; too large only
              # means noticing a genuinely wedged one later, which config.py's own
              # comment calls out as the far cheaper mistake.
-             --env METRICS_OVERHEAD=7200
+             # TWO deadlines, and BOTH are sized from the TRAINING budget while
+             # measured against the WALL clock. Fixing only one just changes which
+             # guillotine lands first:
+             #   watchdog     = budget + METRICS_OVERHEAD          (supervisor gives up)
+             #   per-box kill = budget + INSTANCE_LIFETIME_SLACK   (box poweroffs itself)
+             # step5 needs ~2h wall for 1h of training, so the stock 1h slack would
+             # have self-terminated the fleet mid-run. Keep the per-box timer BEHIND
+             # the watchdog, so the smarter guard (which is actually watching for
+             # metrics.json) is the one that decides.
+             --env METRICS_OVERHEAD=7200 --env INSTANCE_LIFETIME_SLACK_SECONDS=14400
              # Mass loss is the FINALE, deliberately. An earlier version fired one more
              # kill at t+3000, only 600s after it -- but six replacements launch
              # serially (each blocking in wait_running) and then each pays boot plus
@@ -189,7 +198,7 @@ load_def() {
              # The operator deliberately kills the control plane mid-run here, so
              # wall clock includes a full outage plus a second control-plane boot.
              # 1h of slack on a 30 min budget.
-             --env METRICS_OVERHEAD=3600
+             --env METRICS_OVERHEAD=3600 --env INSTANCE_LIFETIME_SLACK_SECONDS=10800
              --env "PREEMPT_SCHEDULE=300:0;780:1") ;;
     final24h)
       # 23h of TRAINING time; wall lands ~24-25h once recovery downtime is added.
@@ -206,7 +215,7 @@ load_def() {
              # 6h of slack -> a 29h deadline against a ~25-26h expected wall
              # clock (23h training + ~23 recoveries at ~300s + boot). See the
              # step5 note above for why this is an upper bound, not an estimate.
-             --env METRICS_OVERHEAD=21600
+             --env METRICS_OVERHEAD=21600 --env INSTANCE_LIFETIME_SLACK_SECONDS=28800
              # ~24 kill events over 23h, spaced ~1h. MEASURED in step5: recovery
              # to full world is ~213-314s and FLAT in the number of nodes lost --
              # losing 6 recovered in 259s, the same as losing 1, because
