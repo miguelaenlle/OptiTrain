@@ -201,14 +201,27 @@ load_def() {
              --env METRICS_OVERHEAD=3600 --env INSTANCE_LIFETIME_SLACK_SECONDS=10800
              --env "PREEMPT_SCHEDULE=300:0;780:1") ;;
     final24h)
-      # 23h of TRAINING time; wall lands ~24-25h once recovery downtime is added.
+      # 62000s of TRAINING time, sized from a MEASURED ratio, not an estimate.
+      #
+      # step5 #2 completed on its own budget: 3599s of training took 4554s of
+      # wall -- a 1.27x ratio. Wall exceeds budget because boot, the 17GB dataset
+      # pull and every recovery spend wall without spending budget. So the old
+      # 82800 ("23h of training") would have run 29.1h wall at ~$234, which is
+      # not the 24h/$195 run this is supposed to be. That is a mis-specification,
+      # not a tuning error, and the $11 re-run existed to catch it.
+      #
+      # 62000 -> ~21.8h wall at 1.27x. Deliberately the SAFE side of 24h rather
+      # than the exact number: step5's chaos was 4 events in 76 min while this is
+      # 23 events over a day, so the recovery share of wall is lower here and
+      # 1.27x more likely over-estimates than under. Landing early is recoverable
+      # (A8 extends it); landing at 29h is not.
       # LR schedule stays at the recipe's 600000 (Karpathy's) -- deliberately NOT
       # tuned to the horizon, because the achievable step count is uncertain to
       # within 2x (step5 ran 1958ms/step late-run vs a 4013ms early baseline), and
       # tuning to a horizon you cannot predict is worse than not tuning. Keeping
       # it also makes step counts directly comparable to nanoGPT's published OWT
       # curve, since the 480x1024 global batch already matches exactly.
-      KIND=multinode-preempt; NODES=8; BUDGET=82800
+      KIND=multinode-preempt; NODES=8; BUDGET=62000
       EXTRA=(--env LOG_INTERVAL_STEPS=10 --env EVAL_INTERVAL_STEPS=300
              --env CHECKPOINT_INTERVAL_SECONDS=120 --env SAMPLE_INTERVAL_STEPS=1500
              --env MAX_EPOCHS_WITHOUT_PROGRESS=30

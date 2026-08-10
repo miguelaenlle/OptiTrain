@@ -10,8 +10,8 @@
  "editable": true,
  "graphTooltip": 1,
  "time": {
-  "from": "2026-08-10T00:58:06Z",
-  "to": "now"
+  "from": "2026-08-10T01:22:53Z",
+  "to": "2026-08-10T02:45:34.248000Z"
  },
  "timepicker": {
   "refresh_intervals": [
@@ -49,7 +49,7 @@
     "name": "degraded",
     "target": {
      "scenarioId": "csv_content",
-     "csvContent": "time,timeEnd,text\n1786324662807,1786324662807,degraded\n"
+     "csvContent": "time,timeEnd,text\n1786325955034,1786326110957,degraded\n1786326432202,1786326587535,degraded\n1786326932927,1786327081891,degraded\n1786327962778,1786328119767,degraded\n"
     }
    },
    {
@@ -63,7 +63,7 @@
     "name": "control plane down",
     "target": {
      "scenarioId": "csv_content",
-     "csvContent": "time,timeEnd,text\n1786324160895,1786324263825,control plane down\n"
+     "csvContent": "time,timeEnd,text\n1786327856488,1786327962778,control plane down\n"
     }
    }
   ]
@@ -74,12 +74,17 @@
     "name": "run",
     "label": "Run",
     "type": "custom",
-    "query": "multinode-preempt-1786323516,multinode-preempt-1786321863,multinode-preempt-1786315813,multinode-1786313431,multinode-1786311446,multinode-1786310488,multinode-1786309731,gapdemo-1786240000,multinode-preempt-1786239456,multinode-preempt-1786231481,multinode-preempt-1786227708,multinode-preempt-1786207072,multinode-1785795454",
+    "query": "multinode-preempt-1786325003,multinode-preempt-1786323516,multinode-preempt-1786321863,multinode-preempt-1786315813,multinode-1786313431,multinode-1786311446,multinode-1786310488,multinode-1786309731,gapdemo-1786240000,multinode-preempt-1786239456,multinode-preempt-1786231481,multinode-preempt-1786227708,multinode-preempt-1786207072,multinode-1785795454",
     "options": [
+     {
+      "text": "multinode-preempt-1786325003",
+      "value": "multinode-preempt-1786325003",
+      "selected": true
+     },
      {
       "text": "multinode-preempt-1786323516",
       "value": "multinode-preempt-1786323516",
-      "selected": true
+      "selected": false
      },
      {
       "text": "multinode-preempt-1786321863",
@@ -143,8 +148,8 @@
      }
     ],
     "current": {
-     "text": "multinode-preempt-1786323516",
-     "value": "multinode-preempt-1786323516",
+     "text": "multinode-preempt-1786325003",
+     "value": "multinode-preempt-1786325003",
      "selected": true
     },
     "includeAll": false,
