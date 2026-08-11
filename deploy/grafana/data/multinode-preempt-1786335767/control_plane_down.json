@@ -1,0 +1,20 @@
+[
+ {
+  "time": 1786343374354,
+  "timeEnd": 1786343480517,
+  "title": "control plane down",
+  "text": "no supervisor status for 106s \u2014 training continued",
+  "tags": [
+   "control-plane"
+  ]
+ },
+ {
+  "time": 1786393774464,
+  "timeEnd": 1786393880865,
+  "title": "control plane down",
+  "text": "no supervisor status for 106s \u2014 training continued",
+  "tags": [
+   "control-plane"
+  ]
+ }
+]

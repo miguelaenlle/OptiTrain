@@ -74,83 +74,18 @@
     "name": "run",
     "label": "Run",
     "type": "custom",
-    "query": "multinode-preempt-1786325003,multinode-preempt-1786323516,multinode-preempt-1786321863,multinode-preempt-1786315813,multinode-1786313431,multinode-1786311446,multinode-1786310488,multinode-1786309731,gapdemo-1786240000,multinode-preempt-1786239456,multinode-preempt-1786231481,multinode-preempt-1786227708,multinode-preempt-1786207072,multinode-1785795454",
+    "query": "multinode-preempt-1786335767",
     "options": [
      {
-      "text": "multinode-preempt-1786325003",
-      "value": "multinode-preempt-1786325003",
-      "selected": true
-     },
-     {
-      "text": "multinode-preempt-1786323516",
-      "value": "multinode-preempt-1786323516",
-      "selected": false
-     },
-     {
-      "text": "multinode-preempt-1786321863",
-      "value": "multinode-preempt-1786321863",
-      "selected": false
-     },
-     {
-      "text": "multinode-preempt-1786315813",
-      "value": "multinode-preempt-1786315813",
-      "selected": false
-     },
-     {
-      "text": "multinode-1786313431",
-      "value": "multinode-1786313431",
-      "selected": false
-     },
-     {
-      "text": "multinode-1786311446",
-      "value": "multinode-1786311446",
-      "selected": false
-     },
-     {
-      "text": "multinode-1786310488",
-      "value": "multinode-1786310488",
-      "selected": false
-     },
-     {
-      "text": "multinode-1786309731",
-      "value": "multinode-1786309731",
-      "selected": false
-     },
-     {
-      "text": "gapdemo-1786240000",
-      "value": "gapdemo-1786240000",
-      "selected": false
-     },
-     {
-      "text": "multinode-preempt-1786239456",
-      "value": "multinode-preempt-1786239456",
-      "selected": false
-     },
-     {
-      "text": "multinode-preempt-1786231481",
-      "value": "multinode-preempt-1786231481",
-      "selected": false
-     },
-     {
-      "text": "multinode-preempt-1786227708",
-      "value": "multinode-preempt-1786227708",
-      "selected": false
-     },
-     {
-      "text": "multinode-preempt-1786207072",
-      "value": "multinode-preempt-1786207072",
-      "selected": false
-     },
-     {
-      "text": "multinode-1785795454",
-      "value": "multinode-1785795454",
-      "selected": false
+      "selected": true,
+      "text": "multinode-preempt-1786335767",
+      "value": "multinode-preempt-1786335767"
      }
     ],
     "current": {
-     "text": "multinode-preempt-1786325003",
-     "value": "multinode-preempt-1786325003",
-     "selected": true
+     "selected": true,
+     "text": "multinode-preempt-1786335767",
+     "value": "multinode-preempt-1786335767"
     },
     "includeAll": false,
     "multi": false

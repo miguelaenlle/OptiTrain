@@ -227,9 +227,7 @@ class OrchestratorConfig:
 
     # --- code delivery -------------------------------------------------------
     repo_url: str = field(
-        default_factory=lambda: _env(
-            "REPO_URL", "https://github.com/miguelaenlle/Spot-Distributed-LLM-Training.git"
-        )
+        default_factory=lambda: _env("REPO_URL", "https://github.com/miguelaenlle/OptiTrain.git")
     )
     repo_branch: str = field(default_factory=lambda: _env("REPO_BRANCH", "main"))
 

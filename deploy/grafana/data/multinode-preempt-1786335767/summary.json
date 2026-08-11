@@ -1,0 +1,14 @@
+{
+ "run_id": "multinode-preempt-1786335767",
+ "run_start_ms": 1786335767000,
+ "run_end_ms": 1786398453493,
+ "active": true,
+ "goodput": 0.0,
+ "nodes_lost": 31,
+ "replacements": 31,
+ "whole_group_restarts": 0,
+ "steps": 26560,
+ "val_loss": 0.0,
+ "usd": 139.29,
+ "wall_hours": 17.413
+}
