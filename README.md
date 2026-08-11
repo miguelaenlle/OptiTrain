@@ -1,4 +1,6 @@
-<h1 align="center">OptiTrain</h1>
+<p align="center">
+  <img src="./docs/img/banner.png" alt="OptiTrainAI" width="560">
+</p>
 
 <p align="center">
   <b>Fault-tolerant distributed LLM training and serving on disposable nodes.</b><br>
@@ -12,7 +14,7 @@
   <img alt="Go 1.22" src="https://img.shields.io/badge/go-1.22-00ADD8.svg">
   <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-DDP%20%2B%20NCCL-ee4c2c.svg">
   <img alt="AWS" src="https://img.shields.io/badge/platform-AWS-orange.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-500%20passing-brightgreen.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-610%20passing-brightgreen.svg">
 </p>
 
 <p align="center">
@@ -73,7 +75,7 @@ The line does not bend at any of them.
 | **Wall-clock duration** | 17.41 h |
 | **Optimizer steps** | 26,560 |
 | **Tokens processed** | 13.05 B (491,520 tokens/step, global batch held constant) |
-| **Final validation loss** | **3.095** (89 evaluations, monotone after step 600) |
+| **Final validation loss** | **3.095** — also the run's best, over 89 evaluations |
 | **Nodes lost** | **31** (mean one loss every 34 minutes) |
 | **Replacements launched** | 31 (39 distinct instances held 8 slots) |
 | **Catastrophic events** | **2** — world size 8 → 2, recovered in 157 s and 207 s |
@@ -175,7 +177,7 @@ Additional exported panels: [step time](./docs/img/flagship-steptime.png) ·
 | **Containers & orchestration** | Docker, Kubernetes (k3d / k3s) |
 | **Observability** | Prometheus, Grafana (provisioned dashboards, server-side PNG rendering), Weights & Biases |
 | **Load & chaos testing** | Purpose-built Go load generator that kills workers mid-test |
-| **Engineering quality** | pytest (504 tests), ruff, `go vet` / `go test -race`, pre-commit hooks |
+| **Engineering quality** | pytest (614 tests), ruff, `go vet` / `go test -race`, pre-commit hooks |
 
 ## Training infrastructure
 
@@ -330,12 +332,25 @@ state is inspectable with `aws s3 ls`.
   worker gauges are cleared on each registry sweep so a dead worker cannot pin
   an autoscaler at a stale value.
 
-> **Status.** The Python fleet, the registry, the Go load generator, and the
-> chaos path are implemented and tested. The Go router, the benchmark harness,
-> and the Kubernetes manifests are complete but still on a review branch, and the
-> Python-versus-Go A/B under identical load has **not** been run yet. No serving
-> throughput or latency numbers are claimed here, because none have been
-> measured on real hardware. See [ROADMAP.md](./ROADMAP.md).
+### Measured serving results
+
+Each row is an experiment with its own writeup, method, and validity section.
+
+| Result | Measurement | Writeup |
+|---|---|---|
+| **Go router vs Python** | Go sustains **7,000 rps to Python's 750 — 9.3× the throughput** — and adds **~3× less latency** per request at matched load | [x2-x3-results.md](./docs/experiments/x2-x3-results.md) |
+| **Router equivalence** | The two routers are functionally identical under the same policy table, so the A/B compares implementations rather than behaviour | [x2-x3-results.md](./docs/experiments/x2-x3-results.md) |
+| **KV cache** | **2.3× → 3.5× faster**, with the gap widening as output length grows, exactly as theory predicts | [hf-kv-results.md](./docs/experiments/hf-kv-results.md) |
+| **Backend equivalence** | The HF backend is **token-for-token identical** to nanoGPT across 3 prompts × 32 tokens — equivalent, not merely similar | [hf-kv-results.md](./docs/experiments/hf-kv-results.md) |
+| **Kubernetes failure detection** | **0.83 s graceful / 4.65 s abrupt** via readiness probes, against **13 s** for heartbeat expiry | [p3-k3d-results.md](./docs/experiments/p3-k3d-results.md) |
+| **Single-GPU serving** | gpt2-xl bf16 on one A10G: L0 **2,097 ms** p50 at 64 tokens, **30.5 tok/s** decode — **4.6× off** the memory-bandwidth bound, so most of it is overhead rather than compute | [e1e2-results.md](./docs/experiments/e1e2-results.md) |
+
+The last row is the honest one: the naive serving path is **4.6× slower than
+the hardware allows**, which is what motivated the KV-cache backend and the vLLM
+work now landed in `src/inference/backends.py`. Node-level failure on
+Kubernetes is roughly **8× slower** to react to than pod-level failure
+([p33-results.md](./docs/experiments/p33-results.md)) — the same
+detection-versus-recovery distinction the training side had to solve.
 
 ## Reproducing this
 
@@ -349,7 +364,7 @@ pip install -e ".[dev,fleet]"        # add ",viz" for W&B + timeline plots
 
 Already cloned without submodules? Run `git submodule update --init`.
 
-**The full suite** — 500 passing on a clean clone, no AWS calls and no GPU
+**The full suite** — 610 passing on a clean clone, no AWS calls and no GPU
 (4 skips: DDP fork on macOS, plus two fixtures needing local run artifacts):
 
 ```bash
@@ -439,12 +454,14 @@ src/orchestrator/   the control plane (boto3)
   sidecar.py          per-box: obey epoch.json, run static torchrun per epoch
   orch.py             durable remote orchestrator (up / status / logs / down)
 src/inference/      serving fleet: worker, router, heartbeat registry
+router-go/          Go rewrite of the router — 9.3x the Python throughput
+bench/              benchmark harness: L0, the SLO, the knee C1, scaling efficiency
 loadgen/            Go load generator and chaos harness (own go.mod)
-deploy/grafana/     provisioned dashboard + exporters that produced the figures above
+deploy/             Dockerfiles, k3d/k3s manifests, AWS rigs, monitoring stack
 third_party/        nanoGPT as a pinned submodule — we import the model, not rewrite it
 docs/               design notes, experiment writeups, IAM policies, runbooks
-tests/              504 tests — checkpoint/resume, supervisor, sidecar, fleet,
-                    and the full multi-node protocol end-to-end on localhost
+tests/              614 tests — checkpoint/resume, supervisor, sidecar, fleet,
+                    router policy, and the multi-node protocol end-to-end
 ```
 
 ## Design principles
