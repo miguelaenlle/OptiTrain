@@ -1,0 +1,59 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Stage 1 on real EC2 nodes: the Go router in front of Go stub workers.
+#
+# No model on purpose. Stage 1 asks distributed-systems questions -- does the
+# router find pods on OTHER machines, does a whole node dying lose requests,
+# does a terminating instance black-hole packets -- and a stub isolates those
+# from model latency entirely. It also cross-compiles to amd64 in seconds,
+# where the torch image would need ~1.2GB built under QEMU on an arm64 Mac.
+# Stage 2 swaps in the real worker on GPU nodes.
+resources:
+  - ../base
+images:
+  - name: fleet-router
+    newTag: cloud
+  - name: fleet-worker
+    newName: fleet-stubworker
+    newTag: cloud
+patches:
+  # Spread workers across nodes. Without this the scheduler may stack both on
+  # one agent, and "kill a node" would then prove nothing about cross-node
+  # routing -- the experiment would silently test the wrong thing.
+  - target: { kind: Deployment, name: fleet-worker }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels: { app: fleet-worker }
+      # The stub needs no model: drop the slow startup probe and the big
+      # memory ask, and strip the torch thread caps that mean nothing here.
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/failureThreshold
+        value: 6
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 64Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 256Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/env
+        value:
+          - { name: PORT, value: "8001" }
+  # Keep the router on the control-plane node so killing an agent never takes
+  # the router with it -- otherwise a node-kill test cannot distinguish "the
+  # fleet rerouted" from "the router itself restarted".
+  - target: { kind: Deployment, name: fleet-router }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value: { node-role.kubernetes.io/control-plane: "true" }
+      - op: add
+        path: /spec/template/spec/tolerations
+        value:
+          - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }

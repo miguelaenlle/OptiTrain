@@ -507,14 +507,22 @@ def launch(
         # --- ORIGINAL (SG without public IP) — restore when done SSH-testing ---
         # "SecurityGroupIds": [security_group_id],
         "InstanceInitiatedShutdownBehavior": "terminate",
+        # Merged through a dict so extra_tags can OVERRIDE the defaults, not just
+        # append to them. The inference fleet must stamp project=inference: the
+        # teardown script scopes on `tag:project`, so an instance still carrying
+        # project=spot-train would be invisible to it and bill until noticed.
+        # AWS rejects duplicate tag keys, so appending was never an option.
         "TagSpecifications": [
             {
                 "ResourceType": "instance",
                 "Tags": [
-                    {"Key": "Name", "Value": f"spot-train-{run_id}"},
-                    {"Key": "project", "Value": "spot-train"},
-                    {"Key": "market", "Value": market},
-                    *[{"Key": k, "Value": v} for k, v in (extra_tags or {}).items()],
+                    {"Key": k, "Value": v}
+                    for k, v in {
+                        "Name": f"spot-train-{run_id}",
+                        "project": "spot-train",
+                        "market": market,
+                        **(extra_tags or {}),
+                    }.items()
                 ],
             }
         ],

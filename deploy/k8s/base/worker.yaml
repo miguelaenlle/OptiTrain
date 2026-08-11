@@ -1,0 +1,95 @@
+# Inference workers.
+#
+# Discovery note: in-cluster the router finds workers through this Service's
+# EndpointSlice, NOT through the S3/local-dir heartbeat. FLEET_WORKERS_URI is
+# deliberately empty so the heartbeat path is OFF -- that makes the k3d
+# experiment falsifiable: if the router still sees workers, it can only be via
+# Endpoints, because no other path exists.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fleet-worker
+  labels: { app: fleet-worker }
+spec:
+  # Headless: we want the individual pod IPs in the EndpointSlice, not a single
+  # virtual IP. kube-proxy would round-robin at L4 with no retry, and
+  # reroute-on-failure is the whole point of our router.
+  clusterIP: None
+  selector: { app: fleet-worker }
+  ports:
+    - name: http
+      port: 8001
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleet-worker
+  labels: { app: fleet-worker }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: fleet-worker }
+  template:
+    metadata:
+      labels: { app: fleet-worker }
+    spec:
+      # Model load takes tens of seconds (and a first-boot weight download can
+      # take minutes). Give the pod time to shut down cleanly so in-flight
+      # requests finish rather than being cut off mid-generation.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: worker
+          image: fleet-worker:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8001 }
+          env:
+            - { name: PORT, value: "8001" }
+            # Empty => heartbeat OFF. Endpoints is the discovery mechanism here.
+            - { name: FLEET_WORKERS_URI, value: "" }
+            - { name: WORKER_ID, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: DEVICE, value: "cpu" }
+            - { name: PRETRAINED_MODEL, value: "gpt2" }
+            - { name: SERVE_ENGINE, value: "hf" }
+            # torch defaults to one thread per core and does NOT read the
+            # cgroup limit, so every worker pod spawns as many threads as the
+            # HOST has cores. With several pods per node they thrash: measured
+            # ~1.2 tok/s per worker unset, vs ~85 tok/s for the same model
+            # outside a container. Cap it to the CPU request.
+            - { name: OMP_NUM_THREADS, value: "2" }
+            - { name: MKL_NUM_THREADS, value: "2" }
+          # startupProbe carries the slow model load, so liveness/readiness can
+          # stay tight afterwards. Without it, a 60s load would trip liveness
+          # and the pod would restart forever.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 60      # up to 5 minutes to load
+          # Readiness drives EndpointSlice membership -- these numbers ARE the
+          # failure-detection latency we measure against the 15s heartbeat TTL.
+          # Kept deliberately modest (2s x 2 = ~4s worst case) so the comparison
+          # is defensible rather than tuned to flatter Kubernetes.
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 2
+            timeoutSeconds: 1
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: { cpu: "500m", memory: "2Gi" }
+            limits: { memory: "6Gi" }
+          volumeMounts:
+            - { name: models, mountPath: /models }
+      volumes:
+        # emptyDir locally: weights re-download per pod, which is fine for gpt2
+        # (~500MB). The cloud overlay swaps this for a host path/PVC so a
+        # gpt2-xl pod restart does not re-pull ~6GB and distort cold start.
+        - name: models
+          emptyDir: {}
