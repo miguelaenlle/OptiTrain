@@ -1,0 +1,2 @@
+time,run_start_ms,run_end_ms,goodput,nodes_lost,replacements,whole_group_restarts,steps,val_loss,usd,wall_hours
+1786398453493,1786335767000,1786398453493,0.0,31,31,0,26560,0.0,139.29,17.413

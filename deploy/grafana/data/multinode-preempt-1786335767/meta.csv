@@ -1,0 +1,3 @@
+time,model,params_m,params_exact,dataset,ctx,global_batch
+1786335767000,GPT-2 · 12L/12H/768d,123.69,124475904,openwebtext,1024,480
+1786398453493,GPT-2 · 12L/12H/768d,123.69,124475904,openwebtext,1024,480

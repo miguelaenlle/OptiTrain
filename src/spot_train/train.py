@@ -270,6 +270,12 @@ def train(cfg: TrainConfig) -> dict:
             # stream it already consumed, and after an elastic world-size change
             # rank r draws a fresh stream for its new slice of the group.
             torch.manual_seed(cfg.seed + ddp.rank * 1_000_003 + start_step)
+        # Startup collectives are done (process group + DDP's weight broadcast and
+        # shape verification). Drop from the generous NCCL_INIT_TIMEOUT to the
+        # short steady-state NCCL_TIMEOUT so a preempted peer is detected fast.
+        applied = distributed.tighten_timeout(ddp)
+        if applied:
+            log(f"[ddp] collective timeout tightened to {applied}s for the training loop")
 
     # Constant-global-batch gradient accumulation (K=1 when GLOBAL_BATCH_SIZE=0).
     accum = grad_accum_steps(cfg.global_batch_size, ddp.world_size, cfg.batch_size)
@@ -301,6 +307,7 @@ def train(cfg: TrainConfig) -> dict:
             uri=cfg.checkpoint_uri,
             trained_seconds=trained_seconds,
             scaler=scaler,
+            keep=cfg.checkpoint_keep,
         )
         # Every Nth checkpoint, prove the written artifact reconstructs a model.
         if cfg.smoke_test_every and ckpt_count % cfg.smoke_test_every == 0:
@@ -322,7 +329,16 @@ def train(cfg: TrainConfig) -> dict:
             build_model=make_model,
             sample_batch=(smoke_x.cpu(), smoke_y.cpu()),
             log=log,
+            keep=cfg.checkpoint_keep,
         )
+
+    # Node-local tier writer. EVERY node's local_rank 0 keeps this tier (not just
+    # the master), so it is constructed outside the `ddp.master` block above.
+    # Synchronous, it put a 1.5 GB torch.save on the critical path every
+    # checkpoint — 33% of all training time at GPT-2 124M.
+    async_local = None
+    if cfg.local_checkpoint_dir and cfg.checkpoint_async and ddp.local_rank == 0:
+        async_local = checkpoint.AsyncLocalSaver(cfg.local_checkpoint_dir, log=log)
 
     start_time = time.monotonic()
     # Epoch at loop start: the orchestrator's run profile uses this to split
@@ -422,9 +438,17 @@ def train(cfg: TrainConfig) -> dict:
             if ddp.master:
                 toks = accum * ddp.world_size * cfg.batch_size * cfg.block_size
                 tok_s = toks / per_step if per_step else 0
+                # `t` is a WALL-CLOCK unix timestamp, appended last on purpose.
+                # profile._STEP_RE has no end anchor, so this cannot break
+                # existing parsing. Without it every timeline plot has to
+                # reconstruct step times by anchoring to `training` events and
+                # summing ms/step — E4 produced two wrong plots that way before
+                # producing a right one. One field removes that whole class of
+                # error, and it is the only clock that survives a node being
+                # replaced mid-run.
                 print(
                     f"step {step}: loss {gloss:.4f}, {per_step * 1000:.0f}ms/step, "
-                    f"{tok_s:.0f} tok/s, ws {ddp.world_size}",
+                    f"{tok_s:.0f} tok/s, ws {ddp.world_size}, t {time.time():.3f}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -437,7 +461,12 @@ def train(cfg: TrainConfig) -> dict:
                 print(
                     f"[rank {ddp.rank}] step {step} | loss {gloss:.4f} "
                     f"| local {micro_loss:.4f} | {per_step * 1000:.0f}ms/step "
-                    f"| ws {ddp.world_size}",
+                    # Same wall clock as the rank-0 line. Without it only the
+                    # MASTER's steps are placeable in time, so a slot-occupancy
+                    # Gantt can only show boxes that were master at some point
+                    # (4 of 22 on E5) and every other node's window has to be
+                    # inferred from the master's step->time map.
+                    f"| ws {ddp.world_size} | t {time.time():.3f}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -474,19 +503,28 @@ def train(cfg: TrainConfig) -> dict:
         now = time.monotonic()
         trained_now = trained_before + (now - start_time)
         submitted = False
+        # Rank 0 feeds BOTH tiers from ONE snapshot. Taking two was a second full
+        # 1.5 GB device->host copy of byte-identical state — the dominant cost
+        # left after the writes went async (measured: stall/step 1.47s -> 0.83s
+        # with async writes alone, and rank 0's pause stalls every rank at the
+        # next all-reduce). Nodes 1..N-1 are unaffected; they only ever snapshot
+        # once, for their local tier.
+        shared_blob = None
         if ddp.master and now - last_ckpt >= cfg.checkpoint_interval_seconds:
             if async_ckpt is not None:
                 # Busy => the previous upload is still in flight: don't advance
                 # last_ckpt, so we retry within a few steps instead of waiting a
                 # whole interval. Bounded: one snapshot in memory at a time.
-                if async_ckpt.submit(
-                    model=raw_model,
-                    optimizer=optimizer,
-                    loader=loader,
-                    step=step,
-                    trained_seconds=trained_now,
-                    scaler=scaler,
-                ):
+                if not async_ckpt.busy():
+                    shared_blob = checkpoint.snapshot(
+                        model=raw_model,
+                        optimizer=optimizer,
+                        loader=loader,
+                        step=step,
+                        trained_seconds=trained_now,
+                        scaler=scaler,
+                    )
+                if shared_blob is not None and async_ckpt.submit(step=step, blob=shared_blob):
                     ckpt_count += 1
                     last_ckpt = now
                     submitted = True
@@ -503,18 +541,25 @@ def train(cfg: TrainConfig) -> dict:
         # a second ~tens-of-ms CPU copy.)
         if cfg.local_checkpoint_dir and distributed.broadcast_flag(ddp, submitted):  # noqa: SIM102
             if ddp.local_rank == 0:
-                checkpoint.save_local(
-                    checkpoint.snapshot(
-                        model=raw_model,
-                        optimizer=optimizer,
-                        loader=loader,
-                        step=step,
-                        trained_seconds=trained_now,
-                        scaler=scaler,
-                    ),
-                    cfg.local_checkpoint_dir,
-                    step,
+                # The snapshot (point-in-time CPU copy) stays here — it is what
+                # makes the write safe while the optimizer mutates the live
+                # tensors. Only serialize+write moves off the critical path.
+                # Rank 0 reuses the blob it just took for S3 (identical state,
+                # same step) instead of paying a second device->host copy.
+                blob = shared_blob or checkpoint.snapshot(
+                    model=raw_model,
+                    optimizer=optimizer,
+                    loader=loader,
+                    step=step,
+                    trained_seconds=trained_now,
+                    scaler=scaler,
                 )
+                if async_local is None or not async_local.submit(blob, step):
+                    # No async writer, or one still in flight: fall back to the
+                    # synchronous write rather than silently skipping a
+                    # checkpoint — a survivor's fast-restart tier must not
+                    # develop holes just because the disk was busy.
+                    checkpoint.save_local(blob, cfg.local_checkpoint_dir, step)
 
         # Forward progress marker for the stall watchdog: a full iteration
         # (step + eval + checkpoint) completed, so we were NOT blocked in a
@@ -553,6 +598,10 @@ def train(cfg: TrainConfig) -> dict:
     # orchestrator can treat its appearance as an unambiguous "run done". Only rank
     # 0 writes; no collective follows, so non-master ranks just shut down and exit.
     if reason == "preempt":
+        if async_local is not None:
+            # Every node's local_rank 0 has its own writer; a survivor restarting
+            # in place must not read a dir a daemon thread is still pruning.
+            async_local.flush()
         if async_ckpt is not None:
             async_ckpt.flush()  # never race the writer with the sync save below
         ckpt_count += 1
@@ -568,6 +617,8 @@ def train(cfg: TrainConfig) -> dict:
     # (freeing the CPU for rank-0's eval); torchrun waits for all ranks to finish.
     train_s = round(time.monotonic() - start_time, 2)
     listener.stop()
+    if async_local is not None:
+        async_local.flush()  # applies to every node, incl. the ranks returning below
     if not ddp.master:
         distributed.shutdown(ddp)
         return {"run_id": cfg.run_id, "stop_reason": reason, "steps": step, "resumed": resumed}

@@ -18,6 +18,7 @@ This module splits cleanly into:
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import sys
@@ -27,7 +28,7 @@ from dataclasses import dataclass, field
 from spot_train import events, s3_store
 
 from . import aws
-from .config import OrchestratorConfig
+from .config import LEADER_VICTIM, OrchestratorConfig
 from .profile import RunProfile
 
 # --------------------------------------------------------------------------- #
@@ -65,6 +66,12 @@ class Observation:
     metrics_exists: bool  # run's done signal landed
     no_progress_s: float | None  # seconds since the checkpoint step last advanced (None = n/a yet)
     due_kills: frozenset[int] = frozenset()  # scheduled victims whose time has arrived
+    # Epochs published in a row that never produced a checkpoint. The stall clock
+    # restarts on every epoch (a new world legitimately needs time before its
+    # first checkpoint), so this is what still catches a world that FLAPS —
+    # re-forming endlessly without ever training. Without it, resetting the clock
+    # would make the deadlock-breaker unreachable.
+    epochs_without_progress: int = 0
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,18 @@ class Policy:
     replace_on_loss: bool  # relaunch a lost node (preempt) vs let the group shrink (shrink)
     recovery_timeout_s: float  # no checkpoint progress this long -> whole-group restart
     heartbeat_timeout_s: float = 90.0  # log key stale this long -> node presumed dead
+    # Consecutive epochs with no checkpoint before we stop believing the world can
+    # form. Each epoch gets a full recovery_timeout_s, so this many failures is
+    # already several minutes of evidence — enough to conclude the membership
+    # itself is the problem and only a clean slate will do.
+    #
+    # Budget it in PREEMPTIONS, not epochs: one preemption publishes TWO epochs
+    # (shrink onto the survivors, then grow when the replacement joins). At 3,
+    # ~1.5 normal recoveries exhausted it — so a counter meant to catch "this
+    # world can NEVER form" could be spent by the mechanism working exactly as
+    # designed, and its penalty is the most destructive action available:
+    # discarding every healthy survivor. 6 = three full preemptions.
+    max_epochs_without_progress: int = 6
 
 
 def _healthy(n: NodeObs, policy: Policy) -> bool:
@@ -111,7 +130,14 @@ class LaunchReplacement:
 
 @dataclass(frozen=True)
 class WholeGroupRestart:
-    pass
+    # WHY the floor fired. This is the most destructive action the supervisor can
+    # take — it discards every healthy survivor and relaunches the fleet — and it
+    # used to be logged as a bare "whole-group restart (floor)". When an 8-node
+    # run amplified 6 injected kills into 22 node slots, the log could not say
+    # which of the three conditions was responsible, so the cause had to be
+    # guessed. Never again: the reason travels with the action.
+    # Compared by identity of the reason too, so tables stay explicit.
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -144,13 +170,41 @@ def decide(obs: Observation, policy: Policy) -> list[Action]:
 
     healthy = frozenset(n.node for n in obs.nodes if _healthy(n, policy))
 
-    # Whole-group restart floor: the group stopped making progress, or every
-    # member is observed gone (no survivor to shrink onto).
-    if obs.epoch > 0 and (
-        (obs.no_progress_s is not None and obs.no_progress_s > policy.recovery_timeout_s)
-        or not healthy
-    ):
-        return [WholeGroupRestart()]
+    # Whole-group restart floor: the group stopped making progress, kept
+    # re-forming without ever training, or every member is observed gone (no
+    # survivor to shrink onto).
+    #
+    # NB the no-progress clock is restarted by the shell on every epoch
+    # publication. It has to be: a preemption arriving late in a checkpoint
+    # interval would otherwise inherit a nearly-spent budget and trip this
+    # instantly, discarding healthy survivors to "recover" from a world that was
+    # recovering fine. The clock measures "this world has had its chance", not
+    # "time since some checkpoint" — and epochs_without_progress is what keeps
+    # the deadlock-breaker reachable once the clock can be reset.
+    #
+    # Under a HIGH failure rate the first two conditions need care: every kill
+    # publishes two epochs (shrink, then grow), so a naive per-epoch counter
+    # spends its whole budget on ~1.5 preemptions and nukes a fleet that is
+    # recovering exactly as designed. Both are therefore judged against a world
+    # that still has healthy members — if survivors are present and the world is
+    # re-forming around them, that is the mechanism working, not a deadlock.
+    if obs.epoch > 0:
+        reason = ""
+        if not healthy:
+            # Nothing left to shrink onto: the only way back is a full relaunch.
+            reason = "no healthy members"
+        elif obs.no_progress_s is not None and obs.no_progress_s > policy.recovery_timeout_s:
+            reason = (
+                f"no checkpoint progress for {obs.no_progress_s:.0f}s "
+                f"(> recovery_timeout {policy.recovery_timeout_s:.0f}s)"
+            )
+        elif obs.epochs_without_progress >= policy.max_epochs_without_progress:
+            reason = (
+                f"{obs.epochs_without_progress} epochs published with no checkpoint "
+                f"(>= max {policy.max_epochs_without_progress})"
+            )
+        if reason:
+            return [WholeGroupRestart(reason)]
 
     # Startup: don't begin training degraded — wait for the whole group to
     # register and reach running, then publish epoch 1.
@@ -182,6 +236,50 @@ def decide(obs: Observation, policy: Policy) -> list[Action]:
 # --------------------------------------------------------------------------- #
 # The imperative shell
 # --------------------------------------------------------------------------- #
+def restore_state(st: SupervisorState, doc: dict | None) -> SupervisorState:
+    """Re-adopt a live world from the durable epoch document.
+
+    SupervisorState is cross-tick memory held in the PROCESS, so a restarted
+    supervisor starts at epoch 0 / members {} -- and ``decide`` reads
+    ``obs.epoch == 0`` as "nothing has ever been published" and republishes
+    EPOCH 1 over a live world. Sidecars kill and relaunch torchrun on an epoch
+    change, so all N boxes churn at once, their heartbeats go quiet, and
+    ``replace_on_loss`` then launches a replacement for every one of them. That
+    is how a supervisor SIGKILL grew an 8-node fleet to 14 in the rehearsal.
+
+    The authority already lives in S3 -- epoch.json is written on every
+    publication. This just reads it back, so a restart is a no-op instead of a
+    fleet rebuild. Which is what makes "if the supervisor throws, reboot it" a
+    cheap strategy rather than a $3-and-four-minutes one.
+
+    Deliberately total: a missing document is a genuine cold start (epoch 0 is
+    then the truth and the startup branch SHOULD run), and a malformed one --
+    truncated, half-written, hand-edited -- degrades to the same, because
+    raising here would turn a recoverable restart into a dead control plane.
+    """
+    if not doc:
+        return st
+    try:
+        epoch = int(doc.get("epoch") or 0)
+        raw = doc.get("members") or []
+        members = {int(m["node"]): m.get("ip") for m in raw if m.get("node") is not None}
+    except (TypeError, ValueError, AttributeError):
+        return st
+    if epoch <= 0 or not members:
+        return st
+    st.epoch = epoch
+    st.members = frozenset(members)
+    st.ips = {n: ip for n, ip in members.items() if ip}
+    # epoch_doc() builds `ordered = [master, *rest]`, so rank 0 IS the master --
+    # the ordering is the authority and there is no separate field to trust.
+    ranked = sorted(
+        (m for m in raw if m.get("node") is not None),
+        key=lambda m: m.get("rank", 0),
+    )
+    st.master = int(ranked[0]["node"]) if ranked else None
+    return st
+
+
 def elect_master(
     members: tuple[int, ...], prev_members: frozenset[int], current_master: int | None
 ) -> int:
@@ -317,6 +415,9 @@ class SupervisorState:
     ips: dict[int, str] = field(default_factory=dict)  # node -> private IP (from registration)
     ckpt_step: int = -1
     ckpt_changed_at: float = 0.0
+    # Epochs published since the last checkpoint advanced. Reset by real progress;
+    # bumped by each publication. See Observation.epochs_without_progress.
+    epochs_without_progress: int = 0
     shrink_baseline: int | None = None  # ckpt step at the last kill (for shrink_resume)
     full_ws: int | None = None  # world size before the last kill (for full_world)
     marks: set[str] = field(default_factory=set)  # one-shot marks already emitted per epoch cycle
@@ -358,6 +459,9 @@ class Supervisor:
         self.ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
         self.metrics_key = cfg.run_metrics_key(run_id)
         self._train_start: float | None = None
+        # Wall-clock twin of _train_start. Persisted, because monotonic resets
+        # with the process and the kill clock must not.
+        self._train_start_wall: float = 0.0
         # Kill scheduling is EDGE-triggered per schedule ENTRY (not per node):
         # once entry i has been issued it never fires again, even after its
         # victim is replaced and re-added to the group. (A level trigger on
@@ -375,6 +479,60 @@ class Supervisor:
         self._orch_lines: list[str] = []
         self._orch_dirty = False
         self._downed: set[tuple[int, str]] = set()  # (node, iid) already emitted down/killed
+
+    # -- durable chaos-schedule progress ------------------------------------ #
+    def _save_schedule(self, wall: float) -> None:
+        """Persist which kill entries have fired, and when training began.
+
+        Housekeeping: a failure here must never end the run. The cost of losing
+        it is a replayed schedule, which is bad but survivable; the cost of
+        raising is a dead control plane.
+        """
+        if self._train_start is None:
+            return
+        with contextlib.suppress(Exception):
+            aws.put_text(
+                self.cfg.bucket,
+                self.cfg.run_schedule_key(self.run_id),
+                json.dumps(
+                    {
+                        "version": 1,
+                        "train_start_wall": self._train_start_wall,
+                        "fired": sorted(self._fired_kills),
+                    }
+                ),
+            )
+
+    def _restore_schedule(self, now: float, wall: float) -> None:
+        """Re-arm the kill clock from S3 instead of from this process's birth.
+
+        `_train_start` is a time.monotonic() reading, and monotonic resets with
+        the process -- which is precisely the bug. So the WALL start is what is
+        persisted, and the monotonic field is reconstructed by offsetting it, so
+        `elapsed` keeps measuring time since training actually began rather than
+        since the supervisor last restarted.
+        """
+        doc = None
+        with contextlib.suppress(Exception):
+            doc = aws.get_json(self.cfg.bucket, self.cfg.run_schedule_key(self.run_id))
+        if not doc:
+            return
+        try:
+            fired = {int(i) for i in doc.get("fired") or []}
+            started = float(doc.get("train_start_wall") or 0.0)
+        except (TypeError, ValueError):
+            return
+        if started <= 0:
+            return
+        self._fired_kills = fired
+        self._train_start_wall = started
+        self._train_start = now - max(0.0, wall - started)
+        remaining = [s for i, (s, _v) in enumerate(self.kill_schedule) if i not in fired]
+        self._event(
+            f"re-armed kill schedule: {len(fired)} of {len(self.kill_schedule)} already "
+            f"fired, {len(remaining)} pending, training began {wall - started:.0f}s ago "
+            f"(not replaying)"
+        )
 
     # -- observability ------------------------------------------------------ #
     def _event(self, msg: str) -> None:
@@ -415,8 +573,39 @@ class Supervisor:
                 ckpt_step=self.st.ckpt_step,
                 done=done,
             )
-            aws.put_text(self.cfg.bucket, self.status_key, json.dumps(doc))
+            body = json.dumps(doc)
+            aws.put_text(self.cfg.bucket, self.status_key, body)
+            # HISTORY, not just current state. status.json is overwritten in
+            # place, so the world-size staircase and the Gantt exist only if
+            # something captured every tick -- and today that something is
+            # live.py polling from a LAPTOP. Close the lid for an hour and that
+            # hour of fleet history is unrecoverable: it was never written down.
+            # Step/loss/cost survive (node logs are append-only in S3); world
+            # size and slot occupancy do not.
+            #
+            # The supervisor IS the writer, so it publishes each tick as its own
+            # immutable object and `aws s3 sync` on the prefix reconstructs the
+            # full history from anywhere. One object per tick rather than one
+            # growing jsonl: rewriting a 13 MB file every 10s would be ~78 GB of
+            # PUTs over a 24h run.
+            if doc.get("updated_at") != (self._last_status or {}).get("updated_at"):
+                aws.put_text(
+                    self.cfg.bucket,
+                    self.cfg.run_status_tick_key(self.run_id, wall),
+                    body,
+                    quiet=True,
+                )
             self._last_status = doc
+            # Feed the live dashboard the state only the supervisor has. The
+            # profile parses trainer logs, so without this push `ckpt_step` --
+            # durable progress, the one measure a failure cannot inflate -- is
+            # absent from every live run and present only in replays.
+            self.profile.observe(
+                ckpt_step=self.st.ckpt_step,
+                members=list(doc.get("members") or []),
+                target_world=self.cfg.node_count,
+                whole_group_restarts=getattr(self.st, "whole_group_restarts", 0),
+            )
             if self._orch_dirty:
                 aws.put_text(self.cfg.bucket, self.orch_log_key, "\n".join(self._orch_lines) + "\n")
                 self._orch_dirty = False
@@ -435,8 +624,22 @@ class Supervisor:
         if raw is None:
             return None
         try:
-            ip = json.loads(raw)["ip"]
+            doc = json.loads(raw)
+            ip = doc["ip"]
         except (ValueError, KeyError):
+            return None
+        # A registration is only OURS if the box that wrote it is the box now
+        # occupying this slot. nodes/node<i>.json is keyed by node INDEX and
+        # persists in S3, so after a kill the DEAD occupant's doc is still there:
+        # clearing the in-memory cache just forced a re-read of it, and the slot
+        # read as registered again within one tick. That is what let the reducer
+        # regrow onto a corpse at t+288s while the replacement did not boot until
+        # t+440s — 204s of survivors idling. Comparing instance ids makes the slot
+        # unregistered until the REPLACEMENT writes its own doc.
+        # ("unknown" = IMDS unavailable, i.e. the localhost E2E; trust it there.)
+        expected = self.node_ids.get(node)
+        got = doc.get("instance_id")
+        if expected and got and got != "unknown" and got != expected:
             return None
         self.st.ips[node] = ip
         return ip
@@ -457,7 +660,9 @@ class Supervisor:
         # Checkpoint progress: track when the max step last advanced.
         step = aws.max_checkpoint_step(self.cfg.bucket, self.ckpt_prefix)
         if step > self.st.ckpt_step:
+            # Real progress: the world is training. Clears BOTH stall signals.
             self.st.ckpt_step, self.st.ckpt_changed_at = step, now
+            self.st.epochs_without_progress = 0
         no_progress = (now - self.st.ckpt_changed_at) if self._train_start is not None else None
 
         due = set()
@@ -465,8 +670,19 @@ class Supervisor:
             elapsed = now - self._train_start
             for i, (secs, victim) in enumerate(self.kill_schedule):
                 if elapsed >= secs and i not in self._fired_kills:
+                    # LEADER_VICTIM resolves HERE, not when the schedule was
+                    # built: elect_master is sticky to a survivor, so after any
+                    # kill the master may no longer be node 0 and a fixed index
+                    # would stop exercising re-election. If there is no master
+                    # yet, leave the entry unfired so it lands on a later tick
+                    # rather than being silently dropped.
+                    if victim == LEADER_VICTIM:
+                        if self.st.master is None:
+                            continue
+                        victim = self.st.master
                     due.add(victim)
                     self._fired_kills.add(i)  # fire this entry exactly once
+                    self._save_schedule(wall)
 
         return Observation(
             node_count=self.cfg.node_count,
@@ -476,6 +692,7 @@ class Supervisor:
             metrics_exists=aws.object_exists(self.cfg.bucket, self.metrics_key),
             no_progress_s=no_progress,
             due_kills=frozenset(due),
+            epochs_without_progress=self.st.epochs_without_progress,
         )
 
     # -- current world size (for full_world), read from the profile stream -- #
@@ -495,6 +712,15 @@ class Supervisor:
         aws.put_text(self.cfg.bucket, self.cfg.run_epoch_key(self.run_id), json.dumps(doc))
         self.st.epoch, self.st.members, self.st.master = epoch, frozenset(members), master
         self.st.replacing -= set(members)  # any admitted member is no longer "in flight"
+        # Restart the stall clock: this world was just created and has not had a
+        # chance to checkpoint yet. Survivors must tear down and re-form the
+        # collective, and a replacement has to boot AND pull the dataset (~4-5 min
+        # for a 17 GB train.bin) before it can take a single step. Charging that
+        # against the PREVIOUS world's clock is what made every preemption look
+        # like a wedged group and trigger a whole-group restart. The counter below
+        # is what still catches a world that never trains at all.
+        self.st.ckpt_changed_at = time.monotonic()
+        self.st.epochs_without_progress += 1
         self._event(
             f"published epoch {epoch}: members {sorted(members)} master=node{master} "
             f"({doc['master_addr']}:{doc['master_port']})"
@@ -521,6 +747,15 @@ class Supervisor:
         self.st.marks.discard("full_world")
         aws.terminate(iid)
         self._terminated_iids.add(iid)
+        # Forget the box's identity IMMEDIATELY. `_healthy` requires a
+        # registration, and st.ips is keyed by node INDEX, so a slot kept its
+        # dead occupant's IP after the kill. Combined with EC2 briefly still
+        # reporting `running` and a log only ~26s old (under the 90s heartbeat
+        # timeout), a node we had just terminated still read as healthy — so the
+        # reducer regrew the world onto a corpse and then waited for the
+        # replacement that eventually filled the slot. Clearing the IP makes the
+        # slot unregistered until its REPLACEMENT announces itself.
+        self.st.ips.pop(node, None)
         self.profile.instance_stopped(iid)
         self.profile.mark("kill")
         self._event(f"terminated node {node} ({iid})")
@@ -535,21 +770,32 @@ class Supervisor:
             return
         self.st.replacing.add(node)
         self._event(f"launching replacement for node {node}")
-        aws.wait_quota_released(self.node_ids[node])
+        # Do NOT wait for the dead instance to release its quota first. That was
+        # an unconditional serialization — terminate, poll every 5s until AWS
+        # moves it out of shutting-down (tens of seconds), only then launch —
+        # paid on every replacement even when the account has ample headroom.
+        # wait_vcpu_headroom already covers the case it was guarding: it returns
+        # immediately when used+needed fits, and blocks only when it does not,
+        # which is exactly when the dead instance releasing is what makes room.
+        # Measured: 4 nodes + 1 replacement = 20 of a 64 vCPU quota. It never had
+        # to wait. It matters most in the total-loss case, where every
+        # replacement used to queue behind a corpse AND no survivor is training.
         aws.wait_vcpu_headroom(self.cfg.instance_vcpu_count(), self.cfg.vcpu_quota)
         self.st.ips.pop(node, None)  # force re-read of the replacement's fresh registration
         self.node_ids[node] = self._launch_node(node)
         self.profile.mark("relaunch")
 
-    def _whole_group_restart(self) -> None:
-        self._event("whole-group restart (floor)")
+    def _whole_group_restart(self, reason: str = "") -> None:
+        self._event(f"whole-group restart (floor): {reason or 'unspecified'}")
         aws.delete_object(self.cfg.bucket, self.cfg.run_epoch_key(self.run_id))
         for iid in self.node_ids.values():
             aws.terminate(iid)
             self.profile.instance_stopped(iid)
-        for iid in self.node_ids.values():
-            aws.wait_quota_released(iid)
         self.st = SupervisorState()
+        # Same reasoning as _launch_replacement: no unconditional per-instance
+        # quota wait. Here the whole fleet's worth of vCPUs is needed at once, so
+        # headroom genuinely may be short — and wait_vcpu_headroom blocks exactly
+        # then, and only then, instead of serializing on every corpse in turn.
         aws.wait_vcpu_headroom(
             self.cfg.node_count * self.cfg.instance_vcpu_count(), self.cfg.vcpu_quota
         )
@@ -566,7 +812,7 @@ class Supervisor:
             elif isinstance(a, LaunchReplacement):
                 self._launch_replacement(a.node)
             elif isinstance(a, WholeGroupRestart):
-                self._whole_group_restart()
+                self._whole_group_restart(a.reason)
             elif isinstance(a, Done):
                 pass
 
@@ -595,6 +841,27 @@ class Supervisor:
         parsed metrics, or None on timeout."""
         import sys
 
+        # RE-ADOPT before the first tick. run() is what the systemd unit
+        # re-enters after a crash, so this is the one place that sees every
+        # restart. On a cold start there is no epoch document and this is a
+        # no-op; on a restart it is the difference between continuing a live
+        # world and rebuilding one that was training fine.
+        prior = self.st.epoch
+        with contextlib.suppress(Exception):  # a failed read must not block a restart
+            self.st = restore_state(
+                self.st, aws.get_json(self.cfg.bucket, self.cfg.run_epoch_key(self.run_id))
+            )
+        if self.st.epoch > prior:
+            self._event(
+                f"re-adopted epoch {self.st.epoch}: members {sorted(self.st.members)} "
+                f"master=node{self.st.master} (restarted onto a live world, not re-forming it)"
+            )
+        # Re-arm the chaos schedule from S3 too. Without this a restart replays
+        # every kill from zero -- the fleet survives it, but the run's chaos
+        # accounting no longer matches what was scheduled, and it costs real
+        # replacements.
+        self._restore_schedule(time.monotonic(), time.time())
+
         end = time.monotonic() + deadline_s
         while time.monotonic() < end:
             self._pull_logs()
@@ -603,6 +870,8 @@ class Supervisor:
             # First checkpoint => training has started; arm the kill schedule clock.
             if self._train_start is None and self.st.ckpt_step >= 0 and self.st.epoch > 0:
                 self._train_start = now
+                self._train_start_wall = wall
+                self._save_schedule(wall)
                 self.profile.mark("train_start")
             # Reclaim detection: a member observed gone that we did NOT terminate
             # is a spot reclaim => emit "down" (stamped now, ~one tick after the

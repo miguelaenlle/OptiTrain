@@ -20,6 +20,8 @@ checkpoints/
 # Dataset bins are huge + regenerable — ignore them, but KEEP our prep scripts
 # (data/<dataset>/prepare.py) tracked so `stage-data` can build the corpus.
 data/**/*.bin
+# ...and the in-progress artifacts of a long prep job (.bin.partial/.bin.progress)
+data/**/*.bin.*
 data/**/*.pkl
 datasets/
 out/
@@ -55,3 +57,11 @@ reports/
 # Local Gantt timeline exports written by `spot-orchestrate logs` (the `e` key)
 *-timeline.png
 *-events.txt
+
+# Grafana: exported run data is regenerable from S3 artifacts
+deploy/grafana/data/
+# live-loop scratch: one dir per run, pulled from S3 each tick
+deploy/grafana/.live/
+
+# Grafana export artifacts (regenerate with export.py)
+deploy/grafana/data/

@@ -1,0 +1,11 @@
+apiVersion: 1
+datasources:
+  - name: RunData
+    type: yesoreyeram-infinity-datasource
+    uid: rundata
+    access: proxy
+    isDefault: false
+    jsonData:
+      # Grafana proxies the fetch, so the browser never needs to reach nginx.
+      allowedHosts:
+        - http://data/

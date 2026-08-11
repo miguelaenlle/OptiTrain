@@ -26,6 +26,12 @@ def _env_float(name: str, default: float) -> float:
     return float(v) if v not in (None, "") else default
 
 
+# Sentinel victim meaning "whichever node is master when this kill fires".
+# Resolved by the supervisor at fire time, not at schedule-build time: the
+# master moves (elect_master is sticky to a SURVIVOR), so a hardcoded index
+# would quietly stop testing re-election after the first kill.
+LEADER_VICTIM = -1
+
 # Trainer knobs the orchestrator relays verbatim (only when set in ITS
 # environment): the convergence recipe + periodic eval/sample cadence. The
 # orchestrator never branches on these values, so they stay untyped strings —
@@ -48,6 +54,11 @@ _TRAINER_PASSTHROUGH = (
     "MIN_LR",
     "GRAD_CLIP",
     "CHECKPOINT_ASYNC",
+    # Without this the durable-tier prune depth is stuck at TrainConfig's default
+    # on the box: pruning still happens, but the recipe cannot tune it and
+    # CHECKPOINT_KEEP=0 cannot turn it off. A knob that silently does nothing is
+    # worse than no knob.
+    "CHECKPOINT_KEEP",
     "LOG_INTERVAL_STEPS",
     "EVAL_INTERVAL_STEPS",
     "SAMPLE_INTERVAL_STEPS",
@@ -58,6 +69,78 @@ _TRAINER_PASSTHROUGH = (
     "SAMPLE_TOP_K",
     "SAMPLES_PER_PROMPT",
 )
+
+# Orchestrator knobs the REMOTE control plane inherits from your shell/.env when
+# you run `orch up`. An ALLOWLIST, never a blanket copy of os.environ: the env
+# lands in EC2 user-data (readable via IMDS by anything on the box), so
+# credentials and API keys must never ride along — boto3 on the box resolves its
+# creds from the attached instance-profile role instead.
+_ORCH_RELAY_ENV = (
+    "SPOT_TRAIN_BUCKET",
+    "AWS_REGION",
+    "REPO_URL",
+    "REPO_BRANCH",
+    "INSTANCE_TYPE",
+    "AMI_ID",
+    "AMI_NAME_FILTER",
+    "SSH_KEY_NAME",
+    "IAM_ROLE",
+    "IAM_PROFILE",
+    "SECURITY_GROUP",
+    "MAX_INSTANCE_LIFETIME_SECONDS",
+    "DATASET",
+    "HOURLY_USD",
+    "BASELINE_SECONDS",
+    "SPOT_SEG1_SECONDS",
+    "SPOT_SEG2_SECONDS",
+    "CHECKPOINT_INTERVAL_SECONDS",
+    "EVAL_ITERS",
+    "BATCH_SIZE",
+    "MARKET",
+    "TRAIN_TOTAL_SECONDS",
+    "PREEMPT_COUNT",
+    "PREEMPT_GRACE",
+    "PREEMPT_AFTER",
+    "PREEMPT_CHECKPOINT_SECONDS",
+    "PREEMPT_VICTIMS",
+    # Without these the REMOTE control plane silently falls back to the
+    # evenly-spaced single-victim schedule -- i.e. the mass-loss event just
+    # would not happen, and the run would look like it worked.
+    "PREEMPT_SCHEDULE",
+    "INSTANCE_LIFETIME_SLACK_SECONDS",
+    "SMOKE_TEST_EVERY",
+    "SAMPLE_PROMPTS",
+    "DDP_NPROC_PER_NODE",
+    "DDP_DATA_MODE",
+    "NODES",
+    "RDZV_PORT",
+    "NCCL_TIMEOUT",
+    "NCCL_INIT_TIMEOUT",
+    "NCCL_SOCKET_IFNAME",
+    "NCCL_IB_DISABLE",
+    "NCCL_DEBUG",
+    "NCCL_NET",
+    "NCCL_NET_PLUGIN",
+    "NCCL_SOCKET_NTHREADS",
+    "NCCL_NSOCKS_PERTHREAD",
+    "RECOVERY_TIMEOUT",
+    "VCPU_QUOTA",
+    "INSTANCE_VCPUS",
+    "METRICS_TIMEOUT",
+    "METRICS_OVERHEAD",
+    "S3_MAX_CONCURRENCY",
+    "S3_CHUNK_MB",
+    "LOG_STREAM_SECONDS",
+    "WANDB_PROJECT",
+    "WANDB_ENTITY",
+    "WANDB_GROUP",
+    "WANDB_DISABLED",
+)
+
+# Belt-and-braces: any name that smells like a credential is dropped from the
+# relayed env even if it was explicitly passed with `--env`. user-data is not a
+# secret store.
+_SECRETISH = ("SECRET", "PASSWORD", "TOKEN", "API_KEY", "ACCESS_KEY", "CREDENTIAL")
 
 # vCPUs per instance type, for the quota-headroom gate. Only the types this
 # project plausibly launches; anything else needs INSTANCE_VCPUS set explicitly.
@@ -83,6 +166,15 @@ ON_DEMAND_HOURLY_USD = {
     "g4dn.12xlarge": 3.912,
     "g5.xlarge": 1.006,
     "g6.xlarge": 0.805,
+    # Control-plane boxes (`orch up`): tiny, on-demand, and long-lived, so their
+    # cost must show up in the ledger for a multi-day run to be honest.
+    "t3.micro": 0.0104,
+    "t3.small": 0.0208,
+    "t3.medium": 0.0416,
+    # Dataset-prep boxes (`stage-data --remote`): CPU-only, one hour, one job.
+    "c6i.2xlarge": 0.34,
+    "c6i.4xlarge": 0.68,
+    "c6i.8xlarge": 1.36,
 }
 
 
@@ -98,6 +190,14 @@ class OrchestratorConfig:
     # run ends far sooner, so this only ever catches orphans.
     max_instance_lifetime_seconds: int = field(
         default_factory=lambda: _env_int("MAX_INSTANCE_LIFETIME_SECONDS", 0)
+    )
+    # Slack added to a run's own budget when DERIVING the dead-man timer: boot,
+    # the dataset pull and the post-budget eval/sample tail all happen outside
+    # TRAIN_BUDGET_SECONDS. 1h is generous against a measured ~4min boot + ~2min
+    # dataset, because a timer that fires DURING a healthy run is far worse than
+    # one that fires late.
+    instance_lifetime_slack_seconds: int = field(
+        default_factory=lambda: _env_int("INSTANCE_LIFETIME_SLACK_SECONDS", 3600)
     )
     # Deep Learning AMI. If AMI_ID is set we use it verbatim; otherwise we resolve
     # the newest Amazon-owned image matching this name filter via DescribeImages.
@@ -133,9 +233,7 @@ class OrchestratorConfig:
 
     # --- code delivery -------------------------------------------------------
     repo_url: str = field(
-        default_factory=lambda: _env(
-            "REPO_URL", "https://github.com/miguelaenlle/Spot-Distributed-LLM-Training.git"
-        )
+        default_factory=lambda: _env("REPO_URL", "https://github.com/miguelaenlle/OptiTrain.git")
     )
     repo_branch: str = field(default_factory=lambda: _env("REPO_BRANCH", "main"))
 
@@ -183,10 +281,17 @@ class OrchestratorConfig:
     # evenly across segments. Set small (e.g. PREEMPT_AFTER=15) to exercise the
     # kill/resume path fast while debugging; the number of kills stays preempt_count.
     preempt_after_seconds: int = field(default_factory=lambda: _env_int("PREEMPT_AFTER", 0))
-    # Small checkpoint interval during preemption so training-start is detectable fast
-    # (graceful SIGTERM also checkpoints, so lost work is ~0 regardless).
+    # Checkpoint interval while a kill schedule is armed. Bounds lost work per
+    # hard kill (no warning) — but it is paid on EVERY step of the whole run, so
+    # it must be priced against the checkpoint's real size. 5s was right when a
+    # Shakespeare checkpoint was a few MB; at GPT-2 124M a checkpoint is 1.5 GB,
+    # and 5s meant serializing + pushing 1.5 GB toward S3 continuously on the
+    # same NIC the gradient all-reduce rides. Measured on the 2-kill 1h run:
+    # 6330 ms/step vs 4013 clean — a +58% tax on every step, dwarfing the
+    # downtime it was meant to bound. At 60s the worst case loses ~15 steps
+    # (~1 min) per kill, and the tax drops to ~2-3%.
     preempt_checkpoint_seconds: int = field(
-        default_factory=lambda: _env_int("PREEMPT_CHECKPOINT_SECONDS", 5)
+        default_factory=lambda: _env_int("PREEMPT_CHECKPOINT_SECONDS", 60)
     )
     # How often the trainer runs the (noisy) checkpoint verify+smoke test. Set per
     # experiment so frequent preemption checkpoints don't flood the loss output.
@@ -205,6 +310,10 @@ class OrchestratorConfig:
     # (kill node 1 first, then node 0). Any node is killable — the epoch after a
     # kill just names a new lowest-index master. Empty = always the last node.
     preempt_victims: str = field(default_factory=lambda: _env("PREEMPT_VICTIMS", ""))
+    # Explicit chaos schedule; when set it WINS over preempt_victims/count. See
+    # preempt_schedule() for the grammar. This is what lets a single event kill
+    # several nodes at once.
+    preempt_schedule_spec: str = field(default_factory=lambda: _env("PREEMPT_SCHEDULE", ""))
 
     # --- DDP experiment (spot-orchestrate ddp) ------------------------------
     # Ranks torchrun launches on the box. 0 (default) = auto: one rank per GPU on
@@ -233,15 +342,108 @@ class OrchestratorConfig:
     # legitimate stall at this model size (an async-checkpoint snapshot or a slow
     # TCP allreduce is well under 2s).
     nccl_timeout_seconds: int = field(default_factory=lambda: _env_int("NCCL_TIMEOUT", 20))
-    # No checkpoint progress for this long -> the supervisor's whole-group
-    # restart floor (terminate all, relaunch, publish a fresh epoch).
     # No-checkpoint-progress this long => the whole group is wedged (e.g. a torchrun
     # rendezvous that can't converge) => whole-group restart. The deadlock-breaker
     # of last resort. Must sit ABOVE the worst-case LEGITIMATE no-progress window
-    # (a whole-group reboot: ~45-70s boot + restore + first checkpoint ~= 90s) so it
-    # never false-fires mid-recovery, yet well under METRICS_TIMEOUT so a genuine
-    # hang is broken within a run instead of stalling to the deadline.
-    recovery_timeout_seconds: int = field(default_factory=lambda: _env_int("RECOVERY_TIMEOUT", 150))
+    # so it never false-fires mid-recovery, yet well under METRICS_TIMEOUT so a
+    # genuine hang is broken within a run instead of stalling to the deadline.
+    #
+    # 150s was that floor when the dataset was Shakespeare (a whole-group reboot
+    # was ~45-70s boot + restore + first checkpoint ~= 90s). Full OpenWebText
+    # invalidated it: a REPLACEMENT must boot (~2 min) AND pull a 17 GB train.bin
+    # (measured 117s) before it can take a step, so legitimate recovery is ~4-5
+    # min. At 150s the supervisor gave up mid-recovery and restarted the whole
+    # group — discarding healthy survivors — on every single preemption, which is
+    # the exact opposite of what the shrink-and-continue design exists to do.
+    # Observed live on an 8-node run: 3 whole-group restarts, zero real progress.
+    #
+    # Sized for boot + dataset pull + collective re-init, with headroom. If the
+    # corpus grows again, this has to grow with it — it is a function of how long
+    # a replacement takes to become useful, not a free-floating constant.
+    recovery_timeout_seconds: int = field(default_factory=lambda: _env_int("RECOVERY_TIMEOUT", 600))
+
+    # --- remote orchestrator (spot-orchestrate orch up) ----------------------
+    # The durable control plane: one ALWAYS-ON-DEMAND box that runs the epoch
+    # supervisor so a 36h run doesn't need your laptop awake. Never spot — if the
+    # control plane is reclaimed mid-run there is nobody left to replace it.
+    orch_instance_type: str = field(default_factory=lambda: _env("ORCH_INSTANCE_TYPE", "t3.micro"))
+    # A plain Amazon Linux 2023 image, NOT the DLAMI: the control plane never
+    # trains, so it needs no CUDA/torch and a small root volume is a feature (a
+    # 100GB DLAMI volume would bill for the whole run). Kept separate from
+    # AMI_ID/AMI_NAME_FILTER so a DLAMI pin in your .env can't leak in here.
+    orch_ami_id: str = field(default_factory=lambda: _env("ORCH_AMI_ID", ""))
+    orch_ami_name_filter: str = field(
+        default_factory=lambda: _env("ORCH_AMI_NAME_FILTER", "al2023-ami-2023.*-x86_64")
+    )
+    # The control plane's OWN instance profile: it launches/terminates training
+    # boxes, so it needs more than the worker role (see docs/iam/). Separate role
+    # = the training boxes never inherit EC2 lifecycle rights.
+    orch_role_name: str = field(
+        default_factory=lambda: _env("ORCH_IAM_ROLE", "spot-train-orch-role")
+    )
+    orch_instance_profile: str = field(
+        default_factory=lambda: _env("ORCH_IAM_PROFILE", "spot-train-orch-profile")
+    )
+    # How often the on-box agent republishes heartbeat.json (liveness + live
+    # step/loss/cost for `orch status`).
+    orch_heartbeat_seconds: int = field(default_factory=lambda: _env_int("ORCH_HEARTBEAT", 10))
+    # Heartbeat older than this => the control plane is presumed wedged/gone.
+    orch_stale_seconds: int = field(default_factory=lambda: _env_int("ORCH_STALE_SECONDS", 60))
+    # Log relay cadence, and the cap that keeps 36h of stdout from filling an 8GB
+    # root volume — the local file is trimmed to its newest half past this size.
+    orch_log_upload_seconds: int = field(default_factory=lambda: _env_int("ORCH_LOG_UPLOAD", 15))
+    orch_log_max_bytes: int = field(
+        default_factory=lambda: _env_int("ORCH_LOG_MAX_BYTES", 32 * 1024 * 1024)
+    )
+    # Dead-man's switch for the CONTROL PLANE, deliberately its own knob and
+    # deliberately 0 (off) by default: MAX_INSTANCE_LIFETIME_SECONDS exists to
+    # reap orphaned *training* boxes when the orchestrator dies, and applying it
+    # here would kill the very process that does the reaping mid-run. Set it only
+    # if you want a hard ceiling comfortably above the run budget.
+    orch_max_lifetime_seconds: int = field(
+        default_factory=lambda: _env_int("ORCH_MAX_LIFETIME_SECONDS", 0)
+    )
+    # `orch up` gives up waiting for the box to boot + provision after this.
+    orch_boot_timeout_seconds: int = field(
+        default_factory=lambda: _env_int("ORCH_BOOT_TIMEOUT", 1800)
+    )
+
+    # --- remote dataset prep (spot-orchestrate stage-data --remote) ----------
+    # One throwaway on-demand box prepares the corpus IN AWS and uploads the bins
+    # same-region (free, minutes) instead of pushing 17 GB up a home uplink.
+    # CPU is NOT the bottleneck — tiktoken does ~29 MB/s/core, so even 4 cores
+    # tokenize OpenWebText in minutes; the HF download, the ~52 GB of cache
+    # writes and the S3 upload are. 16 vCPU keeps that pipeline saturated for
+    # ~$0.68/hr on a job that runs about an hour.
+    prep_instance_type: str = field(
+        default_factory=lambda: _env("PREP_INSTANCE_TYPE", "c6i.4xlarge")
+    )
+    # Root volume, sized EXPLICITLY: OpenWebText needs ~110 GB transient (54 GB
+    # HF cache + ~35 GB tokenized arrow + 17 GB bins), and every AMI default is
+    # far below that (AL2023 8 GB, DLAMI 30 GB). Inheriting the AMI's mapping —
+    # which is what every other launch in this repo does — would fill the disk
+    # ~40 minutes in.
+    prep_volume_gb: int = field(default_factory=lambda: _env_int("PREP_VOLUME_GB", 200))
+    # gp3 defaults to 125 MB/s and 3000 IOPS. ~52 GB of cache writes at 125 MB/s
+    # is ~7 minutes of pure disk wait on the critical path; 500 MB/s costs cents
+    # for a one-hour volume. gp3 caps throughput at 0.25 MB/s per provisioned
+    # IOPS, so 500 MB/s needs >=2000 IOPS — 6000 leaves headroom for the many
+    # small random writes the arrow cache makes.
+    prep_volume_throughput: int = field(
+        default_factory=lambda: _env_int("PREP_VOLUME_THROUGHPUT", 500)
+    )
+    prep_volume_iops: int = field(default_factory=lambda: _env_int("PREP_VOLUME_IOPS", 6000))
+    # Dead-man's switch — MANDATORY here (unlike the control plane's opt-in
+    # ceiling): this box exists to run ONE unattended job, and the worst possible
+    # outcome is a wedged prep billing overnight. 4h is ~4x the expected runtime,
+    # so it only ever fires on a genuinely stuck job.
+    prep_max_lifetime_seconds: int = field(
+        default_factory=lambda: _env_int("PREP_MAX_LIFETIME_SECONDS", 4 * 3600)
+    )
+    # Roughly how long the job takes, for the billable notice's cost estimate.
+    prep_expected_minutes: int = field(
+        default_factory=lambda: _env_int("PREP_EXPECTED_MINUTES", 70)
+    )
 
     # --- inference fleet (ROADMAP Part 1) ------------------------------------
     # CPU instances by default: the 10M-param model serves fine on CPU, and
@@ -260,6 +462,31 @@ class OrchestratorConfig:
     # experiments); set FLEET_INGRESS_CIDR=<your-ip>/32 to tighten.
     fleet_ingress_cidr: str = field(default_factory=lambda: _env("FLEET_INGRESS_CIDR", "0.0.0.0/0"))
 
+    # --- spotwatch (unattended spot-availability collector) -------------------
+    # S3 prefix the Lambda writes JSONL shards under; also the only prefix its
+    # IAM role can touch, so a bug in the collector can't reach checkpoints.
+    spotwatch_prefix: str = field(default_factory=lambda: _env("SPOTWATCH_PREFIX", "spotwatch"))
+    # Tick cadence. 10 minutes = 144 samples/day, comfortably inside Lambda's
+    # free tier and fine-grained enough to see an hour-of-day pattern.
+    spotwatch_interval_minutes: int = field(
+        default_factory=lambda: _env_int("SPOTWATCH_INTERVAL_MINUTES", 10)
+    )
+    # UTC hour whose first tick also does the daily-only work (pool enumeration
+    # + Spot Advisor fetch). 3 = quiet hour, away from business-hours throttling.
+    spotwatch_daily_hour: int = field(default_factory=lambda: _env_int("SPOTWATCH_DAILY_HOUR", 3))
+    # Truth probe: a real 1-instance spot launch, immediately returned. This is
+    # the only part that spends money or competes for capacity — hence the hard
+    # rate limit and the non-interference skip (see lambda_spotwatch.should_probe).
+    spotwatch_probe_enabled: bool = field(
+        default_factory=lambda: _env("SPOTWATCH_PROBE_ENABLED", "1") not in ("0", "false", "False")
+    )
+    spotwatch_probe_type: str = field(
+        default_factory=lambda: _env("SPOTWATCH_PROBE_TYPE", "g5.xlarge")
+    )
+    spotwatch_probe_min_hours: float = field(
+        default_factory=lambda: _env_float("SPOTWATCH_PROBE_MIN_HOURS", 6.0)
+    )
+
     # --- vCPU quota gate ------------------------------------------------------
     # The account's "Running On-Demand G and VT instances" vCPU quota. Launches
     # wait until running+pending G/VT usage leaves headroom under this before
@@ -272,7 +499,37 @@ class OrchestratorConfig:
 
     # --- polling -------------------------------------------------------------
     metrics_poll_seconds: int = 15
+    # How long the orchestrator waits for metrics.json before declaring the run
+    # dead. This is a FLOOR, not the whole story — see metrics_deadline_for(),
+    # which every supervised run must use instead of reading this directly. A
+    # fixed 1800s silently capped a 1h run at 30 minutes: the fleet was healthy
+    # (epoch 1, world 8, step 400, loss 4.86, zero crashes) and got terminated
+    # anyway, because the watchdog's patience was shorter than the work it was
+    # watching. At 36h a fixed default would kill the run before the first eval.
     metrics_timeout_seconds: int = field(default_factory=lambda: _env_int("METRICS_TIMEOUT", 1800))
+    # Slack added on top of the training budget: instance launch, clone/pip, the
+    # dataset pull (~2 min for a 17 GB train.bin), plus the final eval + sample +
+    # checkpoint tail after the budget expires. Generous on purpose — this
+    # deadline exists to catch a WEDGED run, and being late to notice one costs
+    # far less than killing a healthy fleet mid-run.
+    metrics_overhead_seconds: int = field(
+        default_factory=lambda: _env_int("METRICS_OVERHEAD", 1200)
+    )
+
+    def metrics_deadline_for(self, budget_seconds: float | None) -> int:
+        """Watchdog deadline for a run with this training budget.
+
+        The deadline has to outlast the work: budget + boot + dataset + the
+        post-budget eval/checkpoint tail. An explicit METRICS_TIMEOUT still wins
+        when it is larger, so operators can extend but never accidentally
+        shorten a run below its own budget.
+        """
+        if not budget_seconds or budget_seconds <= 0:
+            return self.metrics_timeout_seconds
+        return max(
+            self.metrics_timeout_seconds, int(budget_seconds) + self.metrics_overhead_seconds
+        )
+
     # How often the orchestrator pulls the box's boot log from S3 to print new
     # lines. Smaller than the metrics poll — this drives the live view latency.
     log_stream_seconds: int = field(default_factory=lambda: _env_int("LOG_STREAM_SECONDS", 3))
@@ -355,6 +612,32 @@ class OrchestratorConfig:
     def run_status_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/status.json"
 
+    def run_schedule_key(self, run_id: str) -> str:
+        """Durable chaos-schedule progress: which entries have fired, and the
+        WALL clock at which training started.
+
+        Both were process memory, so any supervisor restart replayed the whole
+        PREEMPT_SCHEDULE from zero -- at hour 8 of a 24h run that re-fires the
+        mass loss of 6 of 8, with no live knob to stop it because the schedule is
+        baked into user-data.
+        """
+        return f"{self.run_prefix}/{run_id}/schedule.json"
+
+    def run_status_prefix(self, run_id: str) -> str:
+        """Per-tick status objects — the DURABLE history status.json cannot be.
+
+        status.json is overwritten in place, so fleet history existed only while
+        a laptop was awake to poll it. These are written by the supervisor, so an
+        offline laptop loses nothing: `aws s3 sync` on this prefix rebuilds the
+        whole world-size / occupancy timeline after the fact.
+        """
+        return f"{self.run_prefix}/{run_id}/status/"
+
+    def run_status_tick_key(self, run_id: str, when: float) -> str:
+        # Millisecond, zero-padded: lexicographic order is chronological order,
+        # which is what makes `s3 sync` + a sorted read reconstruct the timeline.
+        return f"{self.run_status_prefix(run_id)}{int(when * 1000):015d}.json"
+
     def run_status_uri(self, run_id: str) -> str:
         return f"s3://{self.bucket}/{self.run_status_key(run_id)}"
 
@@ -391,6 +674,52 @@ class OrchestratorConfig:
     def fleet_state_key(self, fleet_id: str) -> str:
         return f"fleet/{fleet_id}/fleet.json"
 
+    # Remote-orchestrator control keys. Everything the laptop needs to find,
+    # watch, and cost a detached control plane lives under this one prefix:
+    #   orch.json      — what it was asked to run (experiment/env) + its run_id,
+    #                    written by the on-box agent; survives a systemd restart,
+    #                    which is how a restarted agent RESUMES the same run.
+    #   progress.json  — boot phase markers written by user-data, so `orch up`
+    #                    can show real provisioning progress instead of a spinner.
+    #   heartbeat.json — the agent's liveness + live step/loss/cost.
+    #   orchestrator.log / boot.log — the streamed process and user-data logs.
+    def orch_prefix(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/"
+
+    def orch_state_key(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/orch.json"
+
+    def orch_progress_key(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/progress.json"
+
+    def orch_heartbeat_key(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/heartbeat.json"
+
+    def orch_log_key(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/orchestrator.log"
+
+    def orch_boot_log_key(self, orch_id: str) -> str:
+        return f"orchestrators/{orch_id}/boot.log"
+
+    def orch_hourly_usd(self) -> float | None:
+        """$/hr for the control-plane box's cost-ledger row (None = unknown)."""
+        return ON_DEMAND_HOURLY_USD.get(self.orch_instance_type)
+
+    def orch_relay_env(self, overrides: dict[str, str] | None = None) -> dict[str, str]:
+        """The env the remote control plane boots with: this shell's values for
+        the allowlisted knobs (so your .env recipe carries over verbatim), then
+        the explicit ``--env K=V`` overrides on top. Credential-shaped names are
+        dropped from BOTH sources — user-data is world-readable on the box."""
+        env = {k: os.environ[k] for k in _ORCH_RELAY_ENV if os.environ.get(k)}
+        env.update(self.trainer_passthrough())  # the recipe knobs (MAX_STEPS, LR, …)
+        env.update(overrides or {})  # explicit --env wins over the inherited shell
+        return {k: v for k, v in env.items() if not any(s in k.upper() for s in _SECRETISH)}
+
+    def orch_secretish(self, env: dict[str, str]) -> list[str]:
+        """Names in ``env`` that look like credentials (dropped by orch_relay_env
+        — reported so the operator sees WHY their value didn't make it across)."""
+        return sorted(k for k in env if any(s in k.upper() for s in _SECRETISH))
+
     # AMI-bake control keys: the bake box writes status.json (ok/rc/commit) when
     # provisioning finishes and streams its boot log next to it.
     def bake_status_key(self, bake_id: str) -> str:
@@ -398,6 +727,22 @@ class OrchestratorConfig:
 
     def bake_log_key(self, bake_id: str) -> str:
         return f"bake/{bake_id}/bake.log"
+
+    # Remote dataset prep (`stage-data --remote`): the box streams its whole log
+    # here so the laptop can watch an hour-long job, and writes status.json last
+    # (the done signal — same shape as the bake marker).
+    def prep_log_key(self, prep_id: str) -> str:
+        return f"prep/{prep_id}/prep.log"
+
+    def prep_status_key(self, prep_id: str) -> str:
+        return f"prep/{prep_id}/status.json"
+
+    def prep_log_uri(self, prep_id: str) -> str:
+        return f"s3://{self.bucket}/{self.prep_log_key(prep_id)}"
+
+    def prep_hourly_usd(self) -> float | None:
+        """$/hr for the prep box (None = unknown type, so no cost estimate)."""
+        return ON_DEMAND_HOURLY_USD.get(self.prep_instance_type)
 
     def on_demand_hourly_usd(self) -> float | None:
         """$/hr for on-demand ledger rows: HOURLY_USD override, else the table.
@@ -466,6 +811,118 @@ class OrchestratorConfig:
                 f"PREEMPT_VICTIMS contains {bad} — node indices must be in [0, {self.node_count})"
             )
         return victims
+
+    def instance_lifetime_for(self, max_seconds: int) -> int:
+        """Seconds after boot at which a training box self-terminates.
+
+        Both dead-man switches shipped defaulting to 0 (OFF), which is the wrong
+        default for a 24h run: if the control plane dies and a node then fails,
+        survivors' torchrun crash-loops, sidecars exhaust MAX_EPOCH_CRASHES and
+        exit "leaving the box up for the watchdog" -- a watchdog that no longer
+        exists. The fleet then idles at full GPU rate until a human notices.
+
+        An explicit MAX_INSTANCE_LIFETIME_SECONDS still wins; otherwise derive
+        from the run's own budget plus slack.
+
+        KNOWN LIMITATION, do not paper over it: the timer starts at THIS box's
+        boot. A replacement launched at hour 20 of a 24h run gets a full-length
+        timer from its own boot, so this is a backstop for the
+        fleet-abandoned-early case, not a tight bound late in a run. The proper
+        fix is a renewable lease in status.json, deliberately out of scope.
+        """
+        if self.max_instance_lifetime_seconds > 0:
+            return self.max_instance_lifetime_seconds
+        if max_seconds <= 0:
+            return 0
+        return max_seconds + self.instance_lifetime_slack_seconds
+
+    def preempt_schedule(self) -> list[tuple[float, int]]:
+        """Explicit chaos schedule: [(seconds_after_train_start, victim), ...].
+
+        PREEMPT_VICTIMS gives ONE victim per round at evenly spaced times, so it
+        cannot express a simultaneous multi-node loss -- which is why
+        scripts/e4_rolling_pairs.py exists as a bespoke driver. The 24h run needs
+        a simultaneous loss of 6 of 8 (E5 survived 7 of 8), so that capability
+        belongs in the main driver, not in a one-off script.
+
+        Format -- semicolon-separated events, each ``<seconds>:<victims>``:
+
+            PREEMPT_SCHEDULE="480:3;960:L;1440:1,4;2400:0,1,2,3,4,5"
+
+        Victims are node indices (stable slots -- a replacement re-takes its
+        index), or ``L`` for whichever node is master WHEN THE KILL FIRES. L
+        matters because the master moves: elect_master is sticky to a survivor,
+        so after any kill the leader may no longer be node 0, and a hardcoded
+        index would quietly stop testing re-election.
+
+        Several victims at the SAME timestamp fire in one supervisor tick -- the
+        supervisor already collects due kills into a set, so simultaneity needs
+        nothing beyond expressing it here.
+
+        Empty => fall back to the PREEMPT_VICTIMS/PREEMPT_COUNT behaviour.
+        """
+        raw = (self.preempt_schedule_spec or "").strip()
+        if not raw:
+            return []
+        out: list[tuple[float, int]] = []
+        for event in raw.split(";"):
+            event = event.strip()
+            if not event:
+                continue
+            if ":" not in event:
+                raise SystemExit(
+                    f"PREEMPT_SCHEDULE event {event!r} — expected '<seconds>:<victims>', "
+                    f"e.g. '1440:1,4' or '960:L'"
+                )
+            when, victims = event.split(":", 1)
+            try:
+                secs = float(when)
+            except ValueError:
+                raise SystemExit(
+                    f"PREEMPT_SCHEDULE event {event!r} — {when!r} is not a number"
+                ) from None
+            for v in victims.split(","):
+                v = v.strip()
+                if v.upper() == "L":
+                    out.append((secs, LEADER_VICTIM))
+                    continue
+                try:
+                    idx = int(v)
+                except ValueError:
+                    raise SystemExit(
+                        f"PREEMPT_SCHEDULE event {event!r} — victim {v!r} must be a "
+                        f"node index or 'L'"
+                    ) from None
+                if not 0 <= idx < self.node_count:
+                    raise SystemExit(
+                        f"PREEMPT_SCHEDULE event {event!r} — node index {idx} outside "
+                        f"[0, {self.node_count})"
+                    )
+                out.append((secs, idx))
+        # A kill group that removes EVERY node is a total loss, not a chaos
+        # event: there is no survivor to keep training and the run becomes a
+        # whole-group restart. Catch it here rather than three minutes into a
+        # billed run.
+        by_time: dict[float, int] = {}
+        for secs, _v in out:
+            by_time[secs] = by_time.get(secs, 0) + 1
+        for secs, n in sorted(by_time.items()):
+            if n >= self.node_count:
+                raise SystemExit(
+                    f"PREEMPT_SCHEDULE kills {n} of {self.node_count} nodes at t+{secs:.0f}s — "
+                    f"that is a total loss with no survivors, not a preemption. Leave at least one."
+                )
+        return sorted(out)
+
+    # Whole-group-restart floor, in EPOCHS with no checkpoint progress. One
+    # preemption publishes two epochs (shrink, then grow), so the default 6 is
+    # three full recoveries. A chaos run with many scheduled rounds needs this
+    # raised or the floor fires on the mechanism working as designed — E4 sat
+    # exactly at 6 with three rounds and survived only because checkpoints
+    # landed between them and reset the counter.
+    max_epochs_without_progress: int = field(
+        default_factory=lambda: _env_int("MAX_EPOCHS_WITHOUT_PROGRESS", 6)
+    )
 
     @classmethod
     def for_inference(cls) -> OrchestratorConfig:

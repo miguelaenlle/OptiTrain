@@ -445,8 +445,9 @@ class RunProfile:
         # line (every LOG_INTERVAL_STEPS steps), which made the x-axis read
         # step/10. define_metric points every chart's x-axis at the logged
         # `train_step` instead, so it reads in true training steps.
-        self._wb.define_metric("train_step")
-        self._wb.define_metric("*", step_metric="train_step")
+        from . import wandb_dash as D
+
+        D.define_axes(self._wb)
 
     def _wb_config_cost(self) -> None:
         """Mirror the newest box's rate into the run config (Overview panel)."""
@@ -458,29 +459,64 @@ class RunProfile:
                 {"hourly_usd": row.hourly_usd, "az": row.az}, allow_val_change=True
             )
 
+    def observe(
+        self,
+        *,
+        ckpt_step: int | None = None,
+        members: list | None = None,
+        target_world: int | None = None,
+        whole_group_restarts: int | None = None,
+        trained_seconds: float | None = None,
+    ) -> None:
+        """Supervisor -> dashboard hook, called each tick.
+
+        The profile sees the trainer's log lines but not the supervisor's own
+        state, so durable progress (`ckpt_step`) and live membership have to be
+        pushed in. Without this the dashboard's headline series -- the one
+        progress measure a failure cannot inflate -- would be missing on live
+        runs and only present when replaying a finished one.
+        """
+        if ckpt_step is not None:
+            self._obs_ckpt_step = ckpt_step
+        if members is not None:
+            self._obs_members = list(members)
+        if target_world is not None:
+            self._obs_target_world = target_world
+        if whole_group_restarts is not None:
+            self._obs_wgr = whole_group_restarts
+        if trained_seconds is not None:
+            self._obs_trained_s = trained_seconds
+
     def _wb_log_step(self, s: Sample) -> None:
         if self._wb is None:
             return
-        payload = {
-            # t_rel/train_step let the W&B x-axis switch to wall-clock (gaps
-            # visible) or the trainer's own step (resume overlaps visible).
-            "loss": s.loss,
-            "ms_per_step": s.ms_per_step,
-            "tok_s": s.tok_s,
-            "t_rel": s.t_rel,
-            "train_step": s.step,
-        }
-        if s.world_size is not None:
-            # Charted against the same axes as loss: the world-size staircase
-            # (N -> N-1 while a replacement boots -> N) under the loss curve.
-            payload["world_size"] = s.world_size
-        if self.instances:
-            payload["cost/cumulative_usd"] = round(self.cost_now(), 6)
-            rate = self.hourly_rate_now()
-            if rate is not None:
-                payload["cost/hourly_usd"] = rate
-        self._wb.log(payload, step=self._wb_step)
+        from . import wandb_dash as D
+
+        marks = [e.event for e in self.events] if hasattr(self, "events") else []
+        state = D.RunState(
+            t_rel=s.t_rel,
+            step=s.step,
+            ckpt_step=getattr(self, "_obs_ckpt_step", -1),
+            loss=s.loss,
+            ms_per_step=s.ms_per_step,
+            world_size=s.world_size or (len(getattr(self, "_obs_members", []) or []) or None),
+            target_world=getattr(self, "_obs_target_world", None),
+            nodes_lost=marks.count("kill"),
+            replacements=marks.count("relaunch"),
+            whole_group_restarts=getattr(self, "_obs_wgr", 0),
+            trained_seconds=getattr(self, "_obs_trained_s", 0.0) or s.t_rel,
+            usd=round(self.cost_now(), 6) if self.instances else None,
+            tokens=s.step * self._tokens_per_step() if self._tokens_per_step() else None,
+        )
+        self._wb.log(D.tick_payload(state), step=self._wb_step)
         self._wb_step += 1
+
+    def _tokens_per_step(self) -> int:
+        """global batch x block size, from run metrics; 0 when not yet known."""
+        m = self.metrics or {}
+        gb = m.get("effective_global_batch")
+        bs = m.get("block_size") or 1024
+        return int(gb) * int(bs) if gb else 0
 
     def _wb_log_val(self, v: ValSample) -> None:
         if self._wb is None:

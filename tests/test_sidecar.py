@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
+
+import pytest
 
 from orchestrator import sidecar
 from spot_train import events, s3_store
@@ -201,3 +204,100 @@ def _spin(cond, timeout=3.0):
             return
         time.sleep(0.02)
     raise AssertionError("condition not met within timeout")
+
+
+def test_crash_loop_gives_up_instead_of_burning_the_fleet(tmp_path, monkeypatch):
+    """A DETERMINISTIC failure must not become an unbounded retry loop.
+
+    A crash is normally a peer death, and relaunching is right. But when the
+    world simply cannot start (the 8-node NCCL-init case: every node rebuilt,
+    re-downloaded 17 GB and re-failed every few seconds) the old code retried
+    forever — 8 g5 boxes at ~$8/hr making no progress until a human noticed.
+    After MAX_EPOCH_CRASHES the box exits nonzero so the fleet gets reaped.
+    """
+    run_uri = str(tmp_path)
+    h = Harness(monkeypatch)
+    monkeypatch.setattr(sidecar, "POLL_SECONDS", 0.01)
+    monkeypatch.setattr(sidecar, "RELAUNCH_BACKOFF_CAP", 0.0)  # no real waiting in tests
+    monkeypatch.setattr(sidecar, "MAX_EPOCH_CRASHES", 3)
+    _write_epoch(run_uri, 1, [0, 1])
+    t, result = _run_in_thread(run_uri, 0, h.launch)
+    t.start()
+    for i in range(3):  # crash every launch; never let it make progress
+        _spin(lambda i=i: len(h.launches) == i + 1)
+        h.launches[i].stop(rc=1)
+    t.join(timeout=5)
+    assert not t.is_alive(), "sidecar should have given up, not retried forever"
+    assert result["rc"] == 2, "nonzero exit is what tells the box to stop"
+    assert len(h.launches) == 3, "must not launch again past the cap"
+
+
+def test_epoch_change_forgives_earlier_crashes(tmp_path, monkeypatch):
+    """The cap is per-epoch. A new membership is a different question — a world
+    that failed at 8 nodes may be exactly what succeeds at 7, which is the whole
+    point of shrink-and-continue, so a fresh epoch must reset the budget."""
+    run_uri = str(tmp_path)
+    h = Harness(monkeypatch)
+    monkeypatch.setattr(sidecar, "POLL_SECONDS", 0.01)
+    monkeypatch.setattr(sidecar, "RELAUNCH_BACKOFF_CAP", 0.0)
+    monkeypatch.setattr(sidecar, "MAX_EPOCH_CRASHES", 2)
+    _write_epoch(run_uri, 1, [0, 1])
+    t, result = _run_in_thread(run_uri, 0, h.launch)
+    t.start()
+    _spin(lambda: len(h.launches) == 1)
+    h.launches[0].stop(rc=1)  # 1 crash in epoch 1 — one short of the cap
+    _spin(lambda: len(h.launches) == 2)
+    _write_epoch(run_uri, 2, [0])  # world shrank: budget resets
+    _spin(lambda: len(h.launches) == 3)
+    h.launches[2].stop(rc=1)  # would have tripped the old counter; must not now
+    _spin(lambda: len(h.launches) == 4)
+    assert h.launches[3].epoch == 2
+    s3_store.put_bytes(b"{}", sidecar._join(run_uri, "metrics.json"))
+    t.join(timeout=3)
+
+
+def test_dataset_is_pulled_before_the_box_registers(tmp_path, monkeypatch):
+    """Registration must mean "I can train", not "this instance exists".
+
+    Measured on a 4-node preemption: the supervisor admitted a replacement at
+    t+448s, but it could not take a step until t+662s because it was still
+    pulling a 17 GB train.bin. The survivors tore down their world-3 collective
+    and idled 214s (642 node-seconds) waiting for it.
+    """
+    order = []
+    monkeypatch.setenv("DATA_URI", "s3://bucket/data/x")
+    monkeypatch.setenv("DATA_LOCAL_DIR", str(tmp_path / "d"))
+
+    import spot_train.data as data_mod
+
+    monkeypatch.setattr(data_mod, "ensure_dataset", lambda d, u: order.append("dataset"))
+    monkeypatch.setattr(sidecar, "register", lambda *a, **k: order.append("register"))
+    monkeypatch.setattr(sidecar, "run", lambda *a, **k: order.append("run") or 0)
+
+    monkeypatch.setattr(sys, "argv", ["sidecar", "--run-uri", str(tmp_path), "--node-index", "3"])
+    with pytest.raises(SystemExit):
+        sidecar.main()
+    assert order == ["dataset", "register", "run"], f"wrong order: {order}"
+
+
+def test_prewarm_failure_does_not_block_the_box(tmp_path, monkeypatch):
+    """The trainer calls the same idempotent fetch and will retry. A prewarm
+    failure must never stop a node from joining — that would turn a slow
+    download into a lost node."""
+    monkeypatch.setenv("DATA_URI", "s3://bucket/data/x")
+    monkeypatch.setenv("DATA_LOCAL_DIR", str(tmp_path / "d"))
+
+    import spot_train.data as data_mod
+
+    def boom(d, u):
+        raise RuntimeError("s3 down")
+
+    monkeypatch.setattr(data_mod, "ensure_dataset", boom)
+    sidecar.prewarm_dataset(3)  # must not raise
+
+
+def test_prewarm_is_a_noop_without_dataset_env(monkeypatch):
+    # Local/CPU paths have no DATA_URI; prewarm must simply do nothing.
+    monkeypatch.delenv("DATA_URI", raising=False)
+    monkeypatch.delenv("DATA_LOCAL_DIR", raising=False)
+    sidecar.prewarm_dataset(0)

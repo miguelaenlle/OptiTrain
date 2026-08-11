@@ -103,6 +103,44 @@ def _s3_latest(uri: str) -> str | None:
     return f"s3://{bucket}/{best}" if best else None
 
 
+def _is_checkpoint(base: str) -> bool:
+    """A prunable checkpoint object. An in-flight atomic save carries _TMP_SUFFIX
+    and must NEVER be a prune candidate -- deleting one races the copy in
+    _s3_save and would corrupt the write we are in the middle of."""
+    return base.startswith(CHECKPOINT_PREFIX) and not base.endswith(_TMP_SUFFIX)
+
+
+def _s3_prune(uri: str, keep: int) -> int:
+    bucket, prefix = _split(uri)
+    c = _client()
+    keys: list[str] = []
+    paginator = c.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if _is_checkpoint(obj["Key"].rsplit("/", 1)[-1]):
+                keys.append(obj["Key"])
+    # _ckpt_name zero-pads the step to 12 digits, so lexicographic order IS
+    # numeric order -- the same assumption latest() already relies on.
+    doomed = sorted(keys)[:-keep]
+    for i in range(0, len(doomed), 1000):  # delete_objects caps at 1000 keys
+        c.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": k} for k in doomed[i : i + 1000]], "Quiet": True},
+        )
+    return len(doomed)
+
+
+def _local_prune(dest_dir: str, keep: int) -> int:
+    if not os.path.isdir(dest_dir):
+        return 0
+    cks = sorted(f for f in os.listdir(dest_dir) if _is_checkpoint(f))
+    doomed = cks[:-keep]
+    for f in doomed:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(dest_dir, f))
+    return len(doomed)
+
+
 # --------------------------------------------------------------------------- #
 # Public interface
 # --------------------------------------------------------------------------- #
@@ -116,6 +154,24 @@ def latest(uri: str) -> str | None:
     return _s3_latest(uri) if is_s3(uri) else _local_latest(uri)
 
 
+def prune_checkpoints(uri: str, keep: int) -> int:
+    """Delete all but the ``keep`` newest checkpoints under ``uri``. Returns the
+    number removed. Mirrors save_local's prune on the DURABLE tier.
+
+    The node-local tier has always pruned to 2; S3 pruned nothing, so a long run
+    accumulated every checkpoint it ever wrote -- ~690 objects x 1.5 GB over 24h
+    at a 120s interval. Worse than the storage bill: aws.max_checkpoint_step and
+    _s3_latest both run a full paginated LIST over this prefix (every supervisor
+    tick, and every trainer resume respectively), so an unpruned prefix makes the
+    whole run monotonically slower.
+
+    keep <= 0 disables pruning entirely, for anyone who wants the old behaviour.
+    """
+    if keep <= 0:
+        return 0
+    return _s3_prune(uri, keep) if is_s3(uri) else _local_prune(uri, keep)
+
+
 def ref_for(uri: str, name: str) -> str:
     """The ref of object ``name`` under prefix/dir ``uri`` (existence not checked)."""
     if is_s3(uri):
@@ -123,10 +179,43 @@ def ref_for(uri: str, name: str) -> str:
     return os.path.join(uri, name)
 
 
-def download(ref: str, verify: bool = True) -> str:
+def _transfer_config():
+    """Transfer tuning for the ONE object that dominates boot: the dataset bin.
+
+    boto3's defaults (10 threads, 8 MB chunks) were written for small objects and
+    leave most of the pipe idle on a big one. Measured on g5.xlarge pulling a
+    17 GB train.bin from same-region S3 onto the instance-store NVMe:
+    **148 MB/s = 1.18 Gbps on a link rated "Up to 10 Gigabit"** — about 12% of
+    what the instance can do, and 116s of every cold boot AND every preemption
+    replacement.
+
+    More threads and bigger chunks let the managed transfer actually saturate the
+    link. Kept overridable because the right value is instance-shaped: the ceiling
+    is min(network, destination disk), and a box with a slow root volume gains
+    nothing from more concurrency.
+    """
+    from boto3.s3.transfer import TransferConfig
+
+    return TransferConfig(
+        max_concurrency=int(os.environ.get("S3_MAX_CONCURRENCY", "32")),
+        multipart_chunksize=int(os.environ.get("S3_CHUNK_MB", "16")) * 1024 * 1024,
+        multipart_threshold=8 * 1024 * 1024,
+        use_threads=True,
+    )
+
+
+def download(ref: str, verify: bool = True, dest_dir: str = "") -> str:
     """Return a local path for ``ref``. For S3, download to a temp file (and let
     S3/boto3 validate the SHA-256 when ``verify``). For local, ``ref`` already is
     a path, so return it unchanged.
+
+    boto3's ``download_file`` is the *managed* transfer: parallel ranged GETs
+    written straight to disk, so a 17 GB dataset bin never sits in RAM.
+
+    ``dest_dir`` places the temp file on the same filesystem as wherever the
+    caller will move it. Default (``$TMPDIR``) is fine for checkpoints, but for a
+    17 GB bin a cross-filesystem move turns into a full second copy — minutes of
+    boot time and 2x the free space.
 
     The caller OWNS the returned temp file and must remove (or move) it — a
     30-second checkpoint loop that forgets will fill the disk. Prefer
@@ -134,10 +223,10 @@ def download(ref: str, verify: bool = True) -> str:
     if not is_s3(ref):
         return ref
     bucket, key = _split(ref)
-    fd, local = tempfile.mkstemp(suffix="-" + key.rsplit("/", 1)[-1])
+    fd, local = tempfile.mkstemp(suffix="-" + key.rsplit("/", 1)[-1], dir=dest_dir or None)
     os.close(fd)
     extra = {"ChecksumMode": "ENABLED"} if verify else {}
-    _client().download_file(bucket, key, local, ExtraArgs=extra)
+    _client().download_file(bucket, key, local, ExtraArgs=extra, Config=_transfer_config())
     return local
 
 

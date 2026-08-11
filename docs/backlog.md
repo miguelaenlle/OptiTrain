@@ -1,0 +1,148 @@
+# Backlog
+
+Things worth doing, not scheduled. Each entry states why it matters and what it
+would cost, so it can be picked up cold.
+
+---
+
+## Fault injection beyond instance loss (~$2.30, two runs)
+
+**Every failure we have injected is `TerminateInstances`.** That is faithful to an
+unannounced spot reclaim, and the recovery path is genuinely blind to our
+foreknowledge — a scheduled kill only terminates the box; membership changes come
+solely from `_healthy()` observing the loss. But it exercises exactly one of the
+three failure classes the system already claims to handle:
+
+| failure | detected by | injected? |
+|---|---|---|
+| box dies | `aws_state` dead, or stale log | ✅ repeatedly |
+| **process crashes, box alive** | sidecar sees nonzero exit → relaunch, capped by `MAX_EPOCH_CRASHES` | ❌ never deliberately |
+| **box alive, process wedged** | log stale past 90s heartbeat → treated as lost | ❌ never deliberately |
+
+These are not the same failure. **An instance death frees the GPU and the vCPU
+quota; a hung process holds both.** A wedged node is the nastier case: EC2 still
+reports it healthy, it keeps its slot, and only the heartbeat timeout unmasks it.
+
+We have hit this class accidentally and paid for it — the 8-node NCCL-init crash
+loop consumed 22 instances before a human noticed, which is why the crash-loop
+cap exists. It has never been tested on purpose.
+
+**Two experiments, same harness as the failure-cost A/B — only the kill *action*
+changes, from `TerminateInstances` to an SSM command on the box:**
+
+1. **`kill -9` the trainer, leave the box up.** Does the sidecar relaunch it and
+   rejoin the world cleanly? Does the crash-loop cap stay untriggered for a
+   single crash?
+2. **`SIGSTOP` the trainer.** Does the stale-heartbeat path evict it after 90s
+   and replace it, rather than waiting forever on a node EC2 calls healthy?
+
+**Why it is worth doing:** "we survive node loss, process crash, and hang" is a
+materially stronger claim than node loss alone, and the machinery for all three
+already exists — this only proves it. Cheap: ~$1.15 per run at 4 nodes, reusing
+`docs/failure-cost-runbook.md` unchanged apart from the injection step.
+
+---
+
+## Instrument `snapshot()` (~$0.75)
+
+E1/E1b cut checkpoint stall per step 1.47s → 0.68s (−54%) but missed the ≥90-step
+gate at 81, and **two predictions in a row were wrong** (≥90, then ~100). 54.9s of
+stall over 81 steps is still unexplained, so the model of where the time goes is
+wrong.
+
+Leading suspect is self-inflicted: `_batched_d2h` allocates a fresh **1.5 GB
+pinned buffer every checkpoint**, and page-locking host memory is far costlier
+than ordinary allocation. Reusing one persistent buffer would fix it, but the
+blob is handed to background writers still reading it, so reuse must coordinate
+with `flush()`.
+
+**Do not guess a third time.** Time the pinned allocation, the copies, the sync,
+and the handoff separately, log them, and let one run answer it with evidence.
+
+---
+
+## Streaming data loader (large)
+
+Deferred deliberately — see `docs/perf-fixes-plan.md`. −17% on a 300s run but
+**0.09% on a 36h run**, for 600–800 lines on the correctness-critical path plus a
+sampling-distribution change that needs a side-by-side loss check. Becomes worth
+it when the corpus stops fitting on local disk, not before.
+
+Note the interaction: fixing the idle-survivor bug removes most of streaming's
+remaining value, since survivors then train through a replacement's boot and the
+116s download no longer blocks progress.
+
+---
+
+## ~~Checkpoint-on-membership-change~~ — NOT NEEDED (E2b)
+
+Closed. E2b widened the degraded window from 24s to 173s, which the normal 30s
+checkpoint interval crosses several times, so reduced-world work banks on its
+own: the regrow resumed from step 68 rather than the pre-kill step 39. Re-open
+only if a future degraded window is shorter than the checkpoint interval.
+
+---
+
+## Checkpointing is saturated — the 30s interval never binds
+
+Not a bug; recorded because two documented claims are wrong about it.
+
+Rank 0 re-fires save+verify+smoke on the **first step after the previous one
+completes**. Evidence from E4's node0-r1 log — every `[verify] ... passed` is
+followed by the next checkpoint stall within two log lines, three times in a row:
+
+```
+line 356  [verify] checkpoint at step 104 passed
+line 358  step 120: 17282ms/step        <- next checkpoint, immediately
+line 516  [verify] checkpoint at step 128 passed
+line 518  step 158: 14021ms/step
+line 546  [verify] checkpoint at step 157 passed
+line 548  step 186: 12390ms/step
+```
+
+`last_ckpt` only advances on a **successful** submit, so while a save is in
+flight the interval condition stays true and it retries every step. Effective
+cadence is `max(30s, save+verify+smoke)` = **~104s measured** (median gap between
+stalls). 8 checkpoints completed in 1300s, not the ~43 a strict 30s period implies.
+
+Consequences:
+
+1. **`CHECKPOINT_INTERVAL_SECONDS` is inoperative below ~104s.** Lowering it to
+   10s changes nothing; raising it to 60s changes nothing. Only a value *above*
+   the save duration creates an idle gap.
+2. **CLAUDE.md's invariant is wrong.** It says "lost-work-per-interruption should
+   never exceed the checkpoint interval". The real bound is the effective cadence
+   (~104s), ~3.5x the configured 30s. E4's observed rollbacks were 8 and 6 steps
+   (~24s, ~18s), but that is phase luck between fixed kill times and the
+   checkpoint cycle — expected rollback under this cadence is ~52s.
+
+Behaviour is acceptable as-is. If it ever needs reducing, the levers are
+`SMOKE_TEST_EVERY > 1` or moving verify off the completion path — not the
+interval.
+
+---
+
+## `status.json` goes stale during recovery (observability)
+
+Found during E5. `updated_at` showed a **24s hole** spanning the epoch-2
+transition, and similar gaps at every round: the supervisor loop blocks on the
+synchronous replacement launch, so the observability document stops being
+rewritten *exactly* during a recovery.
+
+Consequence on a long run: `orch status` and the logview dashboard appear frozen
+at the moment an operator is most likely to be watching — and the world-size /
+`ckpt_step` history for that window is unrecoverable afterwards, because
+`status.json` is overwritten in place rather than appended.
+
+It cost E5 nothing only because the step log now carries its own wall clock
+(`t <unix>`), so the world timeline could be read from node logs instead at ~2s
+resolution. Without that change the per-round numbers would have had to be
+reconstructed.
+
+Two candidate fixes, either sufficient:
+1. Write `status.json` *before* launching replacements, not after.
+2. Move `RunInstances` off the decision loop (a thread or a queue), which also
+   removes the ~17.6s-per-launch serialization measured in E5.
+
+Option 2 is the better one — it fixes the observability gap and shortens
+recovery — but it touches the loop's single-writer property, so it needs care.

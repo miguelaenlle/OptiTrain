@@ -29,7 +29,17 @@ def _node(i, state="running", registered=True, log_age=None):
     return NodeObs(node=i, aws_state=state, registered=registered, log_age_s=log_age)
 
 
-def _obs(nodes, *, epoch, members, node_count=None, metrics=False, no_progress=None, due=()):
+def _obs(
+    nodes,
+    *,
+    epoch,
+    members,
+    node_count=None,
+    metrics=False,
+    no_progress=None,
+    due=(),
+    epochs_without_progress=0,
+):
     return Observation(
         node_count=node_count if node_count is not None else len(nodes),
         nodes=tuple(nodes),
@@ -38,6 +48,7 @@ def _obs(nodes, *, epoch, members, node_count=None, metrics=False, no_progress=N
         metrics_exists=metrics,
         no_progress_s=no_progress,
         due_kills=frozenset(due),
+        epochs_without_progress=epochs_without_progress,
     )
 
 
@@ -128,7 +139,11 @@ def test_metrics_exists_is_done():
 
 def test_stall_triggers_whole_group_restart():
     obs = _obs([_node(0), _node(1)], epoch=2, members=[0, 1], no_progress=700)
-    assert decide(obs, PREEMPT) == [WholeGroupRestart()]
+    (act,) = decide(obs, PREEMPT)
+    assert isinstance(act, WholeGroupRestart)
+    # The reason must name the condition — this is the most destructive action
+    # the supervisor takes, and a bare "floor" left a real incident undiagnosable.
+    assert "no checkpoint progress" in act.reason and "700" in act.reason
 
 
 def test_all_gone_triggers_whole_group_restart():
@@ -137,7 +152,9 @@ def test_all_gone_triggers_whole_group_restart():
         epoch=2,
         members=[0, 1],
     )
-    assert decide(obs, PREEMPT) == [WholeGroupRestart()]
+    (act,) = decide(obs, PREEMPT)
+    assert isinstance(act, WholeGroupRestart)
+    assert "no healthy members" in act.reason
 
 
 def test_stale_heartbeat_counts_as_lost():
@@ -218,7 +235,7 @@ def test_publish_epoch_keeps_master_sticky_across_grow_back(monkeypatch):
     cfg = OrchestratorConfig(bucket="b")
     cfg.node_count = 4
     puts: dict[str, str] = {}
-    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t: puts.__setitem__(k, t))
+    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t, **kw: puts.__setitem__(k, t))
 
     s = sup_mod.Supervisor(
         cfg,
@@ -490,7 +507,7 @@ def test_supervisor_writes_status_each_tick_and_survives_failure(monkeypatch):
 
     # Tick 2: healthy write; an _event makes orchestrator.log upload too.
     puts: dict[str, str] = {}
-    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t: puts.__setitem__(k, t))
+    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t, **kw: puts.__setitem__(k, t))
     s._event("terminated node 1 (i-1)")
     s._write_status(s._observe(now=1.0, wall=101.0), 101.0)
     doc = _json.loads(puts[cfg.run_status_key("r")])
@@ -530,7 +547,7 @@ def test_replacement_attempt_is_not_born_dead(monkeypatch):
     }
     monkeypatch.setattr(sup_mod.s3_store, "read_bytes", lambda uri: docs.get(uri))
     puts: dict[str, str] = {}
-    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t: puts.__setitem__(k, t))
+    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t, **kw: puts.__setitem__(k, t))
 
     logs = {
         0: {"key": "k0", "attempt": 0, "state": {"printed": 0}},
@@ -649,3 +666,227 @@ def test_scheduled_kill_fires_exactly_once_even_after_replacement(monkeypatch):
     s.node_ids[1] = "i-1-replacement"
     for t in (210.0, 220.0, 300.0):
         assert s._observe(now=t, wall=0.0).due_kills == frozenset()
+
+
+# --------------------------------------------------------------------------- #
+# Stall detection must not fire DURING a legitimate recovery
+# --------------------------------------------------------------------------- #
+def test_recovery_in_progress_is_not_a_stall():
+    """The bug this pins cost a live 8-node run.
+
+    A replacement has to boot AND pull the dataset (~4-5 min for a 17 GB
+    train.bin) before it can take one step, so a freshly published epoch shows
+    no checkpoint progress for minutes. That is recovery working, not a wedged
+    group — and the shell restarts the clock on every publication so the new
+    world is judged on its OWN elapsed time. Below the timeout, keep waiting.
+    """
+    obs = _obs(
+        [_node(0), _node(1)],
+        epoch=2,
+        members=[0, 1],
+        no_progress=120.0,  # well past the OLD 150s-era margin, still recovering
+        epochs_without_progress=1,
+    )
+    assert decide(obs, PREEMPT) == []
+
+
+def test_genuine_stall_still_breaks_the_deadlock():
+    # Past the timeout with the world nominally healthy: nothing is coming back.
+    obs = _obs([_node(0), _node(1)], epoch=2, members=[0, 1], no_progress=601.0)
+    (act,) = decide(obs, PREEMPT)
+    assert isinstance(act, WholeGroupRestart)
+    assert "no checkpoint progress" in act.reason
+
+
+def test_flapping_world_restarts_even_though_each_epoch_resets_the_clock():
+    """Resetting the stall clock per epoch would make the deadlock-breaker
+    unreachable for a world that re-forms endlessly without ever training —
+    each publication would hand it a fresh budget forever. The
+    epochs-without-progress counter is what closes that hole."""
+    obs = _obs(
+        [_node(0), _node(1)],
+        epoch=7,
+        members=[0, 1],
+        no_progress=5.0,  # clock just reset by the newest epoch
+        epochs_without_progress=6,  # ...but six worlds in a row never trained
+    )
+    (act,) = decide(obs, PREEMPT)
+    assert isinstance(act, WholeGroupRestart)
+    assert "epochs published with no checkpoint" in act.reason
+
+
+def test_progress_clears_the_flap_counter_path():
+    # Same epoch count but progress happened (counter cleared by the shell).
+    obs = _obs(
+        [_node(0), _node(1)],
+        epoch=7,
+        members=[0, 1],
+        no_progress=5.0,
+        epochs_without_progress=0,
+    )
+    assert decide(obs, PREEMPT) == []
+
+
+def test_two_normal_preemptions_do_not_exhaust_the_restart_budget():
+    """One preemption publishes TWO epochs — shrink onto survivors, then grow
+    when the replacement joins. With the budget at 3, ~1.5 textbook recoveries
+    spent it, so the mechanism working correctly could trigger the most
+    destructive action available (discard every healthy survivor and relaunch).
+    The budget is counted in preemptions now, not epochs."""
+    p = Policy(replace_on_loss=True, recovery_timeout_s=600)
+    # Two preemptions = 4 epoch publications with no checkpoint in between.
+    obs = _obs(
+        [_node(0), _node(1)],
+        epoch=5,
+        members=[0, 1],
+        no_progress=30.0,
+        epochs_without_progress=4,
+    )
+    assert decide(obs, p) == [], "two normal recoveries must not trip the floor"
+    # A third full preemption (6 epochs) is genuine evidence the world is stuck.
+    stuck = _obs(
+        [_node(0), _node(1)],
+        epoch=7,
+        members=[0, 1],
+        no_progress=30.0,
+        epochs_without_progress=6,
+    )
+    (act,) = decide(stuck, p)
+    assert isinstance(act, WholeGroupRestart)
+    assert "epochs published with no checkpoint" in act.reason
+
+
+def test_terminated_node_stops_looking_healthy_immediately():
+    """The exact race that wasted 642 node-seconds per failure.
+
+    A node terminated ~26s earlier still passed every check in `_healthy`: its
+    cached IP kept `registered` true (st.ips is keyed by node INDEX, so the slot
+    kept its dead occupant's address), EC2 briefly still reported `running`, and
+    its log age was under the 90s heartbeat timeout. So the reducer regrew the
+    world onto a corpse at t+448s and then idled until the replacement could
+    actually train at t+662s.
+    """
+    # A corpse that still looks alive on every axis EXCEPT registration.
+    corpse = _node(1, state="running", registered=False, log_age=26.0)
+    obs = _obs([_node(0), corpse], epoch=1, members=[0, 1], node_count=2)
+    acts = decide(obs, PREEMPT)
+    # Shrinks onto the survivor and asks for a replacement — it must NOT keep
+    # node 1 in the membership just because AWS and the log still look fine.
+    assert PublishEpoch(2, (0,)) in acts
+    assert LaunchReplacement(1) in acts
+
+
+def test_regrow_waits_for_the_replacement_to_announce_itself():
+    # World shrunk to {0}; node 1's replacement is booting but has not
+    # registered (it is still pulling the corpus). No regrow yet.
+    booting = _node(1, state="running", registered=False)
+    assert decide(_obs([_node(0), booting], epoch=2, members=[0], node_count=2), PREEMPT) == []
+    # Once it registers — which now happens only AFTER its dataset is local —
+    # the world grows back.
+    ready = _node(1, state="running", registered=True)
+    assert decide(_obs([_node(0), ready], epoch=2, members=[0], node_count=2), PREEMPT) == [
+        PublishEpoch(3, (0, 1))
+    ]
+
+
+def test_dead_nodes_registration_does_not_outlive_it(monkeypatch):
+    """The bug that cost 155s of survivor idle time per failure.
+
+    nodes/node<i>.json is keyed by node INDEX and persists in S3, so a killed
+    node's registration is still sitting there after it dies. _node_ip falls
+    through to S3 on a cache miss, so the slot read as registered again within
+    one tick — and _healthy passed it (EC2 still said running, log seconds old).
+    The reducer then published a 4-member epoch while the replacement had not
+    begun booting, and every survivor blocked in init_process_group waiting for
+    a rank that did not exist.
+
+    A registration only counts when the box that wrote it is the box now in the
+    slot. The doc carries instance_id; the supervisor knows node_ids[node].
+    """
+    from orchestrator import supervisor as sup_mod
+    from orchestrator.profile import RunProfile
+
+    cfg = OrchestratorConfig(bucket="b")
+    # node 1's doc was written by i-OLD, which we have since replaced with i-NEW.
+    node_docs = {
+        cfg.run_node_uri("r", 0): b'{"ip": "10.0.0.0", "instance_id": "i-0"}',
+        cfg.run_node_uri("r", 1): b'{"ip": "10.0.0.1", "instance_id": "i-OLD"}',
+    }
+    monkeypatch.setattr(sup_mod.s3_store, "read_bytes", lambda uri: node_docs.get(uri))
+    s = sup_mod.Supervisor(
+        cfg,
+        RunProfile("r", kind="multinode-preempt", market="spot"),
+        run_id="r",
+        policy=PREEMPT,
+        node_ids={0: "i-0", 1: "i-NEW"},  # slot 1 now belongs to the replacement
+        logs={0: {"key": "k0", "state": {"printed": 0}}, 1: {"key": "k1", "state": {"printed": 0}}},
+        launch_node=lambda n: "i-NEW",
+        pull_logs=lambda: None,
+    )
+    assert s._node_ip(0) == "10.0.0.0", "the live node stays registered"
+    assert s._node_ip(1) is None, "the DEAD occupant's registration must not count"
+
+    # ...and once the replacement writes its OWN doc, the slot registers again.
+    node_docs[cfg.run_node_uri("r", 1)] = b'{"ip": "10.0.0.9", "instance_id": "i-NEW"}'
+    assert s._node_ip(1) == "10.0.0.9"
+
+
+def test_registration_trusted_when_instance_id_is_unavailable(monkeypatch):
+    """IMDS is absent in the localhost E2E, where register() writes "unknown".
+    Refusing those would make the harness never form a world at all."""
+    from orchestrator import supervisor as sup_mod
+    from orchestrator.profile import RunProfile
+
+    cfg = OrchestratorConfig(bucket="b")
+    monkeypatch.setattr(
+        sup_mod.s3_store,
+        "read_bytes",
+        lambda uri: b'{"ip": "127.0.0.1", "instance_id": "unknown"}',
+    )
+    s = sup_mod.Supervisor(
+        cfg,
+        RunProfile("r", kind="multinode", market="spot"),
+        run_id="r",
+        policy=PREEMPT,
+        node_ids={0: "i-0"},
+        logs={0: {"key": "k0", "state": {"printed": 0}}},
+        launch_node=lambda n: "i-x",
+        pull_logs=lambda: None,
+    )
+    assert s._node_ip(0) == "127.0.0.1"
+
+
+def test_replacement_launches_without_waiting_for_the_corpse(monkeypatch):
+    """A replacement must not queue behind the dead instance's quota release.
+
+    _launch_replacement used to call wait_quota_released first: terminate, then
+    poll every 5s until AWS moved the box out of shutting-down (tens of seconds),
+    THEN launch — unconditionally, even with a mostly-idle quota. Measured on a
+    4-node run: 20 of a 64 vCPU quota in use, so it never had to wait at all.
+
+    wait_vcpu_headroom already covers the case it guarded — it returns at once
+    when used+needed fits and blocks only when it does not, which is precisely
+    when the corpse releasing is what creates room.
+    """
+    from orchestrator import supervisor as sup_mod
+    from orchestrator.profile import RunProfile
+
+    calls = []
+    monkeypatch.setattr(sup_mod.aws, "wait_quota_released", lambda i: calls.append(("quota", i)))
+    monkeypatch.setattr(sup_mod.aws, "wait_vcpu_headroom", lambda n, q: calls.append(("head", n)))
+    monkeypatch.setattr(sup_mod.s3_store, "read_bytes", lambda uri: None)
+
+    s = sup_mod.Supervisor(
+        OrchestratorConfig(bucket="b"),
+        RunProfile("r", kind="multinode-preempt", market="spot"),
+        run_id="r",
+        policy=PREEMPT,
+        node_ids={0: "i-0", 1: "i-dead"},
+        logs={0: {"key": "k0", "state": {"printed": 0}}, 1: {"key": "k1", "state": {"printed": 0}}},
+        launch_node=lambda n: "i-new",
+        pull_logs=lambda: None,
+    )
+    s._launch_replacement(1)
+    assert ("quota", "i-dead") not in calls, "must not serialize on the dead instance"
+    assert any(c[0] == "head" for c in calls), "headroom check must still gate the launch"
+    assert s.node_ids[1] == "i-new"

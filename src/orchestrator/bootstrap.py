@@ -57,7 +57,9 @@ def _trainer_env(
         ).decode(),
         "DATA_URI": cfg.data_uri(),
         "DATASET": cfg.dataset,
-        "DATA_LOCAL_DIR": f"/home/ubuntu/app/third_party/nanoGPT/data/{cfg.dataset}",
+        # NOTE: DATA_LOCAL_DIR is deliberately NOT here — it is resolved at boot
+        # by _data_dir_block (instance-store NVMe when the box has one, root
+        # volume otherwise) and appended to this same env file.
         "MAX_SECONDS": str(max_seconds),
         "CHECKPOINT_INTERVAL_SECONDS": str(cfg.checkpoint_interval_seconds),
         "SMOKE_TEST_EVERY": str(cfg.smoke_test_every),
@@ -67,6 +69,11 @@ def _trainer_env(
         "MARKET": market,
         "DEVICE": "auto",  # trainer auto-detects cuda vs cpu on the box
         "DDP_DATA_MODE": cfg.ddp_data_mode,  # only used when launched via torchrun
+        # Saturate the pipe when pulling the 17 GB dataset bin: boto3's
+        # defaults hit only 148 MB/s of a "Up to 10 Gigabit" link, and that
+        # download is ~half of every cold boot AND every preemption recovery.
+        "S3_MAX_CONCURRENCY": os.environ.get("S3_MAX_CONCURRENCY", "32"),
+        "S3_CHUNK_MB": os.environ.get("S3_CHUNK_MB", "16"),
         "PYTHONUNBUFFERED": "1",  # unbuffered so `tail -f` shows per-step lines live
     }
     # Recipe/cadence knobs (MAX_STEPS, LR schedule, EVAL/SAMPLE intervals, …)
@@ -79,7 +86,102 @@ def _export_block(env: dict[str, str]) -> str:
     return "\n".join(f'export {k}="{v}"' for k, v in env.items())
 
 
-def _provision_steps(cfg: OrchestratorConfig, exports: str) -> str:
+# Where a box puts the dataset. Resolved AT BOOT, in shell, because it depends on
+# the instance type: the DLAMI root volume is only 30 GB (mostly CUDA + PyTorch
+# already), while OpenWebText's train.bin alone is ~17 GB — downloading that into
+# the repo checkout fills the disk and kills the boot, on every node at once.
+# g5/g4dn ship a large EPHEMERAL NVMe instance store (250 GB on g5.xlarge) that
+# is included in the price, unused today, and ~4x faster to write than the
+# default 125 MB/s gp3 root — which also shortens every preemption recovery.
+# t3 (and the fleet's c7i) have no instance store at all, so this must be probed,
+# never baked in.
+#
+# Ephemeral is CORRECT here: the dataset is re-pulled from S3 on every boot
+# anyway. Nothing that must outlive the instance moves — checkpoints still go to
+# S3 (durable) plus LOCAL_CHECKPOINT_DIR=/tmp on the root volume (node-local by
+# design, only ever used by a survivor restarting in place).
+_DATA_PARENT_FALLBACK = "/home/ubuntu/app/third_party/nanoGPT/data"
+_DATA_SUBDIR = "spot-train-data"
+# A candidate must have at least this much free (KB) to be believed. It doubles
+# as the "is this really the instance store?" test: the DLAMI root volume is
+# 30 GB TOTAL, so anything with 50 GB free cannot be it — which is what saves us
+# if the mount point directory exists but the instance store isn't mounted on it.
+# Overridable per boot (SPOT_TRAIN_MIN_FREE_KB) for odd instance types.
+_DATA_MIN_FREE_KB = 50_000_000
+
+
+def _data_dir_block(cfg: OrchestratorConfig, *, local_ckpt: bool = False) -> str:
+    """Shell that picks the dataset directory and appends the resolved
+    ``DATA_LOCAL_DIR`` export to the env file. The ONE place the path is decided,
+    so the download (trainer) and the read (trainer/fleet worker) can never
+    disagree. Runs under ``set -e``, hence the `if`/`|| true` discipline."""
+    # Only multi-node runs use the node-local tier (a single box has no peers to
+    # re-form with, so writing 1.5 GB locally every interval would be pure cost).
+    local_ckpt_block = (
+        f"""if [ "$DATA_PARENT" = "{_DATA_PARENT_FALLBACK}" ]; then
+  LOCAL_CHECKPOINT_DIR="/tmp/spot-ckpt"
+else
+  LOCAL_CHECKPOINT_DIR="$DATA_PARENT/spot-ckpt"
+fi
+mkdir -p "$LOCAL_CHECKPOINT_DIR"
+echo "export LOCAL_CHECKPOINT_DIR=\\"$LOCAL_CHECKPOINT_DIR\\"" >> /home/ubuntu/spot-train.env
+echo "[data] LOCAL_CHECKPOINT_DIR=$LOCAL_CHECKPOINT_DIR"
+"""
+        if local_ckpt
+        else ""
+    )
+    return f"""
+# --- dataset location: prefer the ephemeral NVMe instance store ------------- #
+# Candidates: the DLAMI's conventional mount first, then ANY non-root filesystem
+# mounted off a local disk (so this keeps working if AWS moves the mount point).
+DATA_PARENT="{_DATA_PARENT_FALLBACK}"
+MIN_FREE_KB="${{SPOT_TRAIN_MIN_FREE_KB:-{_DATA_MIN_FREE_KB}}}"
+for attempt in 1 2 3; do
+  CANDS="/opt/dlami/nvme $(lsblk -ln -o NAME,MOUNTPOINT 2>/dev/null \\
+    | awk '$1 ~ /^(nvme|xvd|sd)/ && $2 != "" && $2 != "/" && $2 !~ /^\\/boot/ {{print $2}}' \\
+    | tr '\\n' ' ' || true)"
+  for cand in $CANDS; do
+    # MUST already exist: the mount unit creates it. Never `mkdir -p` the mount
+    # point itself — that would silently manufacture a directory ON THE ROOT
+    # VOLUME and then happily fill it with 17 GB of OpenWebText.
+    [ -d "$cand" ] || continue
+    FREE_KB=$(df -Pk "$cand" 2>/dev/null | awk 'NR==2 {{print $4}}' || echo 0)
+    [ "${{FREE_KB:-0}}" -ge "$MIN_FREE_KB" ] || continue
+    # The mount is usually root-owned; we run as ubuntu, so take it with sudo
+    # and hand it over. No sudo => try the next candidate.
+    if {{ mkdir -p "$cand/{_DATA_SUBDIR}" 2>/dev/null \\
+         || {{ sudo -n mkdir -p "$cand/{_DATA_SUBDIR}" 2>/dev/null \\
+              && sudo -n chown "$(id -un)" "$cand/{_DATA_SUBDIR}" 2>/dev/null; }}; }} \\
+       && [ -w "$cand/{_DATA_SUBDIR}" ]; then
+      DATA_PARENT="$cand/{_DATA_SUBDIR}"
+      break
+    fi
+  done
+  # The DLAMI mounts the instance store from a boot unit that can land just
+  # after user-data starts, so retry briefly before settling for the root
+  # volume — but never sleep after the last attempt (a box with no instance
+  # store must not pay for this on every preemption recovery).
+  [ "$DATA_PARENT" = "{_DATA_PARENT_FALLBACK}" ] || break
+  [ "$attempt" = 3 ] || sleep "${{SPOT_TRAIN_MOUNT_WAIT:-3}}"
+done
+DATA_LOCAL_DIR="$DATA_PARENT/{cfg.dataset}"
+mkdir -p "$DATA_LOCAL_DIR"
+echo "export DATA_LOCAL_DIR=\\"$DATA_LOCAL_DIR\\"" >> /home/ubuntu/spot-train.env
+# The node-local checkpoint tier rides the SAME disk decision. It was pinned to
+# /tmp on the 30 GB gp3 root (~125 MB/s), where a 1.5 GB GPT-2 checkpoint takes
+# ~12s to write; on the instance-store NVMe it is ~1s. Ephemeral is correct for
+# this tier by construction — it only ever serves a survivor restarting IN
+# PLACE, so a box that dies takes its usefulness with it either way, and S3
+# remains the durable tier. Falls back to /tmp when there is no instance store
+# (t3 control plane, c7i fleet), which is exactly the old behaviour.
+{local_ckpt_block}# Log the resolved paths AND free space: a future disk-full failure should be
+# diagnosable straight from this log instead of needing a repro.
+echo "[data] DATA_LOCAL_DIR=$DATA_LOCAL_DIR"
+df -h "$DATA_LOCAL_DIR" || true
+"""
+
+
+def _provision_steps(cfg: OrchestratorConfig, exports: str, *, local_ckpt: bool = False) -> str:
     """Setup run as the ubuntu login shell (torch env active): clone the repo,
     populate the nanoGPT submodule, install deps, write a source-able env file,
     and preflight. Shared by both builders."""
@@ -122,7 +224,7 @@ git submodule update --init --depth 1
 cat > /home/ubuntu/spot-train.env <<'ENV'
 {exports}
 ENV
-
+{_data_dir_block(cfg, local_ckpt=local_ckpt)}
 # Preflight: fail loudly IN THIS LOG if the torch/boto3 env is wrong.
 "$VENV_PY" - <<'PY'
 import torch, boto3, numpy  # noqa: F401
@@ -155,7 +257,9 @@ def _fleet_env(
                 "CHECKPOINT_URI": cfg.run_checkpoint_uri(run_id),
                 "DATA_URI": cfg.data_uri(),
                 "DATASET": cfg.dataset,
-                "DATA_LOCAL_DIR": f"/home/ubuntu/app/third_party/nanoGPT/data/{cfg.dataset}",
+                # DATA_LOCAL_DIR comes from _data_dir_block (same resolution as
+                # the training boxes) — a worker only needs meta.pkl, but the two
+                # call sites must never disagree about where the data lives.
                 "RUN_ID": run_id,
                 "DEVICE": "auto",
             }
@@ -246,6 +350,401 @@ PY
 exit "$RC"
 BOOT
 echo "fleet {role} exited rc=$? — box left up; run 'fleet down' to terminate it"
+"""
+
+
+def _orch_env_file(env: dict[str, str]) -> str:
+    """systemd ``EnvironmentFile`` lines (``K="v"``). systemd strips the quotes
+    and does NO shell expansion, so a value with spaces (SAMPLE_PROMPTS) is safe;
+    a value containing a double quote would not be, hence the strip."""
+    return "\n".join(f'{k}="{v.replace(chr(34), "")}"' for k, v in sorted(env.items()))
+
+
+def build_orchestrator_user_data(
+    cfg: OrchestratorConfig,
+    *,
+    orch_id: str,
+    experiment: str,
+    env: dict[str, str],
+) -> str:
+    """Boot the DURABLE CONTROL PLANE (``spot-orchestrate orch up``): a small
+    on-demand box that runs the epoch supervisor for the whole run so the laptop
+    can go to sleep.
+
+    Deliberately different from the training boxes in four ways:
+
+      1. **Amazon Linux 2023, not the DLAMI, and no torch.** The control plane
+         never trains — it makes AWS calls and reads/writes S3. We install boto3
+         into a venv and run the package from source (``PYTHONPATH``), the same
+         discipline the training boxes use; ``pip install -e . --no-deps`` is
+         attempted too, purely so ``spot-orchestrate`` exists for SSM debugging.
+         Installing the real dependency set would drag ~2GB of CUDA torch onto an
+         8GB root volume for nothing.
+      2. **systemd, not a foreground boot script.** ``spot-orch.service`` owns
+         the run, so it survives user-data exiting, restarts on failure, and is
+         inspectable with ``systemctl status`` / ``journalctl`` over SSM.
+      3. **No dead-man's switch by default.** ``MAX_INSTANCE_LIFETIME_SECONDS``
+         reaps orphaned *training* boxes when the orchestrator dies; applying it
+         to the orchestrator would kill the reaper mid-run. ``orch_max_lifetime_
+         seconds`` is a separate, opt-in ceiling.
+      4. **Progress markers.** Each provisioning phase writes
+         ``orchestrators/<id>/progress.json`` so ``orch up`` on the laptop can
+         show real progress (clone → install → start) rather than a blind wait.
+
+    No credentials are passed in: the box uses its instance-profile role, which
+    (unlike a copied session token) never expires — the requirement that makes an
+    unattended 36-hour run possible at all.
+    """
+    bucket = cfg.bucket
+    progress_key = cfg.orch_progress_key(orch_id)
+    log_key = cfg.orch_log_key(orch_id)
+    boot_log_key = cfg.orch_boot_log_key(orch_id)
+    interval = cfg.orch_log_upload_seconds
+    cap = cfg.orch_log_max_bytes
+    # Last gate before the value is baked into user-data (which anything on the
+    # box can read from IMDS): drop credential-shaped names here too, not only in
+    # cfg.orch_relay_env. The box authenticates with its instance-profile role.
+    secretish = set(cfg.orch_secretish(env))
+    env_file = _orch_env_file({k: v for k, v in env.items() if k not in secretish})
+    # Opt-in ceiling only (see the docstring): normally absent entirely.
+    autokill = ""
+    if cfg.orch_max_lifetime_seconds > 0:
+        n = cfg.orch_max_lifetime_seconds
+        autokill = (
+            f'echo "[autokill] control plane self-terminates in {n}s (ORCH_MAX_LIFETIME_SECONDS)"\n'
+            f"systemd-run --on-active={n}s --unit=orch-autokill /usr/bin/systemctl poweroff || true"
+        )
+    return f"""#!/bin/bash
+set -x
+exec > /var/log/spot-orch-boot.log 2>&1
+chmod 644 /var/log/spot-orch-boot.log
+{autokill}
+# --- interpreter + boto3 ---------------------------------------------------- #
+# AL2023 ships python3.9; the package targets 3.10+, so prefer 3.11 when the
+# image has it. Installed as SEPARATE commands so a missing python3.11 package
+# can't take git down with it. venv keeps us off the system site-packages
+# (PEP 668); if venv creation fails on some other image we fall back to the
+# interpreter itself + --user.
+(dnf install -y git || yum install -y git) 2>/dev/null || true
+dnf install -y python3.11 python3.11-pip 2>/dev/null \\
+  || dnf install -y python3-pip 2>/dev/null \\
+  || yum install -y python3-pip 2>/dev/null || true
+BASE_PY="$(command -v python3.11 || command -v python3)"
+if "$BASE_PY" -m venv /home/ec2-user/venv 2>/dev/null; then
+  ORCH_PY=/home/ec2-user/venv/bin/python
+else
+  ORCH_PY="$BASE_PY"
+fi
+"$ORCH_PY" -m pip install --upgrade pip 2>/dev/null || true
+"$ORCH_PY" -m pip install boto3 || "$ORCH_PY" -m pip install --user boto3 || true
+
+# Phase markers: one tiny S3 doc the laptop polls so `orch up` shows real
+# progress. Defined only after boto3 exists (nothing to report before that).
+mark() {{
+  "$ORCH_PY" - "$1" "$2" <<'PY' || true
+import json, sys, time, boto3
+boto3.client("s3").put_object(
+    Bucket="{bucket}",
+    Key="{progress_key}",
+    Body=json.dumps({{"phase": sys.argv[1], "detail": sys.argv[2], "at": time.time()}}).encode(),
+)
+PY
+}}
+mark provision "git + python + boto3"
+
+# --- log relay -------------------------------------------------------------- #
+# Same mechanism the training boxes use (boto3 upload_file on a timer), with one
+# addition the training boxes don't need: a SIZE CAP. A 36h run's stdout would
+# otherwise fill an 8GB root volume, so past orch_log_max_bytes the local file is
+# trimmed to its newest half (systemd appends with O_APPEND, so the writer just
+# continues at the new end).
+cat > /home/ec2-user/orch-relay.py <<'PY'
+import os, time
+import boto3
+
+CAP = {cap}
+FILES = [
+    ("/var/log/spot-orch.log", "{log_key}"),
+    ("/var/log/spot-orch-boot.log", "{boot_log_key}"),
+]
+c = boto3.client("s3")
+while True:
+    for path, key in FILES:
+        try:
+            if os.path.getsize(path) > CAP:
+                with open(path, "rb") as f:
+                    f.seek(-CAP // 2, os.SEEK_END)
+                    tail = b"[log trimmed: kept the newest bytes]\\n" + f.read()
+                with open(path, "wb") as f:
+                    f.write(tail)
+            c.upload_file(path, "{bucket}", key)
+        except Exception:
+            pass
+    time.sleep({interval})
+PY
+cat > /etc/systemd/system/spot-orch-relay.service <<'UNIT'
+[Unit]
+Description=spot-train orchestrator log relay ({orch_id})
+
+[Service]
+Type=simple
+ExecStart=ORCH_PY_PATH /home/ec2-user/orch-relay.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sed -i "s|ORCH_PY_PATH|$ORCH_PY|" /etc/systemd/system/spot-orch-relay.service
+touch /var/log/spot-orch.log
+systemctl daemon-reload
+systemctl enable --now spot-orch-relay.service
+
+# --- code ------------------------------------------------------------------- #
+# Branch matters: the boxes this orchestrator launches clone the SAME branch, so
+# `orch up` from a feature branch must not silently run main's code.
+git clone --depth 1 -b {cfg.repo_branch} {cfg.repo_url} /home/ec2-user/app
+# No nanoGPT submodule: the control plane never imports the model (the training
+# boxes init it themselves).
+if [ ! -d /home/ec2-user/app/src/orchestrator ]; then
+  # Fail LOUDLY and immediately: without this the box would spin through pip and
+  # systemd and only surface as "no heartbeat" 30 minutes later on the laptop.
+  mark error "clone of {cfg.repo_branch} failed — see boot.log"
+  exit 1
+fi
+mark clone "$(git -C /home/ec2-user/app rev-parse --short HEAD) ({cfg.repo_branch})"
+
+# Editable install WITHOUT dependencies (see the docstring — torch is 2GB of
+# nothing on a control plane); matplotlib is optional and only renders cost.png.
+"$ORCH_PY" -m pip install --no-deps -e /home/ec2-user/app || true
+"$ORCH_PY" -m pip install matplotlib || true
+mark install "boto3 + package (no torch)"
+
+# --- run -------------------------------------------------------------------- #
+cat > /home/ec2-user/orch.env <<'ENV'
+{env_file}
+ENV
+cat > /etc/systemd/system/spot-orch.service <<'UNIT'
+[Unit]
+Description=spot-train remote orchestrator ({orch_id}: {experiment})
+After=network-online.target
+Wants=network-online.target
+# Restart forever-ish, but stop flapping after 10 crashes in 10 minutes: at that
+# point the config is broken, and a box parked for post-mortem beats a hot loop.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/app
+EnvironmentFile=/home/ec2-user/orch.env
+Environment=PYTHONPATH=/home/ec2-user/app/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=ORCH_PY_PATH -m orchestrator orch _agent --orch-id {orch_id} --experiment {experiment}
+# The agent is idempotent across restarts: it reloads orch.json, reaps the
+# orphaned fleet, and RESUMES the same run_id from its S3 checkpoints.
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/var/log/spot-orch.log
+StandardError=append:/var/log/spot-orch.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sed -i "s|ORCH_PY_PATH|$ORCH_PY|" /etc/systemd/system/spot-orch.service
+chown -R ec2-user:ec2-user /home/ec2-user
+systemctl daemon-reload
+systemctl enable --now spot-orch.service
+mark start "spot-orch.service"
+echo "[orch] user-data done — the run is systemd's now; this box outlives your laptop"
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Remote dataset prep (`stage-data --remote`)
+# --------------------------------------------------------------------------- #
+_PREP_APP = "/home/ec2-user/app"
+# The HuggingFace cache (54 GB for OpenWebText) MUST land on the big root volume
+# the prep launch provisions, never in whatever $HOME the shell inherits.
+_PREP_HF_HOME = "/home/ec2-user/hf-cache"
+# Prep knobs relayed verbatim, and only when set — same discipline as
+# trainer_passthrough. Deliberately no credential-shaped names (HF_TOKEN &c):
+# user-data is readable by anything on the box.
+_PREP_PASSTHROUGH = ("OWT_NUM_PROC", "OWT_TARGET_TOKENS")
+
+
+def _prep_env(cfg: OrchestratorConfig) -> dict[str, str]:
+    """Environment the prep box runs the job under. ``stage-data`` on the box is
+    the SAME CLI the laptop runs, so it reads the same three variables."""
+    env = {
+        "SPOT_TRAIN_BUCKET": cfg.bucket,
+        "AWS_REGION": cfg.region,
+        # Both spellings on purpose: the log relay and the staging upload are
+        # separate boto3 processes, and an unset region makes them fall back to
+        # IMDS lookup — a needless dependency when we already know the region.
+        "AWS_DEFAULT_REGION": cfg.region,
+        "DATASET": cfg.dataset,
+        "HF_HOME": _PREP_HF_HOME,
+        "PYTHONUNBUFFERED": "1",  # tqdm/prints reach the streamed log immediately
+    }
+    env.update({k: os.environ[k] for k in _PREP_PASSTHROUGH if os.environ.get(k)})
+    return env
+
+
+def build_prep_user_data(cfg: OrchestratorConfig, *, prep_id: str) -> str:
+    """Boot a THROWAWAY dataset-prep box (``stage-data --remote``): prepare the
+    configured dataset, upload the bins to S3 with the ordinary ``stage-data``
+    code path, and terminate — whatever happens.
+
+    Same Amazon Linux 2023 + venv + boto3 shape as the control plane
+    (``build_orchestrator_user_data``), because this is the same kind of job: no
+    GPU, no torch, just python and S3. It differs in the one way that matters —
+    **it must never outlive its job**, so termination is layered four deep:
+
+      1. ``InstanceInitiatedShutdownBehavior=terminate`` on the launch, so any OS
+         poweroff is a real termination (billing stops, volume is deleted);
+      2. an UNCONDITIONAL systemd lifetime timer armed as the very first action,
+         before anything that can fail — it fires even if this script dies on its
+         next line, or wedges forever inside the HF download;
+      3. a ``trap ... EXIT`` that powers off on EVERY exit path (``set -e``
+         abort, a python traceback, an early ``exit 1``);
+      4. an explicit ``shutdown -h now`` after the status document is written, so
+         the normal path doesn't wait on the timer.
+
+    The job itself runs in a subshell so a failure becomes an exit code we can
+    publish, rather than an early exit that would skip the status marker. No
+    credentials are passed in: S3 access comes from the instance-profile role."""
+    bucket = cfg.bucket
+    log_key = cfg.prep_log_key(prep_id)
+    status_key = cfg.prep_status_key(prep_id)
+    interval = cfg.log_stream_seconds
+    dataset = cfg.dataset
+    env_exports = "\n".join(f'export {k}="{v}"' for k, v in sorted(_prep_env(cfg).items()))
+    n = max(60, cfg.prep_max_lifetime_seconds)
+    mins = max(1, -(-n // 60))  # ceil(n/60) for the `shutdown` fallback (minutes)
+    return f"""#!/bin/bash
+set -x
+exec > /var/log/spot-prep.log 2>&1
+chmod 644 /var/log/spot-prep.log
+
+# --- 1. dead-man's switch, armed BEFORE anything that can fail -------------- #
+# Unconditional on purpose: if the very next line kills this script, the box
+# still terminates on its own. systemd owns the timer, so it survives user-data
+# exiting, a wedged download, and a dead laptop.
+echo "[prep] {prep_id}: self-terminate scheduled in {n}s (dead-man switch)"
+systemd-run --on-active={n}s --unit=spot-prep-autokill /usr/bin/systemctl poweroff \\
+  || shutdown -h +{mins} "spot-prep autokill" || true
+
+# --- 2. terminate on EVERY exit path --------------------------------------- #
+# A failure that leaves this box running is the worst outcome of the whole
+# command, so the poweroff is a trap, not a trailing line someone can skip: it
+# fires on a `set -e` abort, a python traceback, and any early `exit`.
+terminate_self() {{
+  RC=$?
+  echo "[prep] user-data exiting rc=$RC — powering off (shutdown behavior=terminate)"
+  shutdown -h now || systemctl poweroff || poweroff -f
+}}
+trap terminate_self EXIT
+
+# --- job environment -------------------------------------------------------- #
+# Exported at TOP level, not inside the job subshell, because the log relay below
+# is a separate boto3 process that needs the region too.
+{env_exports}
+
+# --- interpreter + boto3 (same AL2023 dance as the control plane) ----------- #
+(dnf install -y git || yum install -y git) 2>/dev/null || true
+dnf install -y python3.11 python3.11-pip 2>/dev/null \\
+  || dnf install -y python3-pip 2>/dev/null \\
+  || yum install -y python3-pip 2>/dev/null || true
+BASE_PY="$(command -v python3.11 || command -v python3)"
+if "$BASE_PY" -m venv /home/ec2-user/venv 2>/dev/null; then
+  PREP_PY=/home/ec2-user/venv/bin/python
+else
+  PREP_PY="$BASE_PY"
+fi
+"$PREP_PY" -m pip install --upgrade pip 2>/dev/null || true
+"$PREP_PY" -m pip install boto3 || "$PREP_PY" -m pip install --user boto3 || true
+
+# --- log relay: the same mechanism the training boxes use ------------------- #
+# boto3 upload_file on a timer. Started FIRST so the laptop sees dnf/pip/clone
+# too — an hour-long job you cannot watch is indistinguishable from a hang.
+"$PREP_PY" - <<'PY' &
+import time, boto3
+c = boto3.client("s3")
+while True:
+    try:
+        c.upload_file("/var/log/spot-prep.log", "{bucket}", "{log_key}")
+    except Exception:
+        pass
+    time.sleep({interval})
+PY
+UPLOADER_PID=$!
+
+# --- the job (subshell => a failure is an RC, never a skipped status doc) ---- #
+(
+  set -euxo pipefail
+  mkdir -p "$HF_HOME"
+  df -h /
+
+  # Branch matters: the prep script and the staging code both come from the repo,
+  # so a prep run from a feature branch must not silently run main's code.
+  git clone --depth 1 -b {cfg.repo_branch} {cfg.repo_url} {_PREP_APP}
+  cd {_PREP_APP}
+
+  # prepare.py imports datasets/tiktoken/tqdm/numpy lazily, so they are installed
+  # explicitly; the package itself goes in with --no-deps because its dependency
+  # set drags ~2 GB of CUDA torch onto a box that only tokenizes text. (The
+  # editable install is what makes `python -m orchestrator` importable below.)
+  "$PREP_PY" -m pip install datasets tiktoken tqdm numpy boto3
+  "$PREP_PY" -m pip install --no-deps -e {_PREP_APP}
+
+  # Same resolution as orchestrator.dataset._local_dir: our own prep for this
+  # dataset if we have one, else nanoGPT's. Run from its own directory, exactly
+  # as the local stage-data path does (the script writes its bins beside itself).
+  PREPARE="data/{dataset}/prepare.py"
+  if [ ! -f "$PREPARE" ]; then
+    git submodule update --init --depth 1
+    PREPARE="third_party/nanoGPT/data/{dataset}/prepare.py"
+  fi
+  ( cd "$(dirname "$PREPARE")" && "$PREP_PY" -u prepare.py )
+  df -h /
+
+  # Upload through the ORDINARY stage-data path — one staging code path, and it
+  # already skips per file, so a rerun never re-sends a bin that landed.
+  "$PREP_PY" -u -m orchestrator stage-data
+  df -h /
+)
+RC=$?
+
+# --- publish the result, flush the log, then stop the meter ----------------- #
+kill "$UPLOADER_PID" 2>/dev/null || true
+"$PREP_PY" - <<PY
+import json, time
+import boto3
+c = boto3.client("s3")
+try:
+    c.upload_file("/var/log/spot-prep.log", "{bucket}", "{log_key}")
+except Exception:
+    pass
+c.put_object(
+    Bucket="{bucket}",
+    Key="{status_key}",
+    Body=json.dumps(
+        {{
+            "version": 1,
+            "prep_id": "{prep_id}",
+            "dataset": "{dataset}",
+            "ok": $RC == 0,
+            "rc": $RC,
+            "at": time.time(),
+        }}
+    ).encode(),
+)
+PY
+echo "[prep] finished rc=$RC — terminating this box"
+shutdown -h now || systemctl poweroff || poweroff -f
+exit "$RC"
 """
 
 
@@ -431,6 +930,15 @@ def build_user_data(
         # Short collective timeout so survivors of a node kill abort fast (see
         # distributed.init) — the in-band backstop to the supervisor's epoch bump.
         env["NCCL_TIMEOUT"] = str(cfg.nccl_timeout_seconds)
+        # ...but STARTUP gets a much longer budget, because it is not the same
+        # problem. Standing up the process group + DDP over plain TCP (no EFA on
+        # g4dn/g5) builds an all-pairs connection mesh, so the cost grows ~O(N^2):
+        # 8 nodes is 28 peer pairs vs 6 at 4 nodes. Measured on g5.xlarge, 2- and
+        # 4-node came up well inside 20s while 8-node did not, and DDP's shape
+        # verification aborted at exactly the 20s mark — surfacing as a bogus
+        # "params[0] does not match process 0" that looks like a model-config bug.
+        # Scale with node count (floor 300s) and let the operator override.
+        env["NCCL_INIT_TIMEOUT"] = os.environ.get("NCCL_INIT_TIMEOUT", str(max(300, 60 * nodes)))
         # NCCL network hygiene (why 4-node hung where 2-node worked): with no
         # interface pinned, NCCL auto-selects one — and the DLAMI ships Docker, so
         # every box has a docker0 on the SAME non-routable 172.17.0.0/16. NCCL can
@@ -471,10 +979,12 @@ def build_user_data(
         # boot/NCCL-stall/teardown are never billed. MAX_SECONDS still gets a
         # value but the trainer overrides it from this once resumed.
         env["TRAIN_BUDGET_SECONDS"] = str(max_seconds)
-        # Node-local checkpoint tier: survivors of an epoch change resume from
-        # their own disk instead of re-downloading from S3.
-        env["LOCAL_CHECKPOINT_DIR"] = "/tmp/spot-ckpt"
-    steps = _provision_steps(cfg, _export_block(env))
+        # NB: LOCAL_CHECKPOINT_DIR is deliberately NOT set here. Like
+        # DATA_LOCAL_DIR it is resolved at boot by _data_dir_block (instance-store
+        # NVMe when the box has one, /tmp otherwise) and appended to the same env
+        # file — one disk decision, one place, so the write path and the resume
+        # path can never disagree.
+    steps = _provision_steps(cfg, _export_block(env), local_ckpt=(nodes > 1))
     bucket = cfg.bucket
     logs_key = logs_key or cfg.run_logs_key(run_id)
     interval = cfg.log_stream_seconds
@@ -500,8 +1010,8 @@ def build_user_data(
     # poweroff + InstanceInitiatedShutdownBehavior=terminate => the instance
     # terminates (billing stops). Falls back to `shutdown` if systemd-run is absent.
     autokill = ""
-    if cfg.max_instance_lifetime_seconds > 0:
-        n = cfg.max_instance_lifetime_seconds
+    n = cfg.instance_lifetime_for(max_seconds)
+    if n > 0:
         mins = max(1, -(-n // 60))  # ceil(n/60) for the shutdown fallback (minutes)
         autokill = (
             f'echo "[autokill] self-terminate scheduled in {n}s (dead-man switch)"\n'

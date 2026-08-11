@@ -1,8 +1,11 @@
-"""CLI: ``spot-orchestrate {setup,stage-data,bake-ami,baseline,spot,preempt,ddp,
+"""CLI: ``spot-orchestrate {setup,stage-data [--remote],bake-ami,baseline,spot,preempt,ddp,
 ddp-preempt,multinode,multinode-shrink,multinode-preempt,scaling-experiment,
 scaling-clean,scaling-preempt} [--dry-run]``,
-``spot-orchestrate resume <run_id> [--budget N] [--market ...]``, and
-``spot-orchestrate compare <run_id> [<run_id> ...]``.
+``spot-orchestrate resume <run_id> [--budget N] [--market ...]``,
+``spot-orchestrate compare <run_id> [<run_id> ...]``, and
+``spot-orchestrate orch {up,status,logs,down}`` — the durable remote
+orchestrator, which runs an experiment on an always-on t3.micro so a multi-day
+run does not need this laptop awake.
 
 You run this; it needs your AWS creds in the environment. A git-ignored ``.env``
 in the current directory is loaded into the environment on startup (values are
@@ -43,7 +46,6 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     for name in (
         "setup",
-        "stage-data",
         "bake-ami",
         "baseline",
         "spot",
@@ -59,6 +61,28 @@ def main() -> None:
         "scaling-preempt",
     ):
         sub.add_parser(name, parents=[common])
+
+    # stage-data: local by default (unchanged); --remote runs the identical
+    # prepare+upload on a throwaway EC2 box, which is the only way corpora like
+    # full OpenWebText (~110 GB transient, 17 GB uploaded) can be staged at all.
+    stage_parser = sub.add_parser(
+        "stage-data", parents=[common], help="prepare the dataset and upload the bins to S3"
+    )
+    stage_parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="prepare IN AWS on one throwaway box (same-region upload; it self-terminates)",
+    )
+    stage_parser.add_argument(
+        "--no-attach", action="store_true", help="--remote: launch and exit instead of streaming"
+    )
+    stage_parser.add_argument(
+        "--attach",
+        dest="prep_id",
+        default="",
+        help="--remote: reattach to a prep already running (its id)",
+    )
+
     res_parser = sub.add_parser("resume", parents=[common])
     res_parser.add_argument("run_id", help="existing run id to resume from its latest checkpoint")
     res_parser.add_argument(
@@ -69,6 +93,17 @@ def main() -> None:
         choices=["on-demand", "spot"],
         default=None,
         help="instance market (default: inferred from the run id's kind)",
+    )
+    ext_parser = sub.add_parser("extend", parents=[common])
+    ext_parser.add_argument(
+        "run_id", help="completed multi-node run to continue from its checkpoint"
+    )
+    ext_parser.add_argument(
+        "--budget",
+        type=int,
+        required=True,
+        help="new TOTAL training seconds (not an increment) — budget-in-checkpoint "
+        "computes TRAIN_BUDGET_SECONDS minus trained_seconds",
     )
     cmp_parser = sub.add_parser("compare", parents=[common])
     cmp_parser.add_argument("run_ids", nargs="+", help="run ids to compare (2+ recommended)")
@@ -100,6 +135,73 @@ def main() -> None:
         action="store_true",
         help="append-tail one node (--node) with join/death notices — for tmux panes/pipes",
     )
+
+    # --- remote orchestrator: run the control plane on a t3.micro, not here --- #
+    orch_parser = sub.add_parser(
+        "orch",
+        parents=[common],
+        help="durable remote orchestrator: run an experiment on an always-on t3.micro",
+    )
+    orch_sub = orch_parser.add_subparsers(dest="orch_command", required=True)
+    orch_up = orch_sub.add_parser(
+        "up",
+        parents=[common],
+        help="launch the control plane and attach to the live dashboard (Ctrl-C detaches)",
+    )
+    orch_up.add_argument(
+        "--experiment",
+        required=True,
+        help="experiment the remote orchestrator runs (e.g. multinode)",
+    )
+    orch_up.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="env override for the run, repeatable (e.g. --env NODES=8)",
+    )
+    orch_up.add_argument(
+        "--run-id",
+        default="",
+        help="adopt an EXISTING run instead of minting a new one — the way back "
+        "from a dead control-plane box (the fleet keeps training without it)",
+    )
+    orch_up.add_argument(
+        "--force",
+        action="store_true",
+        help="with --run-id, re-enter even a run that already wrote metrics.json",
+    )
+    orch_up.add_argument("--no-attach", action="store_true", help="launch and exit (scripted use)")
+    orch_up.add_argument("--node", type=int, default=None, help="dashboard: node tab to open")
+    orch_up.add_argument("--interval", type=float, default=None, help="dashboard: poll seconds")
+    orch_up.add_argument("--grid", action="store_true", help="dashboard: open the tiled grid")
+    orch_status = orch_sub.add_parser(
+        "status",
+        parents=[common],
+        help="one screen: heartbeat age, epoch/world, step/loss, elapsed vs budget, cost",
+    )
+    orch_status.add_argument("--id", dest="orch_id", default="", help="orchestrator id")
+    orch_logs = orch_sub.add_parser(
+        "logs", parents=[common], help="reattach to the active orchestrator's dashboard"
+    )
+    orch_logs.add_argument("--id", dest="orch_id", default="", help="orchestrator id")
+    orch_logs.add_argument("--run", dest="run_id", default="", help="run id (skips discovery)")
+    orch_logs.add_argument("--node", type=int, default=None)
+    orch_logs.add_argument("--interval", type=float, default=None)
+    orch_logs.add_argument("--grid", action="store_true")
+    orch_logs.add_argument("--plain", action="store_true")
+    orch_down = orch_sub.add_parser("down", parents=[common], help="terminate the control plane")
+    orch_down.add_argument("--id", dest="orch_id", default="", help="orchestrator id")
+    orch_down.add_argument(
+        "--all", action="store_true", help="also terminate the training fleet it was driving"
+    )
+    orch_down.add_argument("--yes", "-y", action="store_true", help="skip the confirmation")
+    # What the systemd unit on the box runs — you never type this yourself.
+    orch_agent = orch_sub.add_parser(
+        "_agent", parents=[common], help="(internal) run the experiment ON the control-plane box"
+    )
+    orch_agent.add_argument("--orch-id", dest="orch_id", required=True)
+    orch_agent.add_argument("--experiment", required=True)
 
     fleet_parser = sub.add_parser(
         "fleet", parents=[common], help="inference fleet (ROADMAP Part 1)"
@@ -157,7 +259,92 @@ def main() -> None:
         "--keep", action="store_true", help="don't tear down a fleet this experiment booted"
     )
 
+    sw_parser = sub.add_parser(
+        "spotwatch",
+        parents=[common],
+        help="unattended GPU spot-availability collector (Lambda + 10-min tick)",
+    )
+    sw_sub = sw_parser.add_subparsers(dest="spotwatch_command", required=True)
+    sw_sub.add_parser("deploy", parents=[common], help="create/update the collector (idempotent)")
+    sw_sub.add_parser("down", parents=[common], help="remove the rule, function and role")
+    sw_report = sw_sub.add_parser("report", parents=[common], help="analyse the collected JSONL")
+    sw_report.add_argument(
+        "--since", type=float, default=72.0, help="hours to analyse (default 72)"
+    )
+    sw_report.add_argument(
+        "--threshold", type=float, default=7.0, help="placement score counted as 'good' (1-10)"
+    )
+    sw_report.add_argument("--region", default="", help="home region (default: AWS_REGION)")
+    sw_report.add_argument(
+        "--type", dest="instance_type", default="", help="home GPU type (default: INSTANCE_TYPE)"
+    )
+
     args = parser.parse_args()
+
+    if args.command in ("spotwatch", "orch"):
+        from . import aws
+        from .config import OrchestratorConfig
+
+        aws.set_dry_run(args.dry_run)
+        cfg = OrchestratorConfig()
+        aws.set_region(cfg.region)
+        if args.command == "spotwatch":
+            from . import spotwatch
+
+            if args.spotwatch_command == "deploy":
+                spotwatch.deploy(cfg)
+            elif args.spotwatch_command == "down":
+                spotwatch.down(cfg)
+            elif args.spotwatch_command == "report":
+                spotwatch.report(
+                    cfg,
+                    since_hours=args.since,
+                    threshold=args.threshold,
+                    home_region=args.region,
+                    home_type=args.instance_type,
+                )
+        else:
+            from . import orch
+
+            if args.orch_command == "up":
+                pairs = {}
+                for item in args.env:
+                    if "=" not in item:
+                        parser.error(f"--env expects K=V, got {item!r}")
+                    k, _, v = item.partition("=")
+                    pairs[k.strip()] = v
+                orch.up(
+                    cfg,
+                    experiment=args.experiment,
+                    env_overrides=pairs,
+                    no_attach=args.no_attach,
+                    node=args.node,
+                    interval=args.interval,
+                    grid=args.grid,
+                    run_id=args.run_id,
+                    force=args.force,
+                )
+            elif args.orch_command == "status":
+                orch.status(cfg, args.orch_id)
+            elif args.orch_command == "logs":
+                orch.logs(
+                    cfg,
+                    orch_id=args.orch_id,
+                    run_id=args.run_id,
+                    node=args.node,
+                    interval=args.interval,
+                    grid=args.grid,
+                    plain=args.plain,
+                )
+            elif args.orch_command == "down":
+                orch.down(cfg, orch_id=args.orch_id, all_=args.all, yes=args.yes)
+            elif args.orch_command == "_agent":
+                # Runs ON the control-plane box under systemd; its exit code is the
+                # restart signal (0 = done, nonzero = systemd retries and resumes).
+                sys.exit(orch.run_agent(cfg, orch_id=args.orch_id, experiment=args.experiment))
+        if args.dry_run:
+            print("\n[dry-run] no AWS calls were made.", file=sys.stderr)
+        return
 
     if args.command == "fleet":
         from . import fleet
@@ -256,7 +443,13 @@ def main() -> None:
     if args.command == "setup":
         setup.ensure_infra(cfg)
     elif args.command == "stage-data":
-        dataset.stage_data(cfg)
+        # --attach implies --remote (you can only reattach to a remote prep).
+        if args.remote or args.prep_id:
+            from . import prep
+
+            prep.run_remote_prep(cfg, attach=not args.no_attach, prep_id=args.prep_id)
+        else:
+            dataset.stage_data(cfg)
     elif args.command == "bake-ami":
         from . import bake
 
@@ -287,6 +480,8 @@ def main() -> None:
         experiments.run_scaling_preempt(cfg)
     elif args.command == "resume":
         experiments.run_resume(cfg, args.run_id, budget=args.budget, market=args.market)
+    elif args.command == "extend":
+        experiments.run_extend(cfg, args.run_id, budget=args.budget)
     elif args.command == "compare":
         from . import compare
 

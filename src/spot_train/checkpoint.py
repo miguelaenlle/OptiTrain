@@ -62,8 +62,34 @@ def _step_of(ref: str | None) -> int:
     return int(base[len(s3_store.CHECKPOINT_PREFIX) : -len(".pt")])
 
 
+def _prune_durable(uri: str, keep: int, log=None) -> None:
+    """Trim the durable tier after a successful write.
+
+    A prune failure must NEVER end the run: the worst case of skipping it is
+    today's behaviour (an unpruned prefix), which is a cost and latency problem,
+    not a correctness one. Same discipline AsyncCheckpointer._write already
+    applies to its own exceptions.
+    """
+    try:
+        n = s3_store.prune_checkpoints(uri, keep)
+    except Exception as e:  # noqa: BLE001 — housekeeping must not kill training
+        if log:
+            log(f"[checkpoint] prune failed (non-fatal, continuing): {e!r}")
+        return
+    if n and log:
+        log(f"[checkpoint] pruned {n} old checkpoint(s), keeping {keep}")
+
+
 def save(
-    *, model, optimizer, loader, step: int, uri: str, trained_seconds: float = 0.0, scaler=None
+    *,
+    model,
+    optimizer,
+    loader,
+    step: int,
+    uri: str,
+    trained_seconds: float = 0.0,
+    scaler=None,
+    keep: int = 0,
 ) -> str:
     """Atomically persist full training state. Returns the final checkpoint ref."""
     blob: dict[str, Any] = {
@@ -81,7 +107,12 @@ def save(
     try:
         torch.save(blob, tmp_path)
         _warn_if_low_disk(os.path.getsize(tmp_path))
-        return s3_store.save_atomic(tmp_path, uri, _ckpt_name(step))
+        ref = s3_store.save_atomic(tmp_path, uri, _ckpt_name(step))
+        # AFTER the write, never before: the new checkpoint must be durable
+        # before anything old is deleted, or a crash mid-prune leaves the run
+        # with fewer checkpoints than it thinks.
+        _prune_durable(uri, keep)
+        return ref
     finally:
         # The local backend renames tmp_path away; the S3 backend uploads a
         # copy and leaves it — without this, every save leaks a checkpoint
@@ -99,18 +130,79 @@ def _scaler_state(scaler) -> dict | None:
     return scaler.state_dict()
 
 
-def _cpu_copy(obj: Any) -> Any:
+def _cuda_tensors(obj: Any, out: list) -> None:
+    """Collect every CUDA tensor in a state tree, in deterministic walk order."""
+    if isinstance(obj, torch.Tensor):
+        if obj.is_cuda:
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _cuda_tensors(v, out)
+    elif isinstance(obj, list | tuple):
+        for v in obj:
+            _cuda_tensors(v, out)
+
+
+def _batched_d2h(tensors: list) -> dict[int, torch.Tensor]:
+    """One pinned staging buffer, one async copy per tensor, ONE sync at the end.
+
+    The naive ``t.to("cpu", copy=True)`` per tensor is a SYNCHRONISING call: it
+    waits for the GPU, which is busy with queued training kernels. GPT-2 124M has
+    ~450 such tensors (weights + Adam's two moments each), so the cost is ~450
+    stalls rather than bandwidth — raw PCIe Gen4 x16 moves the whole 1.5 GB in
+    ~250 ms, but measured stalls were seconds.
+
+    Instead: allocate one pinned (page-locked) host buffer, issue every copy as
+    non_blocking into slices of it, then synchronise ONCE. Pinned memory also
+    lets the driver DMA directly instead of staging through its own bounce
+    buffer, which is worth roughly 3x on its own.
+
+    Returns id(tensor) -> CPU tensor so the tree walk can substitute them.
+    """
+    if not tensors:
+        return {}
+    total = sum(t.numel() * t.element_size() for t in tensors)
+    try:
+        flat = torch.empty(total, dtype=torch.uint8, device="cpu", pin_memory=True)
+    except RuntimeError:
+        # Pinned allocation can fail under host-memory pressure; fall back to
+        # pageable rather than failing the checkpoint.
+        flat = torch.empty(total, dtype=torch.uint8, device="cpu")
+    out: dict[int, torch.Tensor] = {}
+    off = 0
+    for t in tensors:
+        nbytes = t.numel() * t.element_size()
+        view = flat[off : off + nbytes].view(torch.uint8)
+        # A contiguous byte view of the destination, reinterpreted as the source
+        # dtype/shape, so one copy_ moves the tensor with no per-element work.
+        dst = view.view(t.dtype).view(t.shape) if t.is_contiguous() else None
+        if dst is None:
+            out[id(t)] = t.detach().to("cpu", copy=True)  # rare: non-contiguous
+        else:
+            dst.copy_(t.detach(), non_blocking=True)
+            out[id(t)] = dst
+        off += nbytes
+    torch.cuda.synchronize()  # the ONE sync: every copy above is now complete
+    return out
+
+
+def _cpu_copy(obj: Any, mapping: dict[int, torch.Tensor] | None = None) -> Any:
     """Deep copy a state tree with every tensor moved to CPU. The copy is the
     point: the optimizer keeps mutating the live tensors while the background
-    writer serializes, so the snapshot must not alias them."""
+    writer serializes, so the snapshot must not alias them.
+
+    ``mapping`` supplies already-copied CUDA tensors from :func:`_batched_d2h`;
+    without it each tensor is copied individually (the CPU-test path)."""
     if isinstance(obj, torch.Tensor):
+        if mapping is not None and id(obj) in mapping:
+            return mapping[id(obj)]
         return obj.detach().to("cpu", copy=True)
     if isinstance(obj, dict):
-        return {k: _cpu_copy(v) for k, v in obj.items()}
+        return {k: _cpu_copy(v, mapping) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_cpu_copy(v) for v in obj]
+        return [_cpu_copy(v, mapping) for v in obj]
     if isinstance(obj, tuple):
-        return tuple(_cpu_copy(v) for v in obj)
+        return tuple(_cpu_copy(v, mapping) for v in obj)
     return copy.deepcopy(obj)
 
 
@@ -126,15 +218,26 @@ def snapshot(
     it so the stall is amortized, not per-step. RNG and loader state are captured
     in the same instant as the weights — the invariant that keeps resume from
     silently diverging."""
+    model_sd, opt_sd = model.state_dict(), optimizer.state_dict()
+    scaler_sd = _scaler_state(scaler)
+    # ONE batched device->host transfer for every CUDA tensor across all three
+    # trees, then one sync — instead of ~450 individually synchronising copies.
+    mapping = None
+    if torch.cuda.is_available():
+        cuda: list = []
+        for tree in (model_sd, opt_sd, scaler_sd):
+            _cuda_tensors(tree, cuda)
+        if cuda:
+            mapping = _batched_d2h(cuda)
     return {
         "version": CKPT_VERSION,
         "step": step,
         "trained_seconds": trained_seconds,
-        "model": _cpu_copy(model.state_dict()),
-        "optimizer": _cpu_copy(optimizer.state_dict()),
+        "model": _cpu_copy(model_sd, mapping),
+        "optimizer": _cpu_copy(opt_sd, mapping),
         "rng": rng.capture(),  # capture() already returns copies
         "loader": dict(loader.state_dict()),
-        "scaler": _cpu_copy(_scaler_state(scaler)),
+        "scaler": _cpu_copy(scaler_sd, mapping),
     }
 
 
@@ -165,6 +268,76 @@ def save_local(blob: dict[str, Any], local_dir: str, step: int, keep: int = 2) -
     return final
 
 
+class AsyncLocalSaver:
+    """Async writer for the NODE-LOCAL tier — the same two-phase split
+    :class:`AsyncCheckpointer` uses for S3, applied to the local disk write.
+
+    Why this exists: the local tier was fully synchronous, so a 1.5 GB
+    ``torch.save`` sat on the training critical path every checkpoint. Measured
+    at 4 nodes on GPT-2 124M, that was **99s of 301.7 training-seconds — 33% of
+    all training time** (checkpoint steps showed 28.5s vs a 3.0s norm). The S3
+    tier had solved this already; the local tier just never got the same
+    treatment.
+
+    The caller still snapshots synchronously (:func:`snapshot` — a point-in-time
+    CPU copy, which is what makes the write safe while the optimizer keeps
+    mutating the live tensors). Only the serialize + write + prune moves off the
+    critical path.
+
+    One save in flight, like the S3 saver: ``submit`` returns False while busy,
+    so memory stays bounded at one blob and a slow disk cannot queue-pile. The
+    durability trade is the same and is deliberate — worst-case lost work on a
+    hard kill becomes the checkpoint interval plus one local write, and the
+    node-local tier is the FAST-RESTART tier, not the durable one (S3 is
+    durable). A survivor that loses one local checkpoint falls back to S3.
+
+    Preempt and final checkpoints stay synchronous in the trainer; call
+    :meth:`flush` first so the writer never races them.
+    """
+
+    def __init__(self, local_dir: str, *, keep: int = 2, log: Callable[[str], None] | None = None):
+        self._dir = local_dir
+        self._keep = keep
+        self._log = log or (lambda msg: print(msg, file=sys.stderr, flush=True))
+        self._thread: threading.Thread | None = None
+        self.failures = 0
+        self.skipped = 0
+
+    def busy(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def submit(self, blob: dict[str, Any], step: int) -> bool:
+        """Hand an ALREADY-SNAPSHOTTED blob to the writer. False = previous write
+        still in flight (skipped). The caller owns the snapshot because rank 0
+        may reuse the same blob it just handed to the S3 tier."""
+        if self.busy():
+            self.skipped += 1
+            return False
+        self._thread = threading.Thread(
+            target=self._write, args=(blob, step), name="ckpt-local-writer", daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def _write(self, blob: dict[str, Any], step: int) -> None:
+        try:
+            save_local(blob, self._dir, step, keep=self._keep)
+        except Exception as e:  # noqa: BLE001 — background thread: log, count, keep training
+            self.failures += 1
+            self._log(
+                f"[checkpoint] ASYNC LOCAL save at step {step} FAILED: {e!r} — "
+                "training continues; the S3 tier is unaffected"
+            )
+
+    def flush(self, timeout: float = 300.0) -> None:
+        """Wait for the in-flight local write. Called before the synchronous
+        preempt/final checkpoints and at shutdown, so a resume can never read a
+        directory that a background thread is still pruning."""
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout)
+
+
 class AsyncCheckpointer:
     """Two-phase checkpointing: the caller snapshots on its own thread
     (:func:`snapshot`, ~tens of ms), then a daemon thread serializes, uploads
@@ -191,8 +364,10 @@ class AsyncCheckpointer:
         build_model: Callable[[], Any] | None = None,
         sample_batch: tuple | None = None,
         log: Callable[[str], None] | None = None,
+        keep: int = 0,
     ):
         self._uri = uri
+        self._keep = keep
         self._verify_every = verify_every
         self._build_model = build_model
         self._sample_batch = sample_batch  # CPU tensors (see trainer: RNG-free eval batch)
@@ -205,20 +380,37 @@ class AsyncCheckpointer:
         return self._thread is not None and self._thread.is_alive()
 
     def submit(
-        self, *, model, optimizer, loader, step: int, trained_seconds: float = 0.0, scaler=None
+        self,
+        *,
+        model=None,
+        optimizer=None,
+        loader=None,
+        step: int,
+        trained_seconds: float = 0.0,
+        scaler=None,
+        blob: dict[str, Any] | None = None,
     ) -> bool:
         """Snapshot now and hand off to the writer. False = previous save still
-        in flight (skipped; nothing was snapshotted)."""
+        in flight (skipped; nothing was snapshotted).
+
+        Pass ``blob`` to reuse a snapshot the caller already took. Rank 0 feeds
+        BOTH tiers, and the two snapshots were identical by construction (same
+        model, optimizer and step, with a collective between them guaranteeing
+        training had not advanced) — so taking two was a second full 1.5 GB
+        device->host copy for nothing. The writers only ever READ the blob, so
+        sharing one is safe; it also halves peak host memory, at the cost of the
+        blob living until BOTH writers finish."""
         if self.busy():
             return False
-        blob = snapshot(
-            model=model,
-            optimizer=optimizer,
-            loader=loader,
-            step=step,
-            trained_seconds=trained_seconds,
-            scaler=scaler,
-        )
+        if blob is None:
+            blob = snapshot(
+                model=model,
+                optimizer=optimizer,
+                loader=loader,
+                step=step,
+                trained_seconds=trained_seconds,
+                scaler=scaler,
+            )
         self._count += 1
         self._thread = threading.Thread(
             target=self._write, args=(blob, step, self._count), name="ckpt-writer", daemon=True
@@ -237,6 +429,9 @@ class AsyncCheckpointer:
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
+            # Rank-0-only on the durable tier (docs/checkpoint-tiers.md), so
+            # there is no concurrent-pruner race by construction.
+            _prune_durable(self._uri, self._keep, self._log)
             if self._verify_every and count % self._verify_every == 0:
                 good = verify(ref, map_location="cpu")
                 if self._build_model is not None and self._sample_batch is not None:

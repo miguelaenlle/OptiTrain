@@ -1,0 +1,9 @@
+apiVersion: 1
+datasources:
+  # Built-in, no plugin install required. Panels carry their CSV inline
+  # (scenarioId: csv_content), so the static pass needs no network origin.
+  - name: Embedded
+    type: grafana-testdata-datasource
+    uid: testdata-embedded
+    access: proxy
+    isDefault: true

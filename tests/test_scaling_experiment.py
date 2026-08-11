@@ -332,3 +332,35 @@ def test_parse_run_events_attributes_by_filename():
     assert (None, None, "epoch") in by
     assert (0, 0, "training") in by
     assert (1, 1, "training") in by
+
+
+def test_metrics_deadline_outlasts_the_training_budget():
+    """The watchdog must never be more impatient than the work it watches.
+
+    A fixed METRICS_TIMEOUT=1800 terminated a healthy 8-node fleet 30 minutes
+    into a 1h run — epoch 1, world 8, step 400, loss 4.86, zero crashes, killed
+    because the deadline was half the budget. At 36h the same default would have
+    killed the run before its first eval.
+    """
+    from orchestrator.config import OrchestratorConfig
+
+    cfg = OrchestratorConfig(bucket="b")
+    for budget in (900, 3600, 14400, 129600):
+        deadline = cfg.metrics_deadline_for(budget)
+        assert deadline > budget, f"deadline {deadline} <= budget {budget}"
+        # Room for boot + a 17 GB dataset pull + the post-budget eval/ckpt tail.
+        assert deadline - budget >= 600
+    # No budget (open-ended) falls back to the plain floor.
+    assert cfg.metrics_deadline_for(None) == cfg.metrics_timeout_seconds
+    assert cfg.metrics_deadline_for(0) == cfg.metrics_timeout_seconds
+
+
+def test_explicit_metrics_timeout_can_extend_but_not_shorten(monkeypatch):
+    from orchestrator.config import OrchestratorConfig
+
+    # An operator raising METRICS_TIMEOUT wins when it is larger...
+    monkeypatch.setenv("METRICS_TIMEOUT", "99999")
+    assert OrchestratorConfig(bucket="b").metrics_deadline_for(3600) == 99999
+    # ...but a too-small explicit value must NOT cut a run below its own budget.
+    monkeypatch.setenv("METRICS_TIMEOUT", "60")
+    assert OrchestratorConfig(bucket="b").metrics_deadline_for(3600) > 3600

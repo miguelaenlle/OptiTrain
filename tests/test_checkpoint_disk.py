@@ -31,7 +31,9 @@ class _FakeS3Client:
     def delete_object(self, Bucket, Key):
         self.objects.pop((Bucket, Key), None)
 
-    def download_file(self, bucket, key, local, ExtraArgs=None):
+    # Config= is the boto3 TransferConfig the real client takes; the fake must
+    # accept it or the tuned-download path can't be exercised here.
+    def download_file(self, bucket, key, local, ExtraArgs=None, Config=None):
         with open(local, "wb") as f:
             f.write(self.objects[(bucket, key)])
 

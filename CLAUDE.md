@@ -185,14 +185,24 @@ src/spot_train/        # remote trainer — OUR fault-tolerance loop
 src/orchestrator/      # local control plane (boto3) — you run this
   aws.py               # the ONLY module that calls AWS; --dry-run + logging
   setup.py             # idempotent: bucket + IAM instance profile + SG
-  dataset.py           # prepare-once → upload to S3
+  dataset.py           # prepare-once → upload to S3 (local `stage-data`)
+  prep.py              # `stage-data --remote`: prepare the corpus IN AWS on one
+                       #   throwaway box (110 GB transient / 17 GB train.bin do
+                       #   not fit a laptop); self-terminating, log streamed to
+                       #   s3://<bucket>/prep/<id>/prep.log
   bake.py              # bake-ami: pre-provisioned AMI (repo+deps) → faster boots
   bootstrap.py         # EC2 user-data script builder (multinode → sidecar)
   experiments.py       # run_baseline / run_spot / _run_supervised (multinode)
   supervisor.py        # epoch supervisor: pure decide() reducer + Effects loop
   sidecar.py           # per-box: obey epoch.json, run static torchrun per epoch
+  spotwatch.py         # spot-availability collector: deploy/down/report (~$1-3/mo)
+  lambda_spotwatch.py  # ^ its Lambda handler — runs IN AWS, boto3+stdlib only
+  orch.py              # DURABLE remote orchestrator: `orch up|status|logs|down`
+                       #   — runs the supervisor on an always-on t3.micro so a
+                       #   36h run doesn't need the laptop; `up` attaches to the
+                       #   existing logview dashboard, Ctrl-C only detaches
   config.py            # OrchestratorConfig (env-overridable)
-  __main__.py          # CLI: setup | stage-data | baseline | spot [--dry-run]
+  __main__.py          # CLI: setup | stage-data [--remote] | baseline | spot [--dry-run]
 third_party/nanoGPT/   # Karpathy's nanoGPT — git submodule, read-only.
                        #   we import GPT/GPTConfig from model.py; we do NOT
                        #   use their train.py — our loop owns fault tolerance.
@@ -210,6 +220,23 @@ tests/                 # checkpoint/resume tests
 
 The nanoGPT submodule is pinned; contributors run
 `git submodule update --init` after cloning.
+
+## AWS region — training is us-east-1, and only us-east-1
+
+This AWS account is shared with a separate **inference platform that owns
+us-east-2**. Isolation is by region: GPU quota is per-region, so neither project
+can starve the other, and a careless `describe-instances`/`terminate-instances`
+in one region cannot even see the other's boxes.
+
+- `aws.TRAINING_REGION = "us-east-1"`; `aws.set_region()` **raises** on anything
+  else (override: `ALLOW_REGION_OVERRIDE=1`). Every entry point funnels through it.
+- Source `scripts/fleetctl.sh` — never write a bare `aws ec2 describe-instances`
+  in a driver. It scopes by region *and* `tag:project=spot-train`.
+- IAM and S3 are **not** regional: keep the `spot-train-*` name prefix, and never
+  touch resources belonging to the inference project.
+
+Full contract: [docs/region-split.md](./docs/region-split.md). The brief handed
+to the other agent: [docs/prompts/inference-agent-region.md](./docs/prompts/inference-agent-region.md).
 
 ## Conventions
 

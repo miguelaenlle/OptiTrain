@@ -204,6 +204,7 @@ def _stream_until_metrics(
     profile: RunProfile,
     logs_key: str | None = None,
     state: dict | None = None,
+    budget: int | None = None,
 ) -> dict | None:
     """Stream the box log until ``metrics.json`` appears (trainer writes it last =>
     done) or ``metrics_timeout_seconds`` elapses. Returns parsed metrics, or None.
@@ -213,7 +214,7 @@ def _stream_until_metrics(
     metrics_key = cfg.run_metrics_key(run_id)
     state = state if state is not None else {"printed": 0}
     start = time.monotonic()
-    deadline = start + cfg.metrics_timeout_seconds
+    deadline = start + cfg.metrics_deadline_for(budget)
     last_heartbeat = start
     marked_first = False
 
@@ -285,17 +286,27 @@ def _run_single_box(
     ddp: bool = False,
     nproc_per_node: int = 0,
     return_profile: bool = False,
+    run_id: str | None = None,
+    on_profile=None,
 ):
     """One box, run to its wall-clock budget, stream the log, collect the run
     profile, then terminate. Shared by `baseline` (1 process) and `ddp` (torchrun,
-    N processes) — the only difference is the ddp/torchrun launch."""
+    N processes) — the only difference is the ddp/torchrun launch.
+
+    ``run_id`` reuses an existing run prefix instead of minting a new one (the
+    remote orchestrator passes the run it is resuming after a control-plane
+    restart; the trainer's one resume path then continues from that prefix's
+    latest checkpoint). ``on_profile(profile)`` is called once the ledger exists,
+    so a caller can register boxes IT owns — the control-plane instance."""
     ami, sg_id = _prepare(cfg)
-    run_id = _run_id(kind)
+    run_id = run_id or _run_id(kind)
     extra = f" nproc_per_node={nproc_per_node or 'auto(gpu)'}" if ddp else ""
     print(f"[{kind}] run_id={run_id} budget={budget}s{extra}", file=sys.stderr)
     _logs_hint(run_id)
     # Collect a run profile (timeline + loss) and mirror to W&B if configured.
     profile = RunProfile(run_id, kind=kind, market=market)
+    if on_profile is not None:
+        on_profile(profile)
     if not aws.is_dry_run():  # dry-run must not create a real W&B run
         profile.wandb_start(cfg)
     iid = _launch(
@@ -314,7 +325,7 @@ def _run_single_box(
         if aws.is_dry_run():
             print(f"[{kind}] dry-run: skipping stream/terminate", file=sys.stderr)
             return (profile, None) if return_profile else None
-        metrics = _stream_until_metrics(cfg, run_id, profile)
+        metrics = _stream_until_metrics(cfg, run_id, profile, budget=budget)
         profile.mark("metrics" if metrics is not None else "timeout")
         profile.from_metrics(metrics)
         profile.instance_stopped(iid)  # ledger stop ~= the terminate call below
@@ -328,8 +339,10 @@ def _run_single_box(
         aws.terminate(iid)
 
 
-def run_baseline(cfg: OrchestratorConfig) -> dict | None:
-    return _run_single_box(cfg, kind="baseline", market="on-demand", budget=cfg.baseline_seconds)
+def run_baseline(cfg: OrchestratorConfig, **kw) -> dict | None:
+    return _run_single_box(
+        cfg, kind="baseline", market="on-demand", budget=cfg.baseline_seconds, **kw
+    )
 
 
 def run_resume(
@@ -389,7 +402,7 @@ def run_resume(
         if aws.is_dry_run():
             print("[resume] dry-run: skipping stream/terminate", file=sys.stderr)
             return None
-        metrics = _stream_until_metrics(cfg, run_id, profile, logs_key=logs_key)
+        metrics = _stream_until_metrics(cfg, run_id, profile, logs_key=logs_key, budget=budget)
         if metrics is not None:
             if not metrics.get("resumed"):
                 print("[resume] WARNING: trainer did not report resumed=true", file=sys.stderr)
@@ -399,7 +412,7 @@ def run_resume(
         aws.terminate(iid)
 
 
-def run_ddp(cfg: OrchestratorConfig) -> dict | None:
+def run_ddp(cfg: OrchestratorConfig, **kw) -> dict | None:
     """Single-node, multi-process DDP via torchrun (Phase 1b). Same machinery as
     baseline; the box runs the trainer under torchrun with ddp_nproc_per_node ranks."""
     return _run_single_box(
@@ -409,6 +422,7 @@ def run_ddp(cfg: OrchestratorConfig) -> dict | None:
         budget=cfg.baseline_seconds,
         ddp=True,
         nproc_per_node=cfg.ddp_nproc_per_node,
+        **kw,
     )
 
 
@@ -452,6 +466,48 @@ def _launch_node(
     )
 
 
+def adopt_fleet(cfg, run_id: str, logs: dict[int, dict]) -> dict[int, str]:
+    """Boxes already running this run: ``{node_index: instance_id}``, filling
+    ``logs`` with each one's live log key as a side effect.
+
+    _run_supervised launches ``node_count`` boxes unconditionally, which is right
+    exactly once -- on a cold start. When the control plane is SIGKILLed and
+    systemd restarts it, the fleet is still up and TRAINING (sidecars run static
+    torchrun against the last published epoch), so relaunching doubles it. In the
+    2-node verification this produced 5 boxes: 2 survivors correctly spared by
+    _reap_orphans, 2 needlessly relaunched, 1 replacement for a survivor that
+    looked dead only because the restarted process no longer knew its instance id.
+
+    Both halves are process memory, and both must come back:
+      * ``node_ids`` -- without it ``_observe`` cannot resolve aws_state, so the
+        node is never even observed, drops out of ``healthy``, and gets replaced;
+      * ``logs``     -- ``_observe`` reads ``logs[node]["key"]`` for the
+        heartbeat, so a missing entry is a KeyError on the first tick.
+
+    status.json is the source because it carries node, attempt, instance_id and
+    log_key in one record, already keyed the way both dicts need. Only entries
+    the supervisor last saw ALIVE are adopted: a dead attempt's row is history,
+    and its slot legitimately needs a fresh box.
+    """
+    doc = aws.get_json(cfg.bucket, cfg.run_status_key(run_id)) or {}
+    adopted: dict[int, str] = {}
+    for entry in doc.get("nodes") or []:
+        node, iid = entry.get("node"), entry.get("instance_id")
+        if node is None or not iid or entry.get("state") != "alive":
+            continue
+        # An instance AWS no longer runs is not adoptable however alive the last
+        # status doc believed it to be -- that document can be a tick stale.
+        if aws.instance_state(iid) != "running":
+            continue
+        adopted[int(node)] = iid
+        logs[int(node)] = {
+            "key": entry.get("log_key") or cfg.run_logs_key(run_id, node=int(node)),
+            "attempt": int(entry.get("attempt", 0)),
+            "state": {"printed": 0},
+        }
+    return adopted
+
+
 def _make_launch_node(cfg, ami, sg_id, run_id, market, budget, profile, logs):
     """Return ``launch(node_index) -> instance_id`` for the supervisor: allocate
     a fresh (attempt-suffixed) log key so a replacement never clobbers the dead
@@ -485,6 +541,8 @@ def _run_supervised(
     kill_schedule: list[tuple[float, int]],
     verdict: bool = False,
     return_profile: bool = False,
+    run_id: str | None = None,
+    on_profile=None,
 ):
     """Shared driver for every multi-node experiment: launch N boxes, hand
     membership to the epoch :class:`~orchestrator.supervisor.Supervisor`, and let
@@ -492,13 +550,20 @@ def _run_supervised(
     one kill with ``replace_on_loss=False`` (+ a PASS/FAIL verdict);
     ``multinode-preempt`` a schedule with ``replace_on_loss=True``. All three
     share one code path, so the W&B world-size staircase / degraded phase / cost
-    ledger behave identically across them."""
+    ledger behave identically across them.
+
+    ``run_id`` reuses an existing run prefix rather than minting a new one: the
+    remote orchestrator passes the run it was already driving when its control
+    plane restarted, so the replacement boxes resume from that run's checkpoints
+    (and its budget-in-checkpoint) instead of training from scratch.
+    ``on_profile(profile)`` lets the caller add ledger rows for boxes it owns —
+    the control-plane instance, so a multi-day run's cost is honest."""
     from .supervisor import Policy, Supervisor
 
     if cfg.node_count < 2:
         raise SystemExit(f"{kind} needs NODES >= 2")
     ami, sg_id = _prepare(cfg)
-    run_id = _run_id(kind)
+    run_id = run_id or _run_id(kind)
     market = cfg.spot_market
     if kill_schedule:
         # Dense checkpoints: a hard kill gives no warning, so lost work (and the
@@ -514,6 +579,8 @@ def _run_supervised(
     )
     _logs_hint(run_id)
     profile = RunProfile(run_id, kind=kind, market=market)
+    if on_profile is not None:
+        on_profile(profile)
     if not aws.is_dry_run():
         profile.wandb_start(cfg)
 
@@ -522,8 +589,21 @@ def _run_supervised(
     launch_node = _make_launch_node(cfg, ami, sg_id, run_id, market, budget, profile, logs)
 
     try:
-        aws.wait_vcpu_headroom(cfg.node_count * cfg.instance_vcpu_count(), cfg.vcpu_quota)
-        for i in range(cfg.node_count):
+        # Adopt before launching. On a cold start this finds nothing and the loop
+        # below launches the whole group, exactly as before; after a control-plane
+        # restart it finds the fleet that never stopped training, and only the
+        # genuinely missing slots are launched.
+        node_ids.update(adopt_fleet(cfg, run_id, logs))
+        missing = [i for i in range(cfg.node_count) if i not in node_ids]
+        if node_ids:
+            print(
+                f"[{kind}] adopted {len(node_ids)} running box(es) "
+                f"{sorted(node_ids)}; launching {len(missing)} more",
+                file=sys.stderr,
+            )
+        if missing:
+            aws.wait_vcpu_headroom(len(missing) * cfg.instance_vcpu_count(), cfg.vcpu_quota)
+        for i in missing:
             node_ids[i] = launch_node(i)
         profile.mark("launch")
 
@@ -540,6 +620,7 @@ def _run_supervised(
         policy = Policy(
             replace_on_loss=replace_on_loss,
             recovery_timeout_s=cfg.recovery_timeout_seconds,
+            max_epochs_without_progress=cfg.max_epochs_without_progress,
         )
         sup = Supervisor(
             cfg,
@@ -552,7 +633,9 @@ def _run_supervised(
             pull_logs=lambda: _pull_logs(cfg, logs, profile),
             kill_schedule=kill_schedule,
         )
-        metrics = sup.run(deadline_s=cfg.metrics_timeout_seconds)
+        # Deadline must outlast the work it is watching: budget + boot +
+        # dataset pull + the post-budget eval/checkpoint tail.
+        metrics = sup.run(deadline_s=cfg.metrics_deadline_for(budget))
         profile.mark("metrics" if metrics is not None else "timeout")
         profile.from_metrics(metrics)
         if metrics is not None:
@@ -571,7 +654,7 @@ def _run_supervised(
             aws.terminate(iid)
 
 
-def run_multinode(cfg: OrchestratorConfig) -> dict | None:
+def run_multinode(cfg: OrchestratorConfig, **kw) -> dict | None:
     """N nodes x one-rank-per-GPU DDP under the epoch supervisor, run to the
     wall-clock budget with no kills. Proves a clean multi-node run end to end."""
     return _run_supervised(
@@ -580,10 +663,89 @@ def run_multinode(cfg: OrchestratorConfig) -> dict | None:
         budget=cfg.baseline_seconds,
         replace_on_loss=False,
         kill_schedule=[],
+        **kw,
     )
 
 
-def run_multinode_shrink(cfg: OrchestratorConfig) -> dict | None:
+SUPERVISED_KINDS = ("multinode", "multinode-shrink", "multinode-preempt")
+
+
+def run_extend(cfg: OrchestratorConfig, run_id: str, *, budget: int, **kw) -> dict | None:
+    """Continue a COMPLETED supervised run from its last checkpoint.
+
+    Two uses, and the first is why this exists: if a 24h run dies at hour 18 from
+    a small bug, patch and continue instead of writing off the run. The second is
+    buying a longer result later if credits allow.
+
+    ``spot-orchestrate resume`` cannot do this. It derives
+    ``kind = run_id.split("-", 1)[0]``, which maps ``multinode-preempt-…`` to
+    ``"multinode"`` and then raises "resume handles single-box runs" — it is a
+    single-box salvage tool. We take the kind off the RIGHT instead, and hand the
+    existing run_id to ``_run_supervised``, which already accepts one.
+
+    ``budget`` is the new TOTAL, not an increment. Budget-in-checkpoint computes
+    ``TRAIN_BUDGET_SECONDS - trained_seconds``, so extending 24h->36h means
+    passing 125000, not 42200. Passing an increment would silently stop the run
+    almost immediately, so it is asserted rather than trusted.
+    """
+    kind = run_id.rsplit("-", 1)[0]
+    if kind not in SUPERVISED_KINDS:
+        raise SystemExit(
+            f"extend handles supervised multi-node runs ({', '.join(SUPERVISED_KINDS)}); "
+            f"{run_id!r} looks like kind {kind!r}"
+        )
+    ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
+    metrics_key = cfg.run_metrics_key(run_id)
+    profile_key = cfg.run_profile_key(run_id)
+
+    trained = 0.0
+    if not aws.is_dry_run():
+        if not aws.any_object_under(cfg.bucket, ckpt_prefix):
+            raise SystemExit(
+                f"no checkpoints under s3://{cfg.bucket}/{ckpt_prefix} — nothing to extend from"
+            )
+        met = aws.get_json(cfg.bucket, metrics_key) or {}
+        trained = float(met.get("trained_seconds_total") or 0.0)
+        if trained and budget <= trained:
+            raise SystemExit(
+                f"--budget {budget}s is not more than the {trained:.0f}s already trained. "
+                f"It is the new TOTAL, not an increment: to add 10h to a 23h run pass "
+                f"{int(trained) + 36000}, not 36000."
+            )
+        # Archive BEFORE re-entering. A completed run has both documents, the new
+        # segment overwrites both, and that destroys the result already paid for.
+        # It is also what unblocks re-entry: orch.run_agent treats an existing
+        # metrics.json as "nothing to do".
+        seg = 1
+        while aws.object_exists(cfg.bucket, f"{metrics_key[:-5]}-seg{seg}.json"):
+            seg += 1
+        for key in (metrics_key, profile_key):
+            doc = aws.get_json(cfg.bucket, key)
+            if doc is None:
+                continue
+            archived = f"{key[:-5]}-seg{seg}.json"
+            aws.put_text(cfg.bucket, archived, json.dumps(doc, indent=2))
+            aws.delete_object(cfg.bucket, key)
+            print(f"[extend] archived {key} -> {archived}", file=sys.stderr)
+        print(
+            f"[extend] {run_id}: {trained:.0f}s trained, new total {budget}s "
+            f"(+{budget - trained:.0f}s) — segment {seg + 1}",
+            file=sys.stderr,
+        )
+
+    replace = kind != "multinode-shrink"
+    return _run_supervised(
+        cfg,
+        kind=kind,
+        budget=budget,
+        replace_on_loss=replace,
+        kill_schedule=cfg.preempt_schedule() if kind == "multinode-preempt" else [],
+        run_id=run_id,
+        **kw,
+    )
+
+
+def run_multinode_shrink(cfg: OrchestratorConfig, **kw) -> dict | None:
     """The minimal elastic validation: ONE kill, NO replacement. The supervisor
     publishes a shrink epoch; survivors must re-form at N-1 and finish the run on
     their own. Ends with an explicit PASS/FAIL verdict (survivors checkpointed
@@ -599,26 +761,34 @@ def run_multinode_shrink(cfg: OrchestratorConfig) -> dict | None:
         replace_on_loss=False,
         kill_schedule=[(kill_after, cfg.node_count - 1)],
         verdict=True,
+        **kw,
     )
 
 
-def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
+def run_multinode_preempt(cfg: OrchestratorConfig, **kw) -> dict | None:
     """Multi-node preemption under the epoch supervisor: a schedule of hard kills,
     each followed by a replacement that rejoins at the next epoch. Same profile
     marks as before (kill -> shrink_resume -> relaunch -> full_world), so the W&B
     world-size staircase, degraded phase, and goodput carry over unchanged."""
-    victims = cfg.preempt_victim_schedule()
     total = cfg.train_total_seconds
-    interval = cfg.preempt_after_seconds or math.ceil(total / (cfg.preempt_count + 1))
-    # Kill i fires `interval` seconds after the PREVIOUS one resumed; the
-    # supervisor clock is seconds-since-train-start, so space them by interval.
-    schedule = [((k + 1) * interval, victims[k]) for k in range(cfg.preempt_count)]
+    # An explicit PREEMPT_SCHEDULE wins: it is the only form that can express a
+    # SIMULTANEOUS multi-node loss (several victims sharing one timestamp), which
+    # the evenly-spaced victim list cannot. Without it, a mass-loss event needs a
+    # bespoke driver -- which is exactly what scripts/e4_rolling_pairs.py is.
+    schedule = cfg.preempt_schedule()
+    if not schedule:
+        victims = cfg.preempt_victim_schedule()
+        interval = cfg.preempt_after_seconds or math.ceil(total / (cfg.preempt_count + 1))
+        # Kill i fires `interval` seconds after the PREVIOUS one resumed; the
+        # supervisor clock is seconds-since-train-start, so space them by interval.
+        schedule = [((k + 1) * interval, victims[k]) for k in range(cfg.preempt_count)]
     return _run_supervised(
         cfg,
         kind="multinode-preempt",
         budget=max(1, math.ceil(total)),
         replace_on_loss=True,
         kill_schedule=schedule,
+        **kw,
     )
 
 
@@ -692,14 +862,28 @@ def _fetch_run_events(cfg: OrchestratorConfig, run_id: str) -> list[dict]:
     return logview.parse_run_events(items)
 
 
-def _render_run_timeline(cfg: OrchestratorConfig, run_id: str, out_dir: str) -> dict:
-    """Export the event-sourced Gantt PNG + events.txt for a finished run."""
+def _render_run_timeline(
+    cfg: OrchestratorConfig, run_id: str, out_dir: str, end_ts: float | None = None
+) -> dict:
+    """Export the event-sourced Gantt PNG + events.txt for a finished run.
+
+    ``end_ts`` is where the chart stops. It matters more than it looks: events
+    are emitted on STATE TRANSITIONS only (kill, relaunch, epoch change), so a
+    run that recovers and then trains quietly to the end emits nothing for that
+    final stretch. Defaulting to the last event truncated E5 at 2239s of a
+    3336s run and dropped 1097s of full-world training — the final replacements
+    rendered as `prov` with no training bar, making a healthy fleet look stalled.
+
+    Callers that know when the run actually ended (profile durations, metrics
+    mtime) should pass it. Falls back to the last event, which is correct only
+    when the run ended ON a transition.
+    """
     from .logview import TimelineRecorder, export_gantt
 
     records = _fetch_run_events(cfg, run_id)
     if not records:
         return {"png": None, "events": None}
-    now = max(r["ts"] for r in records)
+    now = max(max(r["ts"] for r in records), end_ts or 0.0)
     rec = TimelineRecorder.from_events(records, now)
     where = export_gantt(rec, run_id, now, out_dir=out_dir, local_only=True, records=records)
     return {"png": where[0], "events": where[1] if len(where) > 1 else None}
@@ -1857,7 +2041,9 @@ def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
 
             if final:
                 # Let this segment finish its remaining budget and write metrics.
-                metrics = _stream_until_metrics(cfg, run_id, profile, logs_key=logs_key)
+                metrics = _stream_until_metrics(
+                    cfg, run_id, profile, logs_key=logs_key, budget=budget
+                )
                 profile.mark("metrics" if metrics is not None else "timeout")
                 profile.from_metrics(metrics)
                 done, iid = iid, None

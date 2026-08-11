@@ -32,6 +32,17 @@ POLL_SECONDS = 3
 # the orchestrator's whole-group-restart watchdog). Generous: a replacement can
 # sit idle a long time between registering and being admitted.
 IDLE_BUDGET_SECONDS = 30 * 60
+# Consecutive torchrun crashes within ONE epoch before this box gives up. A peer
+# death crashes our collective too, so a crash is normal and relaunching is the
+# correct response — but only a few times. Past that the fault is deterministic
+# (the world simply cannot start with this config) and retrying just re-pays the
+# boot + dataset download on every node, forever, at full fleet cost. Resets on
+# every epoch change, because a new membership deserves a fresh verdict.
+MAX_EPOCH_CRASHES = 5
+# Ceiling on the exponential backoff between relaunches. Kept small: the common
+# crash IS a preemption, and this delay lands directly in recovery time, which is
+# the headline number the whole spot thesis is measured on.
+RELAUNCH_BACKOFF_CAP = 30.0
 
 
 def _log(msg: str) -> None:
@@ -174,6 +185,21 @@ def run(
     # so "realized the world changed" still fires when our torchrun crashed on the
     # peer's death BEFORE the shrunk epoch was published — the common preempt path)
     idle_deadline = time.monotonic() + idle_budget
+    # Consecutive crashes WITHIN one epoch, and the earliest time we may relaunch.
+    # Relaunching a crashed torchrun is right for a transient fault, but a
+    # DETERMINISTIC one (bad env, a config the world can never start with) turns
+    # into a hot retry loop: every node rebuilds, re-downloads, re-fails, every
+    # POLL_SECONDS. That is what an 8-node world does at ~$8/hr while making no
+    # progress — the failure mode that burned an 8-node leg through 6 identical
+    # relaunches before it was killed by hand. Back off, then give up and let the
+    # box exit so the orchestrator's own teardown reclaims it.
+    epoch_crashes = 0
+    # The epoch those crashes belong to. Tracked SEPARATELY from running_epoch,
+    # which the crash path resets to -1 — using that as "the epoch changed" would
+    # make every crash look like a fresh membership and silently zero the counter,
+    # restoring the infinite loop this guard exists to stop.
+    crash_epoch = -1
+    relaunch_after = 0.0
     try:
         while True:
             if s3_store.read_bytes(metrics_uri) is not None:
@@ -213,7 +239,28 @@ def run(
                     _log(f"node {node_index}: killed for epoch {epoch}")
                     kill_tree(proc)
                     proc = None
-                if proc is None or epoch_changed:
+                if crash_epoch != -1 and epoch != crash_epoch:
+                    # A genuinely NEW epoch: the world changed, so earlier crashes
+                    # say nothing about whether THIS membership can run (a world
+                    # that fails at 8 nodes may be exactly what succeeds at 7).
+                    epoch_crashes = 0
+                    crash_epoch = -1
+                    relaunch_after = 0.0
+                if (proc is None or epoch_changed) and time.monotonic() >= relaunch_after:
+                    if epoch_crashes >= MAX_EPOCH_CRASHES:
+                        _log(
+                            f"node {node_index}: {epoch_crashes} consecutive torchrun crashes in "
+                            f"epoch {epoch} — giving up so this box stops burning; "
+                            "the orchestrator reaps the fleet"
+                        )
+                        events.emit(
+                            "failed",
+                            by="sidecar",
+                            node=node_index,
+                            epoch=epoch,
+                            cause=f"crash-loop:{epoch_crashes}",
+                        )
+                        return 2
                     _log(
                         f"node {node_index}: entering epoch {epoch} as rank {rank}/{node_count} "
                         f"(master {master_addr}:{master_port})"
@@ -237,7 +284,19 @@ def run(
                     # collective) — the supervisor will publish the next epoch;
                     # drop the corpse and let the epoch-change branch relaunch.
                     code = proc.poll()
-                    _log(f"node {node_index}: torchrun exited {code} in epoch {epoch}")
+                    epoch_crashes += 1
+                    crash_epoch = epoch
+                    # Exponential backoff, capped. A peer death (the expected
+                    # cause) is resolved by the next epoch doc within a poll or
+                    # two, so the first retry stays fast and only a genuine crash
+                    # loop slows down — recovery time is what preemption costs us,
+                    # and we must not inflate it to guard against a rarer bug.
+                    delay = min(RELAUNCH_BACKOFF_CAP, POLL_SECONDS * (2 ** (epoch_crashes - 1)))
+                    relaunch_after = time.monotonic() + delay
+                    _log(
+                        f"node {node_index}: torchrun exited {code} in epoch {epoch} "
+                        f"(crash {epoch_crashes}/{MAX_EPOCH_CRASHES}, retry in {delay:.0f}s)"
+                    )
                     events.emit(
                         "provisioning",
                         by="sidecar",
@@ -265,11 +324,42 @@ def run(
             kill_tree(proc)
 
 
+def prewarm_dataset(node_index: int) -> None:
+    """Pull the corpus BEFORE announcing this box, so registration means
+    "I can train" rather than "this instance exists".
+
+    Measured on a 4-node preemption: the supervisor admitted a replacement the
+    moment it appeared, at t+448s, but that box could not take a step until
+    t+662s because it was still pulling a 17 GB train.bin — the survivors tore
+    down their world-3 collective and idled 214s (3 x 214 = 642 node-seconds)
+    waiting for it. Doing the pull first costs nothing extra: it is the same
+    download, moved ahead of the announcement instead of behind it.
+
+    Best-effort. A failure here must NOT stop the box: the trainer calls the
+    same idempotent function and will retry, and a node that registers slightly
+    early is the behaviour we already had."""
+    data_uri = os.environ.get("DATA_URI", "")
+    data_dir = os.environ.get("DATA_LOCAL_DIR", "")
+    if not data_uri or not data_dir:
+        return
+    started = time.monotonic()
+    try:
+        from spot_train.data import ensure_dataset
+
+        ensure_dataset(data_dir, data_uri)
+        _log(
+            f"node {node_index}: dataset ready in {time.monotonic() - started:.1f}s (pre-register)"
+        )
+    except Exception as exc:  # noqa: BLE001 — the trainer retries; never block boot
+        _log(f"node {node_index}: dataset prewarm failed ({exc}) — trainer will retry")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="orchestrator.sidecar")
     ap.add_argument("--run-uri", required=True, help="s3://bucket/runs/<run_id> (or a local dir)")
     ap.add_argument("--node-index", type=int, required=True)
     args = ap.parse_args()
+    prewarm_dataset(args.node_index)
     register(args.run_uri, args.node_index)
     sys.exit(run(args.run_uri, args.node_index))
 
