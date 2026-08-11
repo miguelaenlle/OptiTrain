@@ -1217,6 +1217,330 @@ def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
     return results
 
 
+def _preempt_stats(profile: RunProfile) -> dict:
+    """Preemption cost read off the profile marks/samples. The supervisor emits
+    kill -> shrink_resume -> relaunch -> full_world per round, so recovery (world
+    back to full) = full_world - kill and the degraded window (training at the
+    shrunken world) = full_world - shrink_resume. ``min_world`` is the smallest
+    world size any step actually ran at — the depth of the dip."""
+    first: dict[str, float] = {}
+    for e in profile.events:
+        first.setdefault(e.event, e.t_wall)
+
+    def gap(a: str, b: str) -> float | None:
+        return round(first[b] - first[a], 1) if a in first and b in first else None
+
+    worlds = [s.world_size for s in profile.samples if s.world_size]
+    return {
+        "killed": sum(1 for e in profile.events if e.event == "kill"),
+        "min_world": min(worlds) if worlds else None,
+        "recovery_s": gap("kill", "full_world"),
+        "degraded_s": gap("shrink_resume", "full_world"),
+    }
+
+
+def run_scaling_preempt(cfg: OrchestratorConfig) -> list[dict]:
+    """ONE command: 2- vs 4-node TIME-TO-TARGET-LOSS while HALF of each world is
+    PREEMPTED 60s in. The preemption twin of `scaling-clean`: same model / data /
+    seed / constant-global-batch recipe, same sequential-run structure and report.
+    The ONLY differences are (1) a kill schedule that terminates the top half of
+    each world PREEMPT_AT_SECONDS after training starts — then replaces the boxes so
+    the world grows back — and (2) a 2x-larger default wall-clock cap (960s), since
+    a run that eats a preemption + recovery needs the headroom to still reach target.
+
+    The orchestrator is held CONSTANT: this reuses the same epoch supervisor and the
+    `_run_supervised` kill path that `multinode-preempt` drives. It's a test harness,
+    not new control-plane code — the only knob it turns is the kill schedule.
+
+    Two modes mirror `scaling-clean`: with TARGET_LOSS set, speedup = time-to-target
+    (now INCLUSIVE of preemption downtime + recompute — that's the point); WITHOUT
+    it, THROUGHPUT mode (steady-state ms/step, with the recovery dip still visible in
+    the timeline). Every NODE_COUNTS entry must be >= 2 — you can't preempt half a
+    1-node world and keep a survivor, and the supervisor is 2+-node only."""
+    target = float(os.environ.get("TARGET_LOSS", "0") or "0")
+    throughput_only = target <= 0
+    node_counts = [int(x) for x in os.environ.get("NODE_COUNTS", "2,4").split(",") if x.strip()]
+    if not node_counts or min(node_counts) < 2:
+        raise SystemExit(
+            "scaling-preempt needs every NODE_COUNTS entry >= 2 (half a 1-node world "
+            "leaves no survivor, and the epoch supervisor is 2+-node only). Use "
+            "`scaling-clean` for the 1-node baseline."
+        )
+
+    # vCPU-quota guard (before any env mutation): the WIDEST run must fit the quota.
+    per_box = cfg.instance_vcpu_count()
+    widest = max(node_counts) * per_box
+    if widest > cfg.vcpu_quota:
+        raise SystemExit(
+            f"{max(node_counts)} nodes x {per_box} vCPU = {widest} > VCPU_QUOTA="
+            f"{cfg.vcpu_quota}. Raise VCPU_QUOTA (e.g. =32 for your spot G limit) or "
+            "drop the top node count."
+        )
+
+    kill_at = float(os.environ.get("PREEMPT_AT_SECONDS", "60"))  # seconds after train start
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if not throughput_only:
+        os.environ["TARGET_LOSS"] = str(target)  # relayed to boxes for the early stop
+    # Throughput mode: no target to detect, so eval off (a full val pass is pure
+    # overhead) and run to the cap. Target mode keeps fine eval granularity.
+    default_eval = "0" if throughput_only else "25"
+    for k, v in {  # constant global batch is the control — same recipe as scaling-clean
+        "N_LAYER": "12",
+        "N_HEAD": "12",
+        "N_EMBD": "768",
+        "BLOCK_SIZE": "1024",
+        "GLOBAL_BATCH_SIZE": "64",
+        "EVAL_INTERVAL_STEPS": default_eval,
+        "DROPOUT": "0.0",
+        "LEARNING_RATE": "6e-4",
+        "MIN_LR": "6e-5",
+        "WARMUP_STEPS": "100",
+        "LR_DECAY_STEPS": "50000",
+        "GRAD_CLIP": "1.0",
+        "SAMPLE_INTERVAL_STEPS": "0",
+        "MAX_STEPS": "1000000",  # the wall-clock cap (below) is the real stop
+    }.items():
+        os.environ.setdefault(k, v)
+    os.environ.setdefault("WANDB_GROUP", f"scaling-preempt-{stamp}")
+    market = os.environ.get("MARKET", "spot")  # spot by default (OD quota is tight)
+    cfg.batch_size = int(os.environ.get("BATCH_SIZE", "4"))  # per-rank micro; global constant
+    # 2x the clean cap (960s / 16 min): a run that loses half its world and recovers
+    # needs headroom to still reach target. Conservative on purpose.
+    cap_s = int(os.environ.get("SCALING_CAP_SECONDS", "960"))
+    # NB: DON'T sparsen checkpoints here (scaling-clean does) — _run_supervised
+    # tightens the interval to preempt_checkpoint_seconds for any non-empty kill
+    # schedule, so the t+60s kill loses ~no work.
+
+    recipe = {
+        "stamp": stamp,
+        "target": target,
+        "throughput_only": throughput_only,
+        "market": market,
+        "instance": cfg.instance_type,
+        "model": f"{os.environ['N_LAYER']}L-{os.environ['N_EMBD']}d-{os.environ['BLOCK_SIZE']}ctx",
+        "dataset": cfg.dataset,
+        "global_batch": os.environ["GLOBAL_BATCH_SIZE"],
+        "eval_interval": os.environ["EVAL_INTERVAL_STEPS"],
+        "cap_s": cap_s,
+        "kill_at": kill_at,
+        "node_counts": ",".join(map(str, node_counts)),
+    }
+    out_dir = os.path.abspath(f"reports/scaling-preempt-{stamp}")
+    os.makedirs(f"{out_dir}/runs", exist_ok=True)
+    print(
+        f"\n\033[1m⚠️  BILLABLE: {len(node_counts)} SEQUENTIAL {market} runs "
+        f"({recipe['node_counts']} nodes of {cfg.instance_type}, peak {widest} vCPU), "
+        f"each <= {cap_s}s — HALF of each world killed at t+{int(kill_at)}s.\033[0m\n"
+        f"[scaling-preempt] recipe: {recipe}\n[scaling-preempt] report dir: {out_dir}",
+        file=sys.stderr,
+    )
+
+    results: list[dict] = []
+    for nodes in node_counts:
+        label = f"{nodes}n"
+        cfg.node_count = nodes
+        # Kill the TOP half of the world (indices n//2 .. n-1) simultaneously at
+        # t+kill_at, keeping node 0 (master) + the lower half alive. replace_on_loss
+        # then grows the world back so the run can still finish.
+        victims = list(range(nodes // 2, nodes))
+        kill_schedule = [(kill_at, v) for v in victims]
+        print(
+            f"\n[scaling-preempt] === {label} (nodes={nodes}, "
+            f"kill {victims} @ t+{int(kill_at)}s) ===",
+            file=sys.stderr,
+        )
+        try:
+            profile, _m = _run_supervised(
+                cfg,
+                kind="multinode-preempt",
+                budget=cap_s,
+                replace_on_loss=True,
+                kill_schedule=kill_schedule,
+                return_profile=True,
+            )
+            analysis = _analyze_target(profile, target)
+            tput = _run_throughput(profile)
+            preempt = _preempt_stats(profile)
+            art = _render_run_timeline(cfg, profile.run_id, f"{out_dir}/runs")
+            valcurve = _val_curve_png(
+                profile, analysis, f"{out_dir}/runs/{profile.run_id}-valcurve.png"
+            )
+            results.append(
+                {
+                    "label": label,
+                    "nodes": nodes,
+                    "victims": victims,
+                    "run_id": profile.run_id,
+                    "instance": cfg.instance_type,
+                    "market": market,
+                    "ms_per_step": tput["ms_per_step"],
+                    "tok_per_s": tput["tok_per_s"],
+                    "run_time_s": tput["run_time_s"],
+                    "analysis": analysis,
+                    "preempt": preempt,
+                    "cost": round(profile.cost_now(), 4),
+                    "wandb": getattr(profile._wb, "url", None) if profile._wb else None,
+                    "png": art["png"],
+                    "events": art["events"],
+                    "valcurve": valcurve,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad run must not sink the sweep
+            print(f"[scaling-preempt] {label} FAILED: {exc}", file=sys.stderr)
+            results.append(
+                {
+                    "label": label,
+                    "nodes": nodes,
+                    "victims": victims,
+                    "run_id": "-",
+                    "instance": cfg.instance_type,
+                    "market": market,
+                    "ms_per_step": None,
+                    "tok_per_s": None,
+                    "run_time_s": None,
+                    "analysis": {"reached": False, "why": f"run failed: {exc}"},
+                    "preempt": {},
+                    "cost": 0.0,
+                    "wandb": None,
+                    "png": None,
+                    "events": None,
+                    "valcurve": None,
+                }
+            )
+        _write_scaling_preempt_report(f"{out_dir}/summary.txt", results, recipe)
+        print(f"[scaling-preempt] {label} done → {out_dir}/summary.txt", file=sys.stderr)
+
+    print(f"\n\033[1m[scaling-preempt] DONE → {out_dir}/summary.txt\033[0m", file=sys.stderr)
+    with open(f"{out_dir}/summary.txt") as f:
+        print(f.read())
+    return results
+
+
+def _write_scaling_preempt_report(path: str, results: list[dict], recipe: dict) -> None:
+    """Summary for the 2/4-node PREEMPTED sweep (half the world killed at
+    t+kill_at, then replaced). Same speedup math as the clean sweep —
+    base_metric / this_metric, efficiency vs the ideal node ratio — but
+    time-to-target now INCLUDES the preemption downtime + recompute, and a per-run
+    PREEMPTION block reports how deep the world dipped and how long recovery took."""
+    throughput = recipe.get("throughput_only")
+
+    def by_nodes(n: int) -> dict | None:
+        return next((x for x in results if x["nodes"] == n), None)
+
+    def metric(r: dict | None) -> float | None:
+        """The lower-is-faster number that drives the speedup, per mode."""
+        if r is None:
+            return None
+        if throughput:
+            return r.get("ms_per_step")
+        return r["analysis"].get("time_to_target_s") if r["analysis"].get("reached") else None
+
+    base = by_nodes(min(r["nodes"] for r in results))  # fewest nodes = baseline
+    base_n = base["nodes"] if base else 2
+    base_m = metric(base)
+
+    if throughput:
+        header = [
+            f"Scaling sweep (PREEMPTED, THROUGHPUT / ms-per-step) — {recipe['stamp']}",
+            "=" * 72,
+            "",
+            f"half of each world killed at t+{int(recipe['kill_at'])}s (then replaced); each run",
+            "trains to the wall-clock cap. speedup = steady-state ms/step vs the baseline.",
+        ]
+        speed_title = f"THROUGHPUT vs {base_n} node(s)   (ms/step; lower = faster)"
+    else:
+        header = [
+            f"Scaling sweep (PREEMPTED, time to target loss) — {recipe['stamp']}",
+            "=" * 72,
+            "",
+            f"target val_loss <= {recipe['target']}. HALF of each world is killed at "
+            f"t+{int(recipe['kill_at'])}s",
+            "(then replaced). time-to-target = wall-clock from the first training step to",
+            "the first eval at or below target — INCLUDING preemption downtime + recompute.",
+        ]
+        speed_title = f"SPEEDUP vs {base_n} node(s)   (under preemption)"
+
+    lines = [
+        *header,
+        "",
+        "Control: identical model/data/seed + CONSTANT global batch "
+        f"(GLOBAL_BATCH_SIZE={recipe['global_batch']}). Sequential {recipe['market']} runs on",
+        f"{recipe['instance']}, model {recipe['model']}, dataset {recipe['dataset']}, "
+        f"per-run cap {recipe['cap_s']}s.",
+        "",
+        speed_title,
+        "-" * 72,
+    ]
+    if base_m is None:
+        why = "no ms/step samples" if throughput else "did not reach target (raise cap or target)"
+        lines.append(f"  {base_n}-node has no baseline metric — {why}.")
+    else:
+        for n in sorted({r["nodes"] for r in results}):
+            r = by_nodes(n)
+            m = metric(r)
+            ms = r.get("ms_per_step") if r else None
+            tok = r.get("tok_per_s") if r else None
+            if m is None:
+                lines.append(f"  {n}n: INCONCLUSIVE (no metric)  {ms} ms/step")
+                continue
+            sp = base_m / m if m else float("inf")
+            eff = sp / (n / base_n) * 100 if n else 0
+            unit = f"{m} ms/step" if throughput else f"{m}s to target ({ms} ms/step)"
+            lines.append(
+                f"  {n}n: {unit}   {tok} tok/s   {sp:.2f}x vs {base_n}n   "
+                f"efficiency {eff:.0f}% (ideal {n / base_n:.0f}x)"
+            )
+
+    # Target mode only: constant-global-batch control — steps_to_target must match.
+    if not throughput:
+        steps = {
+            r["nodes"]: r["analysis"].get("steps_to_target")
+            for r in results
+            if r["analysis"].get("reached")
+        }
+        if len({v for v in steps.values() if v}) > 1:
+            lines += [
+                "",
+                f"⚠️  CONTROL CHECK: steps_to_target differ across node counts ({steps})",
+                "   — constant-global-batch control imperfect; speedups are approximate.",
+            ]
+
+    lines += ["", "PREEMPTION (recovery cost per run)", "-" * 72]
+    for r in sorted(results, key=lambda x: x["nodes"]):
+        p = r.get("preempt") or {}
+        lines.append(
+            f"  {r['label']}: killed {p.get('killed', '?')} node(s) "
+            f"(victims {r.get('victims')})   world dipped to {p.get('min_world', '?')}   "
+            f"recovery {p.get('recovery_s', '?')}s   degraded {p.get('degraded_s', '?')}s"
+        )
+
+    lines += ["", "PER-RUN", "-" * 72]
+    for r in sorted(results, key=lambda x: x["nodes"]):
+        a = r["analysis"]
+        lines += [
+            f"[{r['label']}]  run_id={r['run_id']}  nodes={r['nodes']}",
+            f"    hardware: {r['nodes']}x {r.get('instance', '?')} ({r.get('market', '?')})    "
+            f"ms/step: {r.get('ms_per_step', '?')}    tok/s: {r.get('tok_per_s', '?')}    "
+            f"run time: {r.get('run_time_s', '?')}s",
+        ]
+        if not throughput:
+            if a.get("reached"):
+                detail = (
+                    f"  step {a['target_step']}  hit_val {a['hit_val']}  "
+                    f"time_to_target {a['time_to_target_s']}s"
+                )
+            else:
+                detail = f"  ({a.get('why', 'target not reached — raise cap or target')})"
+            lines.append(f"    target: {'HIT' if a.get('reached') else 'NOT REACHED'}{detail}")
+        lines += [
+            f"    cost: ${r['cost']}    wandb: {r['wandb'] or '(disabled)'}",
+            f"    gantt: {r['png']}    events: {r['events']}    valcurve: {r['valcurve']}",
+            "",
+        ]
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def _calibration_sizing(profile: RunProfile, cap_s: int, global_batch: int, block: int) -> dict:
     """Turn a single-GPU probe profile into experiment sizing: measured 1-GPU
     throughput, projected steps for 2-/4-node at the cap (per-step scales ~world
@@ -1297,9 +1621,7 @@ def run_calibrate(cfg: OrchestratorConfig) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     if sizing.get("ok"):
         p = sizing["proj_steps_at_cap"]
-        last_val_step = (
-            max(v.step for v in profile.val_samples) if profile.val_samples else "?"
-        )
+        last_val_step = max(v.step for v in profile.val_samples) if profile.val_samples else "?"
         lines = [
             f"Calibration probe — {profile.run_id}  (GPT-2-small, block {block}, "
             f"global batch {global_batch})",

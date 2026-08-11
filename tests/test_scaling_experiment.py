@@ -218,6 +218,89 @@ def test_scaling_clean_vcpu_guard(monkeypatch):
         experiments.run_scaling_clean(cfg)
 
 
+def _preempt_result(label, nodes, t, victims, preempt, reached=True, ms=None):
+    r = _clean_result(label, nodes, t, reached=reached, ms=ms)
+    r["victims"] = victims
+    r["preempt"] = preempt
+    return r
+
+
+_PREEMPT_RECIPE = {**_CLEAN_RECIPE, "throughput_only": False, "kill_at": 60.0, "node_counts": "2,4"}
+
+
+def test_preempt_stats_reads_recovery_from_marks():
+    from orchestrator.profile import Event
+
+    p = RunProfile("mp", kind="multinode-preempt", market="spot")
+    # kill -> shrink_resume -> relaunch -> full_world; two kills (half of a 4-node
+    # world) fire together, so `killed` counts both but recovery spans from the first.
+    p.events = [
+        Event("launch", 100.0, 0),
+        Event("kill", 160.0, 0),
+        Event("kill", 160.0, 0),
+        Event("shrink_resume", 175.0, 0),
+        Event("relaunch", 180.0, 1),
+        Event("full_world", 210.0, 1),
+    ]
+    p.samples = [
+        Sample(step=1, loss=1.0, ms_per_step=80, tok_s=1000, t_rel=10, world_size=4),
+        Sample(step=2, loss=1.0, ms_per_step=80, tok_s=1000, t_rel=70, world_size=2),  # dip
+        Sample(step=3, loss=1.0, ms_per_step=80, tok_s=1000, t_rel=120, world_size=4),
+    ]
+    stats = experiments._preempt_stats(p)
+    assert stats["killed"] == 2
+    assert stats["min_world"] == 2
+    assert stats["recovery_s"] == 50.0  # full_world - first kill
+    assert stats["degraded_s"] == 35.0  # full_world - shrink_resume
+
+
+def test_preempt_stats_missing_marks_are_none():
+    # A run that never lost a node (or died before recovering) yields no gaps.
+    p = RunProfile("mp", kind="multinode-preempt", market="spot")
+    stats = experiments._preempt_stats(p)
+    assert stats == {"killed": 0, "min_world": None, "recovery_s": None, "degraded_s": None}
+
+
+def test_scaling_preempt_report_speedup_and_preemption_block(tmp_path):
+    results = [
+        _preempt_result(
+            "2n",
+            2,
+            300.0,
+            [1],
+            {"killed": 1, "min_world": 1, "recovery_s": 40.0, "degraded_s": 25.0},
+        ),
+        _preempt_result(
+            "4n",
+            4,
+            180.0,
+            [2, 3],
+            {"killed": 2, "min_world": 2, "recovery_s": 55.0, "degraded_s": 30.0},
+        ),
+    ]
+    path = str(tmp_path / "summary.txt")
+    experiments._write_scaling_preempt_report(path, results, _PREEMPT_RECIPE)
+    with open(path) as f:
+        body = f.read()
+    # baseline is the SMALLEST node count (2n), not 1n
+    assert "SPEEDUP vs 2 node(s)   (under preemption)" in body
+    assert "INCLUDING preemption downtime" in body
+    assert "180.0s to target" in body and "1.67x vs 2n" in body  # 300/180
+    # per-run preemption cost block
+    assert "PREEMPTION (recovery cost per run)" in body
+    assert "4n: killed 2 node(s) (victims [2, 3])" in body
+    assert "world dipped to 2" in body and "recovery 55.0s" in body and "degraded 30.0s" in body
+
+
+def test_scaling_preempt_requires_two_nodes(monkeypatch):
+    from orchestrator.config import OrchestratorConfig
+
+    monkeypatch.setenv("NODE_COUNTS", "1,2")  # a 1-node world can't be half-preempted
+    monkeypatch.setenv("VCPU_QUOTA", "32")
+    with pytest.raises(SystemExit, match=">= 2"):
+        experiments.run_scaling_preempt(OrchestratorConfig())
+
+
 def test_calibration_sizing_projects_and_suggests():
     p = RunProfile("cal", kind="calibrate", market="on-demand")
     # 200 ms/step single GPU -> 5 steps/s; a descending val curve for the log fit.

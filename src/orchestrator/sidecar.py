@@ -129,6 +129,20 @@ def kill_tree(proc: subprocess.Popen) -> None:
     subprocess.run(["pkill", "-9", "-f", "spot_train.train"], check=False)
     with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=10)
+    # Wait for the worker processes to ACTUALLY exit before we return — a SIGKILL'd
+    # trainer's ~19GB of GPU memory isn't freed until the process is reaped, and the
+    # sidecar relaunches torchrun within one poll. Relaunching while a dead-but-not-
+    # yet-reaped worker still holds the GPU makes the fresh trainer OOM. Bounded so a
+    # wedged worker can't hang the sidecar forever.
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        left = subprocess.run(
+            ["pgrep", "-f", "spot_train.train"], capture_output=True, text=True
+        ).stdout.split()
+        if not left:
+            return
+        time.sleep(0.5)
+    _log("WARNING: spot_train.train workers still alive after kill — GPU may not be free")
 
 
 def _my_membership(doc: dict, node_index: int) -> tuple[int, int, str, int] | None:
