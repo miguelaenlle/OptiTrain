@@ -1,0 +1,2 @@
+# `go build .` drops the binary here (same convention as loadgen/loadgen).
+/router-go

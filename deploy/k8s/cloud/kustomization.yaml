@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# k3s on EC2: one A10G per g5.xlarge, so exactly one worker pod per node.
+# Images must be linux/amd64 (see deploy/docker/build.sh --cloud) -- an arm64
+# image built on a Mac dies here with "exec format error".
+resources:
+  - ../base
+images:
+  - name: fleet-router
+    newTag: cloud
+  - name: fleet-worker
+    newTag: cloud
+patches:
+  - target: { kind: Deployment, name: fleet-worker }
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env/4/value
+        value: gpt2-xl
+      - op: replace
+        path: /spec/template/spec/containers/0/env/3/value
+        value: cuda
+      # 1 GPU per node => replica count IS node count. There is no packing.
+      - op: add
+        path: /spec/template/spec/containers/0/resources/limits/nvidia.com~1gpu
+        value: 1

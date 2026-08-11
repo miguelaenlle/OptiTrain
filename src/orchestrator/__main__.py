@@ -354,7 +354,7 @@ def main() -> None:
             from .config import OrchestratorConfig
 
             aws.set_dry_run(args.dry_run)
-            cfg = OrchestratorConfig()
+            cfg = OrchestratorConfig.for_inference()
             aws.set_region(cfg.region)
             fleet_preempt.run_fleet_preempt(
                 cfg,
@@ -374,7 +374,7 @@ def main() -> None:
             from . import monitor
             from .config import OrchestratorConfig
 
-            cfg = OrchestratorConfig()
+            cfg = OrchestratorConfig.for_inference()
             url = args.url
             if not url and getattr(args, "local", False):
                 url = fleet.router_url_local()
@@ -411,7 +411,7 @@ def main() -> None:
         from .config import OrchestratorConfig
 
         aws.set_dry_run(args.dry_run)
-        cfg = OrchestratorConfig()
+        cfg = OrchestratorConfig.for_inference()
         aws.set_region(cfg.region)
         if args.fleet_command == "serve":
             fleet.serve_cloud(cfg, run_id=args.run)

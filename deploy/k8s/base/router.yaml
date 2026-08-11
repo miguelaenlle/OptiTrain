@@ -1,0 +1,81 @@
+# Fleet router — the only public entry point.
+#
+# Note what this Service is NOT doing: it does not load-balance across workers.
+# kube-proxy would round-robin at L4 with no retry, so a request in flight to a
+# dying pod is simply lost. Reroute-on-failure is the entire thesis of this
+# fleet, so the router owns worker selection at L7 and Kubernetes owns only
+# placement and lifecycle.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fleet-router
+  labels: { app: fleet-router }
+spec:
+  selector: { app: fleet-router }
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleet-router
+  labels: { app: fleet-router }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: fleet-router }
+  template:
+    metadata:
+      labels: { app: fleet-router }
+    spec:
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        # Must be NUMERIC. The distroless base sets `USER nonroot`, and the
+        # kubelet refuses a non-numeric user under runAsNonRoot because it
+        # cannot verify uid != 0 from a name alone:
+        #   "image has non-numeric user (nonroot), cannot verify user is non-root"
+        # 65532 is distroless's nonroot uid.
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: router
+          image: fleet-router:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            # dns:// => discover workers from the headless Service's A records,
+            # which contain exactly the READY pods. No heartbeat, no S3, no
+            # RBAC. The worker Deployment sets FLEET_WORKERS_URI="" so the
+            # heartbeat path is off on both sides: if the router still sees
+            # workers, Endpoints/DNS is provably the mechanism.
+            - { name: FLEET_WORKERS_URI, value: "dns://fleet-worker:8001" }
+            # Poll cadence bounds how fast a readiness change becomes a routing
+            # change. 1s keeps the DNS poll from dominating the ~4s probe
+            # detection we are actually trying to measure.
+            - { name: ROUTER_POLL_SECONDS, value: "1" }
+            - { name: ROUTER_STATS_POLL_SECONDS, value: "2" }
+            # Fresh dial per upstream attempt. A pooled connection to a pod that
+            # has just died has no SYN to time out, so it would hang the full
+            # read window instead of failing fast and rerouting.
+            - { name: ROUTER_UPSTREAM_KEEPALIVE, value: "false" }
+            - { name: ROUTER_CONNECT_TIMEOUT_SECONDS, value: "3" }
+            - { name: ROUTER_MAX_ATTEMPTS, value: "3" }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: { cpu: "100m", memory: "64Mi" }
+            limits: { memory: "256Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

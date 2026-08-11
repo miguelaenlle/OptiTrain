@@ -1,0 +1,122 @@
+# ServiceMonitor — inference workers.
+#
+# ###########################################################################
+# # THIS FILE INTENTIONALLY CREATES NOTHING TODAY.                          #
+# # `kubectl apply -f servicemonitor-workers.yaml` is a no-op, on purpose.  #
+# ###########################################################################
+#
+# ---------------------------------------------------------------------------
+# WHY: the worker has no Prometheus endpoint
+# ---------------------------------------------------------------------------
+# `src/inference/worker.py` serves exactly four routes:
+#
+#     GET  /healthz        {"ok": true, "worker_id": ..., "model": ...}
+#     GET  /v1/models      OpenAI-shaped model list
+#     GET  /stats          JSON: worker_id, model, device, + stats snapshot
+#                          (requests, queued, tokens_per_second, ...) + gpu_stats
+#     POST /v1/completions the actual inference
+#
+# There is no `/metrics`, and `/stats` is application JSON — NOT the Prometheus
+# text exposition format. Pointing a ServiceMonitor at it produces a target
+# that is permanently DOWN with a parse error, which is the same false-alarm
+# trap that the k3s kubeScheduler/kubeEtcd ServiceMonitors set (see
+# values.yaml §1). So we do not point one at it.
+#
+# ---------------------------------------------------------------------------
+# HOW WORKER METRICS ACTUALLY REACH PROMETHEUS: the router's poll loop
+# ---------------------------------------------------------------------------
+# The router runs a background monitor that GETs `http://<worker>/stats` every
+# `ROUTER_STATS_POLL_SECONDS` (default 2s) for every live worker, then rewrites
+# two per-worker gauges on its OWN registry — `metrics.sync_worker_gauges()`
+# in src/inference/metrics.py, `Metrics.SyncWorkerGauges` in
+# router-go/metrics.go:
+#
+#     fleet_worker_queue_depth{worker_id="..."}        <- /stats "queued"
+#     fleet_worker_tokens_per_second{worker_id="..."}  <- /stats "tokens_per_second"
+#
+# Prometheus therefore learns about workers by scraping the ROUTER. One scrape
+# target, worker identity carried in the `worker_id` label. That is why the
+# dashboard's per-worker panels query `fleet_worker_*` with no worker job.
+#
+# Two consequences worth knowing before you read those panels:
+#
+#   1. The gauges are CLEAR-then-SET on every sweep. A worker that vanishes,
+#      or whose /stats scrape fails (`ok=false`), stops being exported within
+#      one sweep instead of freezing at its last value. Good: a dead worker
+#      cannot hold an HPA scaled up. Side effect: with zero live workers the
+#      GaugeVecs have no children, so BOTH client libraries export nothing and
+#      the per-worker panels legitimately read "No data" (see README, "absent
+#      is not zero").
+#   2. The freshness of `fleet_worker_*` is bounded by the router's poll
+#      period (2s) PLUS the Prometheus scrape interval (5s), not by the scrape
+#      interval alone.
+#
+# ---------------------------------------------------------------------------
+# WHAT YOU DO GET ABOUT WORKERS WITHOUT A WORKER SCRAPE
+# ---------------------------------------------------------------------------
+#   * pod CPU / memory / restarts / OOMKills — kubelet + cAdvisor + kube-state-
+#     metrics, already enabled in values.yaml. Works on k3s.
+#   * per-worker request outcomes — fleet_router_upstream_attempts_total has a
+#     `worker_id` label, so "which worker returned transport errors" is
+#     answerable from the router's exposition alone. That is the panel that
+#     names the box that died.
+#   * GPU utilisation is NOT covered. It needs NVIDIA DCGM-exporter as a
+#     DaemonSet on the g5 nodes; that is a separate deliverable and is
+#     deliberately not faked here.
+#
+# ---------------------------------------------------------------------------
+# ENABLE THIS THE DAY THE WORKER SPEAKS PROMETHEUS
+# ---------------------------------------------------------------------------
+# ROADMAP Part 4 swaps the toy worker for vLLM, whose OpenAI server DOES expose
+# a real `/metrics` (vllm:num_requests_waiting, vllm:time_to_first_token_seconds,
+# ...). At that point uncomment the block below, confirm the Service label and
+# port name, and — importantly — decide whether the per-worker panels should
+# switch from the router's re-exported gauges to the worker's own series.
+# Do not run both as the source of truth for the same panel.
+#
+# The selector below is matched against the real Service in
+# deploy/k8s/base/worker.yaml: a HEADLESS Service named `fleet-worker`, labelled
+# `app: fleet-worker`, with a named port `http` on 8001. Headless is fine for a
+# ServiceMonitor — the operator discovers pods through the EndpointSlice, not
+# the clusterIP.
+#
+# Everything between the two markers is pure YAML: strip the leading "# " from
+# each line and it applies as-is.
+#
+# ---8<--- uncomment from here ---8<---
+#
+# apiVersion: monitoring.coreos.com/v1
+# kind: ServiceMonitor
+# metadata:
+#   name: fleet-worker
+#   namespace: monitoring
+#   labels:
+#     release: optitrain
+#     app.kubernetes.io/name: fleet-worker
+#     app.kubernetes.io/part-of: optitrain-inference
+# spec:
+#   jobLabel: app                             # => job="fleet-worker"
+#   namespaceSelector:
+#     any: true
+#   selector:
+#     matchLabels:
+#       app: fleet-worker
+#   endpoints:
+#     - port: http                            # named port on the worker Service
+#       path: /metrics                        # ONLY valid once the worker serves it
+#       interval: 5s
+#       scrapeTimeout: 4s
+#       relabelings:
+#         # The worker Deployment already sets WORKER_ID from the pod name
+#         # (fieldRef: metadata.name), so mapping __meta_kubernetes_pod_name
+#         # onto `worker_id` makes the worker's own series join cleanly against
+#         # the router's re-exported fleet_worker_* gauges. Same identity, same
+#         # label, from two independent sources.
+#         - sourceLabels: [__meta_kubernetes_pod_name]
+#           targetLabel: worker_id
+#           action: replace
+#         - sourceLabels: [__meta_kubernetes_node_name]
+#           targetLabel: node
+#           action: replace
+#
+# ---8<--- to here ---8<---

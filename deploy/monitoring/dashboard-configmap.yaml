@@ -1,0 +1,1340 @@
+# Grafana dashboard, delivered as a ConfigMap.
+#
+# GENERATED — the source of truth is deploy/monitoring/dashboard-fleet.json.
+# Edit that file, then regenerate this one (command in README.md, "Editing the
+# dashboard"). Never edit the JSON inside this ConfigMap by hand, and never
+# edit the dashboard in the Grafana UI: values.yaml sets
+# grafana.sidecar.dashboards.provider.allowUiUpdates=false, so the file wins on
+# every reconcile and UI edits are silently discarded.
+#
+# The `grafana_dashboard: "1"` label is the whole mechanism. The Grafana
+# sidecar (enabled in values.yaml) watches ConfigMaps in ALL namespaces for
+# that label and writes each data key into Grafana's provisioning directory
+# (/tmp/dashboards). The key name becomes the filename, which is why it is
+# `dashboard-fleet.json` — values.yaml points
+# grafana.ini's default_home_dashboard_path at exactly that path, so a fresh
+# port-forward lands on this dashboard.
+#
+#   kubectl apply -f deploy/monitoring/dashboard-configmap.yaml
+#
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fleet-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+    app.kubernetes.io/name: fleet-dashboard
+    app.kubernetes.io/part-of: optitrain-inference
+data:
+  dashboard-fleet.json: |-
+    {
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
+      },
+      "description": "OptiTrain inference fleet. Four rows, four claims: at-a-glance, FAST, RELIABLE, SCALABLE & COST. Every query reads only metrics declared in src/inference/metrics.py (and mirrored verbatim in router-go/metrics.go). Counter panels use `or vector(0)` because client_golang omits zero-child metric families - see the panel descriptions and deploy/monitoring/README.md.",
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+          "id": 1,
+          "panels": [],
+          "title": "Fleet at a glance",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "Workers whose heartbeat is inside the router's TTL (default 15s), straight off `fleet_router_live_workers`.\n\n`max()` and not `sum()`: if an A/B leaves two routers running they each report the same fleet, and summing would double the count.\n\n`or vector(0)` keeps this at 0 rather than 'No data' - the gauge itself is exported by both client libraries even with no workers, but the selector can still match nothing before the first scrape.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "#3987e5" },
+              "decimals": 0,
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3987e5", "value": null }] },
+              "unit": "none"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+          "id": 2,
+          "options": {
+            "colorMode": "none",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "max(fleet_router_live_workers{job=~\"$job\"}) or vector(0)",
+              "instant": false,
+              "legendFormat": "Live workers",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Live workers",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "Requests a worker actually answered, per second: outcome `ok` (first try) + `rerouted` (retried onto a healthy worker). Both are successes from the client's point of view.\n\n`fleet_router_requests_total` is a CounterVec, so a freshly restarted Go router exports NOTHING for it - `or vector(0)` is what stops this tile reading 'No data' after every deploy.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "#3987e5" },
+              "decimals": 1,
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3987e5", "value": null }] },
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 5, "w": 4, "x": 4, "y": 1 },
+          "id": 3,
+          "options": {
+            "colorMode": "none",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(rate(fleet_router_requests_total{job=~\"$job\", outcome=~\"ok|rerouted\"}[$rate_window])) or vector(0)",
+              "instant": false,
+              "legendFormat": "Served",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Served",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "End-to-end p99 from `fleet_router_request_duration_seconds` - router-observed, retries included.\n\nThe histogram is a plain (non-vector) Histogram, so BOTH client libraries always export it; the absent-as-zero trap does not apply here. What DOES happen with no traffic is `histogram_quantile` over all-zero buckets returning NaN, which draws a gap. That gap is honest: no observations means there is no latency to report, and faking it as 0 would claim a 0ms p99.\n\nBuckets are hand-chosen for token generation (50ms -> 60s, resolving the 0.5-5s band); +Inf means a request burned its whole retry budget or hit REQUEST_TIMEOUT_SECONDS.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "#86b6ef" },
+              "decimals": 3,
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#86b6ef", "value": null }] },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 5, "w": 4, "x": 8, "y": 1 },
+          "id": 4,
+          "options": {
+            "colorMode": "none",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(fleet_router_request_duration_seconds_bucket{job=~\"$job\"}[$rate_window])))",
+              "instant": false,
+              "legendFormat": "p99",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "p99 latency",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "p99 as a percentage of the SLO budget - the meter form, so the judgement does not depend on knowing what 1.8s means.\n\nSLO is defined once in docs/inference-platform-plan.md section 5 as p99 <= 3 x L0 (L0 = unloaded single-request p50). Set the `SLO p99 (s)` variable at the top of this dashboard to 3 x your measured L0; the thresholds here are budget-relative (green < 80%, amber 80-100%, red over budget) so they stay correct whatever you set it to.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "decimals": 0,
+              "mappings": [],
+              "max": 150,
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "#0ca30c", "value": null },
+                  { "color": "#fab219", "value": 80 },
+                  { "color": "#d03b3b", "value": 100 }
+                ]
+              },
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 5, "w": 4, "x": 12, "y": 1 },
+          "id": 5,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "(histogram_quantile(0.99, sum by (le) (rate(fleet_router_request_duration_seconds_bucket{job=~\"$job\"}[$rate_window]))) / $slo_p99_seconds) * 100",
+              "instant": false,
+              "legendFormat": "p99 / SLO",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "p99 vs SLO budget",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "Requests over the selected time range that were served only after the router retried onto another worker.\n\nThis is the fault-tolerance receipt. The plan wants it > 0 during a chaos run (it proves the reroute path actually fired) and it should sit next to a client-visible error count of exactly 0. Amber above zero because the fleet was degraded, not broken.\n\n`or vector(0)` because a restarted Go router omits the counter family entirely.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "decimals": 0,
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "#c3c2b7", "value": null },
+                  { "color": "#fab219", "value": 1 }
+                ]
+              },
+              "unit": "none"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 5, "w": 4, "x": 16, "y": 1 },
+          "id": 6,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(increase(fleet_router_requests_total{job=~\"$job\", outcome=\"rerouted\"}[$__range])) or vector(0)",
+              "instant": true,
+              "legendFormat": "Rerouted",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Rerouted (range)",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "Requests over the selected time range where the client got a 5xx - no worker answered, retry budget exhausted.\n\nTarget from docs/inference-platform-plan.md section 5: EXACTLY 0 during a kill. A 4xx is deliberately NOT counted here (outcome `ok`): the router did its job, the request was bad. 4xx still shows up on the upstream-failures panel below, so it is never invisible.\n\nGreen at 0, red at anything else - and `or vector(0)` so a cold router reads a truthful green 0 instead of 'No data'.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "decimals": 0,
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "#0ca30c", "value": null },
+                  { "color": "#d03b3b", "value": 1 }
+                ]
+              },
+              "unit": "none"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 5, "w": 4, "x": 20, "y": 1 },
+          "id": 7,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(increase(fleet_router_requests_total{job=~\"$job\", outcome=\"failed\"}[$__range])) or vector(0)",
+              "instant": true,
+              "legendFormat": "Failed",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Client-visible errors (range)",
+          "type": "stat"
+        },
+        {
+          "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+          "id": 10,
+          "panels": [],
+          "title": "FAST - is the fleet answering, and how quickly?",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "Emphasis form: Served is the point, Offered is context, Failed is the exception.\n\n`Offered` here is SERVER-side - requests the router finished, whatever the outcome. It is not client-offered load: requests the client dropped because it could not find a free slot never reach the router and never appear here. The plan's reporting rule is explicit about this - quote loadgen for offered load and this panel for served load, and say which one you are quoting.\n\nAll three queries carry `or vector(0)`: `fleet_router_requests_total` is a CounterVec and client_golang omits families with no children, so a router that has served nothing since restart exports nothing at all.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "requests / s",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 8,
+                "scaleDistribution": { "type": "linear" },
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": { "group": "A", "mode": "none" },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3987e5", "value": null }] },
+              "unit": "reqps"
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "Offered (router-completed)" },
+                "properties": [
+                  { "id": "color", "value": { "fixedColor": "#898781", "mode": "fixed" } },
+                  { "id": "custom.lineWidth", "value": 1 }
+                ]
+              },
+              {
+                "matcher": { "id": "byName", "options": "Served" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#3987e5", "mode": "fixed" } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "Failed (5xx to client)" },
+                "properties": [
+                  { "id": "color", "value": { "fixedColor": "#d03b3b", "mode": "fixed" } },
+                  { "id": "custom.fillOpacity", "value": 12 }
+                ]
+              }
+            ]
+          },
+          "gridPos": { "h": 8, "w": 10, "x": 0, "y": 7 },
+          "id": 11,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(rate(fleet_router_requests_total{job=~\"$job\"}[$rate_window])) or vector(0)",
+              "legendFormat": "Offered (router-completed)",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(rate(fleet_router_requests_total{job=~\"$job\", outcome=~\"ok|rerouted\"}[$rate_window])) or vector(0)",
+              "legendFormat": "Served",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(rate(fleet_router_requests_total{job=~\"$job\", outcome=\"failed\"}[$rate_window])) or vector(0)",
+              "legendFormat": "Failed (5xx to client)",
+              "range": true,
+              "refId": "C"
+            }
+          ],
+          "title": "Request rate - offered vs served",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "p50 / p95 / p99 from `fleet_router_request_duration_seconds_bucket`. The three lines are one hue in ordered lightness steps, not three unrelated colours: percentiles are an ordinal scale, and the lightest (most prominent) step is p99 because p99 is the one you are watching.\n\nThe dashed red line is the SLO budget (`SLO p99 (s)` variable), drawn with `vector()` so it renders even with zero traffic and moves when you change the variable.\n\nGaps with no traffic are correct: `histogram_quantile` over all-zero buckets is NaN. That is genuinely 'no observations', not the client_golang absent-counter trap - see the p99 tile description.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "seconds",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 8,
+                "scaleDistribution": { "type": "linear" },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": { "group": "A", "mode": "none" },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3987e5", "value": null }] },
+              "unit": "s"
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "p50" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#184f95", "mode": "fixed" } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "p95" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#2a78d6", "mode": "fixed" } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "p99" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#86b6ef", "mode": "fixed" } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "SLO - p99 budget" },
+                "properties": [
+                  { "id": "color", "value": { "fixedColor": "#d03b3b", "mode": "fixed" } },
+                  { "id": "custom.lineWidth", "value": 1 },
+                  { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } }
+                ]
+              }
+            ]
+          },
+          "gridPos": { "h": 8, "w": 10, "x": 10, "y": 7 },
+          "id": 12,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(fleet_router_request_duration_seconds_bucket{job=~\"$job\"}[$rate_window])))",
+              "legendFormat": "p50",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(fleet_router_request_duration_seconds_bucket{job=~\"$job\"}[$rate_window])))",
+              "legendFormat": "p95",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(fleet_router_request_duration_seconds_bucket{job=~\"$job\"}[$rate_window])))",
+              "legendFormat": "p99",
+              "range": true,
+              "refId": "C"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "vector($slo_p99_seconds)",
+              "legendFormat": "SLO - p99 budget",
+              "range": true,
+              "refId": "D"
+            }
+          ],
+          "title": "Latency p50 / p95 / p99 vs SLO",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "p99 / p50 - tail discipline, independent of how fast the model is.\n\nThe plan's target is < 3x (< 2x excellent). This is the number that warns first: in the X3 sweep the Python router's p99 degraded 12x BEFORE a single error appeared. A rising ratio at a flat p50 means queueing, not a slower model.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "decimals": 2,
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "#0ca30c", "value": null },
+                  { "color": "#fab219", "value": 2 },
+                  { "color": "#d03b3b", "value": 3 }
+                ]
+              },
+              "unit": "none"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 4, "x": 20, "y": 7 },
+          "id": 13,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(fleet_router_request_duration_seconds_bucket{job=~\"$job\"}[$rate_window]))) / histogram_quantile(0.50, sum by (le) (rate(fleet_router_request_duration_seconds_bucket{job=~\"$job\"}[$rate_window])))",
+              "instant": false,
+              "legendFormat": "p99 / p50",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Tail ratio p99 / p50",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "The full latency distribution over time, straight off the histogram buckets - one sequential hue, magnitude only, no identity colours.\n\nThis is the panel that shows WHY the buckets were hand-picked. Prometheus' defaults spend 9 of 14 buckets below 250ms, a band a token-generating request never lands in; these start at 50ms, resolve the 0.5-5s band where nanoGPT completions actually live, and top out at 60s to match REQUEST_TIMEOUT_SECONDS. Traffic appearing in the top row is the alert-worthy signal: those requests burned the whole retry budget.\n\nZero-rate cells are filtered out rather than drawn at the palette's lightest step, so empty time reads as surface and low traffic does not shout.",
+          "fieldConfig": { "defaults": { "custom": { "hideFrom": { "legend": false, "tooltip": false, "viz": false } } }, "overrides": [] },
+          "gridPos": { "h": 9, "w": 24, "x": 0, "y": 15 },
+          "id": 14,
+          "options": {
+            "calculate": false,
+            "cellGap": 2,
+            "cellValues": { "unit": "reqps" },
+            "color": {
+              "exponent": 0.5,
+              "fill": "#3987e5",
+              "mode": "scheme",
+              "reverse": false,
+              "scale": "exponential",
+              "scheme": "Blues",
+              "steps": 64
+            },
+            "exemplars": { "color": "rgba(255,0,255,0.7)" },
+            "filterValues": { "le": 1e-9 },
+            "legend": { "show": true },
+            "rowsFrame": { "layout": "auto", "value": "requests / s" },
+            "showValue": "never",
+            "tooltip": { "mode": "single", "showColorScale": true, "yHistogram": true },
+            "yAxis": { "axisPlacement": "left", "reverse": false, "unit": "s" }
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum by (le) (rate(fleet_router_request_duration_seconds_bucket{job=~\"$job\"}[$rate_window]))",
+              "format": "heatmap",
+              "legendFormat": "{{le}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Latency distribution (router histogram buckets)",
+          "type": "heatmap"
+        },
+        {
+          "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+          "id": 20,
+          "panels": [],
+          "title": "RELIABLE - does a dying worker ever reach the client?",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "The fault-tolerance story in one panel. Amber = the fleet lost a worker mid-request and recovered on its own. Red = it did not, and the client saw a 5xx.\n\nThese two series MEAN good/bad, so they wear status colours rather than series colours. A healthy chaos run looks like: red flat on zero throughout, amber spiking for one TTL window (default 15s) after the kill.\n\nBoth queries carry `or vector(0)` - without it a restarted Go router draws nothing here and 'no reroutes, no errors' is indistinguishable from 'the dashboard is broken'.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "requests / s",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 15,
+                "gradientMode": "none",
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 8,
+                "scaleDistribution": { "type": "linear" },
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": { "group": "A", "mode": "none" },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#fab219", "value": null }] },
+              "unit": "reqps"
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "Rerouted (recovered)" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#fab219", "mode": "fixed" } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "Failed (client saw 5xx)" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#d03b3b", "mode": "fixed" } }]
+              }
+            ]
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 25 },
+          "id": 21,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(rate(fleet_router_requests_total{job=~\"$job\", outcome=\"rerouted\"}[$rate_window])) or vector(0)",
+              "legendFormat": "Rerouted (recovered)",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(rate(fleet_router_requests_total{job=~\"$job\", outcome=\"failed\"}[$rate_window])) or vector(0)",
+              "legendFormat": "Failed (client saw 5xx)",
+              "range": true,
+              "refId": "B"
+            }
+          ],
+          "title": "Reroutes and client-visible errors",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "One level down: individual router -> worker attempts that did not succeed, from `fleet_router_upstream_attempts_total`.\n\nThe successful `result=\"ok\"` series is deliberately NOT plotted here - at 100:1 it would flatten all three failure lines into the axis. Successful throughput is the panel to the left.\n\n`result=\"error\"` (red) is a transport failure: the connection never completed. That is the shape a preempted spot box makes, and it is the series that should spike at the exact moment of a kill while the client-visible error count stays at zero. Note the caveat from X2: a localhost `kill -9` gives an immediate ECONNREFUSED, whereas a terminating EC2 instance black-holes packets, so this series appears faster in a local chaos test than it will in the cloud.\n\nThe metric carries a `worker_id` label - add `by (worker_id)` here when you need to name the box that died.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "attempts / s",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 15,
+                "gradientMode": "none",
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 8,
+                "scaleDistribution": { "type": "linear" },
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": { "group": "A", "mode": "none" },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#fab219", "value": null }] },
+              "unit": "reqps"
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "client_error - 4xx, the request was bad" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#fab219", "mode": "fixed" } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "server_error - worker answered 5xx" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#ec835a", "mode": "fixed" } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "error - transport, worker unreachable" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#d03b3b", "mode": "fixed" } }]
+              }
+            ]
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 25 },
+          "id": 22,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(rate(fleet_router_upstream_attempts_total{job=~\"$job\", result=\"client_error\"}[$rate_window])) or vector(0)",
+              "legendFormat": "client_error - 4xx, the request was bad",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(rate(fleet_router_upstream_attempts_total{job=~\"$job\", result=\"server_error\"}[$rate_window])) or vector(0)",
+              "legendFormat": "server_error - worker answered 5xx",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(rate(fleet_router_upstream_attempts_total{job=~\"$job\", result=\"error\"}[$rate_window])) or vector(0)",
+              "legendFormat": "error - transport, worker unreachable",
+              "range": true,
+              "refId": "C"
+            }
+          ],
+          "title": "Upstream failures by kind (per worker attempt)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "Fleet membership over time - the staircase. Step interpolation, because membership changes at an instant and linear interpolation would invent a fleet of 1.5 workers.\n\nTwo different questions, same unit, one axis:\n  * Live (heartbeat inside TTL) - `fleet_router_live_workers`, what the router will route to.\n  * Answering /stats - `count(fleet_worker_queue_depth)`, how many of those actually returned a stats scrape.\n\nA gap between the two lines is a real and specific failure: a worker whose heartbeat is fresh but whose /stats is timing out. The router will still send it traffic while its queue depth is invisible to the HPA.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "workers",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "insertNulls": false,
+                "lineInterpolation": "stepAfter",
+                "lineWidth": 2,
+                "pointSize": 8,
+                "scaleDistribution": { "type": "linear" },
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": { "group": "A", "mode": "none" },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "decimals": 0,
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3987e5", "value": null }] },
+              "unit": "none"
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "Live (heartbeat inside TTL)" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#3987e5", "mode": "fixed" } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "Answering /stats" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#d95926", "mode": "fixed" } }]
+              }
+            ]
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 25 },
+          "id": 23,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "min", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "max(fleet_router_live_workers{job=~\"$job\"}) or vector(0)",
+              "legendFormat": "Live (heartbeat inside TTL)",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "count(fleet_worker_queue_depth{job=~\"$job\"}) or vector(0)",
+              "legendFormat": "Answering /stats",
+              "range": true,
+              "refId": "B"
+            }
+          ],
+          "title": "Fleet membership (live vs reporting)",
+          "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 },
+          "id": 30,
+          "panels": [],
+          "title": "SCALABLE & COST - where is the work queued, and what does a token cost?",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "Requests waiting behind each worker's generation lock, right now - `fleet_worker_queue_depth`, the metric a prometheus-adapter HPA rule will scale on.\n\nOne hue for every bar on purpose: worker ids are nominal, so length carries magnitude and colour is not spent re-encoding it. Identity lives on the axis label, where it survives a worker joining or leaving without repainting the survivors.\n\n'No data' here is CORRECT when the fleet is empty. The gauge is a GaugeVec that the router clears and rewrites on every /stats sweep, so a worker that vanished stops being exported within one sweep rather than freezing at its last value (a stuck queue depth would otherwise pin an HPA scaled up forever). No workers, no children, no series - see the trend panel to the right for the aggregate, which is zero-filled.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "#3987e5" },
+              "decimals": 0,
+              "mappings": [],
+              "max": 8,
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3987e5", "value": null }] },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 34 },
+          "id": 31,
+          "options": {
+            "displayMode": "basic",
+            "maxVizHeight": 300,
+            "minVizHeight": 16,
+            "minVizWidth": 8,
+            "namePlacement": "auto",
+            "orientation": "horizontal",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "showUnfilled": true,
+            "sizing": "auto",
+            "valueMode": "text"
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "fleet_worker_queue_depth{job=~\"$job\"}",
+              "instant": true,
+              "legendFormat": "{{worker_id}}",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Queue depth by worker (HPA signal)",
+          "type": "bargauge"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "The same signal over time, aggregated, against the scale-up target.\n\nDeepest-queue vs fleet-mean is the load-balance read: they track together when routing is even, and diverge when one worker is doing the work (a hot key, a slow node, or a worker mid-model-load). The dashed line is the `HPA queue target` variable - when the deepest queue lives above it, that is the HPA firing.\n\n`or vector(0)` on both: with no live workers the GaugeVec has no children and BOTH client libraries export nothing, so 'no fleet' would otherwise render identically to 'monitoring is down'.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "requests queued",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 8,
+                "scaleDistribution": { "type": "linear" },
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": { "group": "A", "mode": "none" },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3987e5", "value": null }] },
+              "unit": "short"
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "Deepest worker queue" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#3987e5", "mode": "fixed" } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "Fleet mean" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#d95926", "mode": "fixed" } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "HPA scale-up target" },
+                "properties": [
+                  { "id": "color", "value": { "fixedColor": "#fab219", "mode": "fixed" } },
+                  { "id": "custom.lineWidth", "value": 1 },
+                  { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } }
+                ]
+              }
+            ]
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 34 },
+          "id": 32,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "max(fleet_worker_queue_depth{job=~\"$job\"}) or vector(0)",
+              "legendFormat": "Deepest worker queue",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "avg(fleet_worker_queue_depth{job=~\"$job\"}) or vector(0)",
+              "legendFormat": "Fleet mean",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "vector($hpa_queue_target)",
+              "legendFormat": "HPA scale-up target",
+              "range": true,
+              "refId": "C"
+            }
+          ],
+          "title": "Queue depth over time vs HPA target",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "Everything currently inside the system, split by where it is waiting. Same unit, one axis - never two scales on one plot.\n\n  * In flight (router) - `fleet_router_in_flight`, completions the router is proxying right now.\n  * Queued (workers) - `sum(fleet_worker_queue_depth)`, requests parked behind a generation lock.\n\nIn-flight rising while queued stays flat is the ROUTER saturating (the X3 knee). Queued rising while in-flight is flat is the GPUs saturating - that is the one an HPA can fix by adding pods.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "requests",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 8,
+                "scaleDistribution": { "type": "linear" },
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": { "group": "A", "mode": "none" },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3987e5", "value": null }] },
+              "unit": "short"
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "In flight (router)" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#3987e5", "mode": "fixed" } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "Queued (workers)" },
+                "properties": [{ "id": "color", "value": { "fixedColor": "#d95926", "mode": "fixed" } }]
+              }
+            ]
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 34 },
+          "id": 33,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(fleet_router_in_flight{job=~\"$job\"}) or vector(0)",
+              "legendFormat": "In flight (router)",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(fleet_worker_queue_depth{job=~\"$job\"}) or vector(0)",
+              "legendFormat": "Queued (workers)",
+              "range": true,
+              "refId": "B"
+            }
+          ],
+          "title": "Backlog - in flight vs queued",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "Per-worker decode rate - `fleet_worker_tokens_per_second`, as the worker itself reports it on /stats.\n\nRead it as a HEALTH check, not a throughput meter: it is lifetime completion tokens divided by lifetime generate-seconds, so it measures how fast a worker decodes WHILE decoding, and it does not fall when the worker goes idle. An outlier bar is a real finding - a worker that landed on a slower node, fell back to CPU, or is serving a different checkpoint.\n\nOne hue, magnitude by length, identity on the axis - the same nominal-category rule as the queue-depth panel.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "#3987e5" },
+              "decimals": 1,
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3987e5", "value": null }] },
+              "unit": "suffix:tok/s"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 42 },
+          "id": 34,
+          "options": {
+            "displayMode": "basic",
+            "maxVizHeight": 300,
+            "minVizHeight": 16,
+            "minVizWidth": 8,
+            "namePlacement": "auto",
+            "orientation": "horizontal",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "showUnfilled": true,
+            "sizing": "auto",
+            "valueMode": "text"
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "fleet_worker_tokens_per_second{job=~\"$job\"}",
+              "instant": true,
+              "legendFormat": "{{worker_id}}",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Decode rate by worker",
+          "type": "bargauge"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "Fleet decode capacity: the per-worker rates added up. Near-linear growth as workers join is the SCALABLE claim (the plan's bar is >= 90% efficiency at N=4, >= 80% at N=8).\n\nSame caveat as the per-worker panel - this is a decode RATE, not delivered throughput. It is the ceiling the fleet could sustain if every worker were generating continuously; the delivered number comes from loadgen. Do not quote this as tokens actually served.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "#3987e5" },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "tokens / s",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 12,
+                "gradientMode": "none",
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 8,
+                "scaleDistribution": { "type": "linear" },
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": { "group": "A", "mode": "none" },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "decimals": 1,
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3987e5", "value": null }] },
+              "unit": "suffix:tok/s"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 42 },
+          "id": 35,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "sum(fleet_worker_tokens_per_second{job=~\"$job\"}) or vector(0)",
+              "legendFormat": "Fleet decode rate",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Fleet decode throughput",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "description": "COST FLOOR, and only a floor. Derived, not measured:\n\n  ($ per worker-hour x live workers) / (fleet decode rate x 3600) x 1e6\n\nIt prices tokens as if every worker decoded continuously for the whole hour, so it is the best case the current hardware and batching strategy can reach - the number to beat, not the number to quote. Real $/1M tokens has to include idle time and comes from the E-series runs on g5 (plan section 5). Expect the serialized `_gen_lock` baseline to sit ~10x off market rates; that gap is the argument for continuous batching.\n\nSet `$ per worker-hour` at the top of the dashboard to your instance price (default 1.006 = g5.xlarge on-demand). The denominator is guarded with `> 0` so the tile reads blank rather than infinity when nothing is generating.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "#3987e5" },
+              "decimals": 3,
+              "mappings": [],
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3987e5", "value": null }] },
+              "unit": "currencyUSD"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 42 },
+          "id": 36,
+          "options": {
+            "colorMode": "none",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "editorMode": "code",
+              "expr": "($price_per_worker_hour * max(fleet_router_live_workers{job=~\"$job\"}) * 1000000 / 3600) / (sum(fleet_worker_tokens_per_second{job=~\"$job\"}) > 0)",
+              "instant": false,
+              "legendFormat": "$ / 1M tokens",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "$ / 1M tokens (decode-rate floor)",
+          "type": "stat"
+        }
+      ],
+      "preload": false,
+      "refresh": "10s",
+      "schemaVersion": 39,
+      "tags": ["optitrain", "inference", "fleet"],
+      "templating": {
+        "list": [
+          {
+            "current": { "selected": false, "text": "Prometheus", "value": "prometheus" },
+            "hide": 0,
+            "includeAll": false,
+            "label": "Data source",
+            "multi": false,
+            "name": "datasource",
+            "options": [],
+            "query": "prometheus",
+            "refresh": 1,
+            "regex": "",
+            "skipUrlSync": false,
+            "type": "datasource"
+          },
+          {
+            "allValue": ".*",
+            "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "definition": "label_values(fleet_router_live_workers, job)",
+            "description": "Which router. Pick one arm to compare Go vs Python (E3); leave on All for a single-router fleet.",
+            "hide": 0,
+            "includeAll": true,
+            "label": "Router",
+            "multi": true,
+            "name": "job",
+            "options": [],
+            "query": {
+              "qryType": 1,
+              "query": "label_values(fleet_router_live_workers, job)",
+              "refId": "PrometheusVariableQueryEditor-VariableQuery"
+            },
+            "refresh": 2,
+            "regex": "",
+            "skipUrlSync": false,
+            "sort": 1,
+            "type": "query"
+          },
+          {
+            "current": { "selected": true, "text": "30s", "value": "30s" },
+            "description": "Rate window for every rate() on this dashboard. Prometheus scrapes the router every 5s (servicemonitor-router.yaml), so a rate window needs >= 20s to span four samples. Grafana's $__rate_interval would derive 60s from the datasource's 15s default and smear a 15s reroute burst into a flat minute, so the window is explicit instead.",
+            "hide": 0,
+            "includeAll": false,
+            "label": "Rate window",
+            "multi": false,
+            "name": "rate_window",
+            "options": [
+              { "selected": false, "text": "20s", "value": "20s" },
+              { "selected": true, "text": "30s", "value": "30s" },
+              { "selected": false, "text": "1m", "value": "1m" },
+              { "selected": false, "text": "5m", "value": "5m" }
+            ],
+            "query": "20s,30s,1m,5m",
+            "queryValue": "",
+            "skipUrlSync": false,
+            "type": "custom"
+          },
+          {
+            "current": { "selected": false, "text": "3", "value": "3" },
+            "description": "p99 latency budget in seconds. The plan defines SLO = 3 x L0, where L0 is the unloaded single-request p50 - measure L0 first (E1), then set this.",
+            "hide": 0,
+            "label": "SLO p99 (s)",
+            "name": "slo_p99_seconds",
+            "options": [{ "selected": true, "text": "3", "value": "3" }],
+            "query": "3",
+            "skipUrlSync": false,
+            "type": "textbox"
+          },
+          {
+            "current": { "selected": false, "text": "2", "value": "2" },
+            "description": "Queue depth per worker at which an HPA would add a pod. Lives here, once, so the target line and any prometheus-adapter rule quote the same number.",
+            "hide": 0,
+            "label": "HPA queue target",
+            "name": "hpa_queue_target",
+            "options": [{ "selected": true, "text": "2", "value": "2" }],
+            "query": "2",
+            "skipUrlSync": false,
+            "type": "textbox"
+          },
+          {
+            "current": { "selected": false, "text": "1.006", "value": "1.006" },
+            "description": "On-demand USD per worker-hour. Default 1.006 = g5.xlarge in us-east-2. Drop it to the spot price to see the spot cost floor.",
+            "hide": 0,
+            "label": "$ per worker-hour",
+            "name": "price_per_worker_hour",
+            "options": [{ "selected": true, "text": "1.006", "value": "1.006" }],
+            "query": "1.006",
+            "skipUrlSync": false,
+            "type": "textbox"
+          }
+        ]
+      },
+      "time": { "from": "now-30m", "to": "now" },
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "OptiTrain - Inference Fleet",
+      "uid": "optitrain-fleet",
+      "version": 1,
+      "weekStart": ""
+    }

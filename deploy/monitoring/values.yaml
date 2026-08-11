@@ -1,0 +1,261 @@
+# kube-prometheus-stack values — OptiTrain inference fleet
+# ---------------------------------------------------------------------------
+# Chart:   prometheus-community/kube-prometheus-stack
+# Pinned:  88.2.0  (Prometheus Operator v0.93.0)
+# Targets: k3d on the laptop  AND  k3s on a t3.small in us-east-2.
+#
+#   helm upgrade --install optitrain prometheus-community/kube-prometheus-stack \
+#     --version 88.2.0 -n monitoring --create-namespace \
+#     -f deploy/monitoring/values.yaml
+#
+# Everything here is deliberate; each block says why. See README.md.
+# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# 1. k3s COMPATIBILITY — the single most important block in this file
+# ===========================================================================
+# k3s (and k3d, which is k3s in Docker) runs the WHOLE control plane as ONE
+# process: `k3s server` embeds the apiserver, scheduler, controller-manager,
+# kube-proxy and a SQLite/embedded-etcd datastore in a single binary. There is
+# no separate `kube-scheduler` pod, no `etcd` pod, no `kube-proxy` DaemonSet,
+# and none of them expose the metrics ports (10259 / 10257 / 10249 / 2381)
+# that this chart's default ServiceMonitors point at.
+#
+# Leave these on and Prometheus creates four scrape jobs whose Endpoints are
+# empty or unreachable. The visible damage:
+#   * "Targets down" in the Prometheus UI, permanently, on a healthy cluster;
+#   * KubeSchedulerDown / KubeControllerManagerDown / KubeProxyDown /
+#     etcdMembersDown firing forever, which trains you to ignore alerts —
+#     exactly the wrong reflex to build before a chaos experiment;
+#   * a red kube-* dashboard that makes a working fleet look broken in a demo.
+#
+# So: disable the scrapers AND the default rules that alert on them. The
+# apiserver, kubelet and cAdvisor scrapes DO work on k3s and stay enabled —
+# those are where pod CPU/memory/restarts come from.
+kubeEtcd:
+  enabled: false # k3s: embedded datastore, no etcd pod, port 2381 not served
+kubeScheduler:
+  enabled: false # k3s: in-process scheduler, no :10259 metrics endpoint
+kubeControllerManager:
+  enabled: false # k3s: in-process controller-manager, no :10257 endpoint
+kubeProxy:
+  enabled: false # k3s: in-process (or replaced by the embedded LB); no :10249
+
+kubeApiServer:
+  enabled: true # works on k3s — keep it
+kubelet:
+  enabled: true # works on k3s — this is the pod/container metrics source
+  serviceMonitor:
+    cAdvisor: true
+    probes: false # kubelet probe metrics: noise for this fleet
+    resource: false # deprecated resource endpoint; cAdvisor covers it
+
+coreDns:
+  enabled: true # k3s ships CoreDNS as a normal Deployment — this one is real
+kubeDns:
+  enabled: false # only for clusters still on kube-dns
+
+defaultRules:
+  create: true
+  rules:
+    # Same four, at the alerting layer. Disabling the ServiceMonitor alone
+    # still leaves rules like KubeSchedulerDown evaluating `up{job="kube-
+    # scheduler"} == 0`, which is *absent*, not 0 — most of these use absent()
+    # and fire anyway. Turn the rule groups off too.
+    etcd: false
+    kubeControllerManager: false
+    kubeProxy: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    # Windows nodes do not exist here.
+    windows: false
+    # Alertmanager is disabled below, so its nine self-check rules would
+    # evaluate against series that are never scraped. They do not use absent()
+    # and so would not actually fire - this is housekeeping, not a fix: same
+    # principle as the four above, do not ship rules for components that do
+    # not exist.
+    alertmanager: false
+    # Everything else stays on: kubelet, node, kubernetesApps/Resources/
+    # Storage/System and the prometheus/operator self-checks are all valid on
+    # k3s and are genuinely useful during a chaos run.
+
+windowsMonitoring:
+  enabled: false
+
+# ===========================================================================
+# 2. PROMETHEUS — short retention, modest footprint
+# ===========================================================================
+prometheus:
+  prometheusSpec:
+    # These are EXPERIMENT clusters: spun up for a run, torn down after. Long
+    # retention buys nothing (the durable record is the loadgen JSON + the
+    # markdown in docs/experiments/), and on a t3.small with an emptyDir it
+    # costs the node's disk. Three days covers "run it Friday, write it up
+    # Monday"; retentionSize is the hard stop so a runaway scrape cannot fill
+    # the root volume and take k3s down with it.
+    retention: 3d
+    retentionSize: 3GB
+
+    # 15s global. The fleet ServiceMonitors override this to 5s (see
+    # servicemonitor-router.yaml) because the worker heartbeat TTL is 15s —
+    # a 15s scrape would render a reroute event as one or two samples.
+    scrapeInterval: 15s
+    scrapeTimeout: 10s
+    evaluationInterval: 30s
+
+    # Adopt ServiceMonitors/PodMonitors/Rules from ANY namespace regardless of
+    # their labels. The chart default (`...NilUsesHelmValues: true`) restricts
+    # discovery to objects labelled `release: <helm release name>`, which is a
+    # silent failure: you apply servicemonitor-router.yaml, nothing errors, and
+    # the target never appears. The fleet manifests carry the `release` label
+    # anyway (belt and braces) — this makes them work even if the release is
+    # renamed.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+
+    # No storageSpec on purpose → emptyDir. k3d has no real StorageClass worth
+    # using and a t3.small demo cluster is disposable. If you ever want the
+    # TSDB to survive a pod restart, add a storageSpec here; nothing else in
+    # this file changes.
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 400Mi
+      limits:
+        memory: 1Gi
+
+alertmanager:
+  # Off. Nobody is on call for a cluster that lives for 40 minutes, and
+  # Alertmanager is ~100Mi we would rather give Prometheus. Rules still
+  # evaluate and are visible in the Prometheus UI (Alerts tab) and via the
+  # ALERTS series — you just cannot route them anywhere. Flip to true and add
+  # a receiver the day this fleet is long-lived.
+  enabled: false
+
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 192Mi
+
+# ===========================================================================
+# 3. GRAFANA — dashboards as code, password from a Secret
+# ===========================================================================
+grafana:
+  enabled: true
+
+  # The admin password is NEVER in this file and never in `--set` (it would
+  # land in shell history and in the Helm release Secret in plaintext-ish
+  # form). Create the Secret out of band before installing:
+  #
+  #   kubectl -n monitoring create secret generic grafana-admin \
+  #     --from-literal=admin-user=admin \
+  #     --from-literal=admin-password="$(openssl rand -base64 24)"
+  #
+  # and read it back with:
+  #   kubectl -n monitoring get secret grafana-admin \
+  #     -o jsonpath='{.data.admin-password}' | base64 -d
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+
+  sidecar:
+    dashboards:
+      # THE point of this block: any ConfigMap in any namespace labelled
+      # `grafana_dashboard: "1"` is picked up by the sidecar and written into
+      # Grafana's provisioning dir. That is how dashboard-configmap.yaml gets
+      # loaded — the dashboard is version-controlled JSON, never hand-built in
+      # the UI and never lost when the pod restarts.
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+      folder: /tmp/dashboards
+      provider:
+        # UI edits are not persisted — the file wins on every reconcile. Edit
+        # deploy/monitoring/dashboard-fleet.json and re-apply instead.
+        allowUiUpdates: false
+    datasources:
+      enabled: true
+      defaultDatasourceEnabled: true
+      isDefaultDatasource: true
+      name: Prometheus
+      # The dashboard's `datasource` variable defaults to this uid.
+      uid: prometheus
+      alertmanager:
+        # Alertmanager is disabled above, so provisioning a datasource pointing
+        # at its Service would leave a permanently-red entry in Grafana's
+        # datasource list. Same rule as the k3s block: do not wire up
+        # components that are not there.
+        enabled: false
+    resources:
+      requests:
+        cpu: 10m
+        memory: 48Mi
+      limits:
+        memory: 128Mi
+
+  # The chart's own kube-* dashboards. Useful for "was the node the
+  # bottleneck?" during a saturation sweep. The fleet dashboard is the one
+  # that tells the story.
+  defaultDashboardsEnabled: true
+  defaultDashboardsTimezone: browser
+
+  grafana.ini:
+    analytics:
+      check_for_updates: false
+      reporting_enabled: false
+    users:
+      # The fleet dashboard's colors are stepped and validated for the DARK
+      # surface (#181b1f). Light mode still works, but dark is what was tested.
+      default_theme: dark
+    dashboards:
+      # Port-forward, open localhost:3000, land on the fleet dashboard.
+      # The sidecar writes each ConfigMap key as a file under folder/ above.
+      default_home_dashboard_path: /tmp/dashboards/dashboard-fleet.json
+
+  # Dashboards come from ConfigMaps and the datasource from the sidecar, so
+  # there is no state worth a PVC. A restart re-provisions everything.
+  persistence:
+    enabled: false
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+  # ClusterIP + `kubectl port-forward`. No Ingress, no LoadBalancer, no
+  # security group hole punched in the k3s server for a demo dashboard.
+  service:
+    type: ClusterIP
+
+# ===========================================================================
+# 4. EXPORTERS — small, because the node is small
+# ===========================================================================
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 48Mi
+    limits:
+      memory: 128Mi
+
+prometheus-node-exporter:
+  # Node CPU / memory / network. Worth keeping: "was the router CPU-bound or
+  # was the box?" is the first question every saturation result raises, and X3
+  # showed the answer is not always the service under test.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 24Mi
+    limits:
+      memory: 64Mi
