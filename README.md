@@ -1,6 +1,17 @@
-# OptiTrain
+<h1 align="center">OptiTrain</h1>
 
-*Fault-tolerant distributed LLM training and serving on ephemeral GPU instances.*
+<p align="center">
+  <i>Fault-tolerant distributed LLM training and serving on ephemeral GPU instances.</i>
+</p>
+
+<p align="center">
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-blue.svg">
+  <img alt="Go 1.22" src="https://img.shields.io/badge/go-1.22-00ADD8.svg">
+  <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-DDP%20%2B%20NCCL-ee4c2c.svg">
+  <img alt="AWS" src="https://img.shields.io/badge/platform-AWS-orange.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-604%20passing-brightgreen.svg">
+</p>
 
 ## Overview
 
@@ -53,22 +64,26 @@ validate system resilience.
 
 ![Loss — training and validation](./docs/img/flagship-loss.png)
 
-*Red regions: One or more nodes were down*<br>
-*Despite failures, the system self-healed and continued training throughout the
-run.*
+<p align="center">
+  <em>Training and validation loss across the run. Each red band marks an interval
+  during which one or more nodes were down; the system self-healed at every one
+  of them, and training continued without a restart.</em>
+</p>
 
 ![Durable progress vs. current frontier](./docs/img/flagship-progress.png)
 
-*The furthest achieved training step continually increased throughout the run,
-rapidly recovering from the durable, checkpointed step after every failure.*
+<p align="center">
+  <em>The furthest training step reached rose steadily throughout the run,
+  recovering from the last durable checkpoint within seconds of every failure.</em>
+</p>
 
 ![Slot occupancy — which instance held each slot](./docs/img/flagship-occupancy.png)
 
 <p align="center">
-<em>Per-slot occupancy throughout the run, 8 in total.<br>
-Red regions: One or more nodes failed<br>
-Blue: node is being replaced<br>
-Green: Node is training/healthy</em>
+  <em>Per-slot occupancy across the run, eight slots in total.<br>
+  <b>Green:</b> the node is training and healthy.<br>
+  <b>Blue:</b> the node is being replaced.<br>
+  <b>Red:</b> one or more nodes have failed.</em>
 </p>
 
 ### Inference: High-Throughput Serving
