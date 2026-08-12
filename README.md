@@ -3,9 +3,7 @@
 </p>
 
 <p align="center">
-  <b>Fault-tolerant distributed LLM training and serving on disposable nodes.</b><br>
-  Node loss is treated as a routine, survivable event rather than an outage —
-  survivors keep training at a reduced world size while replacements boot.
+  <b>Fault-tolerant distributed LLM training and serving on ephemeral EC2 instances</b>
 </p>
 
 <p align="center">
